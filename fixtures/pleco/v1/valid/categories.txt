@@ -1,0 +1,5 @@
+[Greetings]
+你好	ni3 hao3	hello; hi
+再见	zai4 jian4	goodbye
+[Food]
+米饭	mi3 fan4	cooked rice

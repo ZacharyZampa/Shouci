@@ -1,0 +1,12 @@
+[package]
+name = "vocab-pleco"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vocab-core = { path = "../vocab-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+# synthetic OpenSubtitles-style frequency fixture
+水 5000
+学校 4000
+猫 3000
+旅行 2000
+你好 1500
+猫咪 10

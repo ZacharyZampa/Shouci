@@ -1,0 +1,34 @@
+[package]
+name = "vocab-mac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vocab-mac"
+path = "src/main.rs"
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-quartz-core = "0.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+vocab-capture = { path = "../vocab-capture" }
+vocab-core = { path = "../vocab-core" }
+vocab-db = { path = "../vocab-db" }
+vocab-dictionary = { path = "../vocab-dictionary" }
+vocab-search = { path = "../vocab-search" }
+
+# NOTE: `[lints] workspace = true` cannot be combined with per-lint
+# overrides, so the workspace lint set is spelled out here. Keep in sync
+# with the root `Cargo.toml`; the only intentional difference is
+# `unsafe_code`, which AppKit/Carbon interop cannot exist without. All
+# unsafe lives in small documented wrappers; business logic stays safe.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -1,0 +1,5 @@
+% exported by Pleco
+% category: Greetings
+你好	ni3 hao3	hello
+
+% trailing comment

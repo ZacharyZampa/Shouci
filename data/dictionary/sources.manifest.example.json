@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tool_version": "vocab-dictionary 0.1.0",
+  "layers": [
+    {
+      "id": "cc-cedict",
+      "kind": "base_lexicon",
+      "version": "1.2",
+      "license": "CC BY-SA 4.0",
+      "artifact": "sources/cc-cedict-1.2.u8.tar.gz",
+      "sha256": "<pinned>"
+    },
+    {
+      "id": "opensubtitles-zh",
+      "kind": "frequency",
+      "version": "2018",
+      "license": "CC BY-SA 4.0",
+      "artifact": "sources/opensubtitles-zh-cn-50k-2018.txt",
+      "sha256": "<pinned>"
+    },
+    {
+      "id": "hsk",
+      "kind": "hsk_ranks",
+      "version": "3.0",
+      "license": "MIT",
+      "artifact": "sources/hsk30-expanded.csv",
+      "sha256": "<pinned>"
+    }
+  ],
+  "output": {
+    "file": "dictionary.db",
+    "merge_key": "(simplified, traditional) after OpenCC normalization",
+    "collision_policy": "flag_conflict",
+    "stable_id_scheme": "entry_id ascending, deterministic over layer order"
+  }
+}

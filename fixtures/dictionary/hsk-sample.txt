@@ -1,0 +1,6 @@
+# synthetic HSK fixture: word<TAB>level
+水	1
+学校	1
+你好	1
+猫	2
+旅行	2

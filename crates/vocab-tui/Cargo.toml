@@ -1,0 +1,19 @@
+[package]
+name = "vocab-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = "0.29.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+vocab-core = { path = "../vocab-core" }
+vocab-db = { path = "../vocab-db" }
+vocab-dictionary = { path = "../vocab-dictionary" }
+vocab-capture = { path = "../vocab-capture" }
+vocab-search = { path = "../vocab-search" }
+
+[lints]
+workspace = true

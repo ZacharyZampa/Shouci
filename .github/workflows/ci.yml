@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/cache@v4
+        id: dictionary
+        with:
+          path: data/dictionary/dictionary.db
+          key: dictionary-${{ hashFiles('crates/vocab-dictionary/**', 'crates/vocab-pinyin/**') }}
+
+      - name: Fetch dictionary
+        if: steps.dictionary.outputs.cache-hit != 'true'
+        run: cargo run -p vocab-dictionary --example ensure -- data/dictionary/dictionary.db
+
+      - name: Check
+        run: ./scripts/check.sh

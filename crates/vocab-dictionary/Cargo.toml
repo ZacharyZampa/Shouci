@@ -1,0 +1,18 @@
+[package]
+name = "vocab-dictionary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.10"
+vocab-core = { path = "../vocab-core" }
+vocab-pinyin = { path = "../vocab-pinyin" }
+
+[dev-dependencies]
+vocab-search = { path = "../vocab-search" }
+
+[lints]
+workspace = true
