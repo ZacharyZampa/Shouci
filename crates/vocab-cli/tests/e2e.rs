@@ -5,7 +5,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn dictionary() -> PathBuf {
     if let Ok(db) = std::env::var("VOCAB_DICTIONARY") {
@@ -42,7 +45,12 @@ fn temp_user_db() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("vocab-e2e-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "vocab-e2e-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir.join("user.db")
 }

@@ -8,6 +8,7 @@ cd "${ROOT}"
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export VOCAB_SKIP_DICTIONARY_REFRESH=1
+export VOCAB_DICTIONARY="${ROOT}/data/dictionary/dictionary.db"
 
 if [ ! -f data/dictionary/dictionary.db ]; then
   echo "==> dictionary.db missing, fetching"

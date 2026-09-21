@@ -47,7 +47,7 @@ Two files, never mixed:
 | `user.db` | Saved vocab, import/export audit |
 
 Runtime path for `dictionary.db`: `--dictionary` → `VOCAB_DICTIONARY` →
-repo `data/dictionary/dictionary.db` (if that file exists) →
+`data/dictionary/dictionary.db` walking up from the current directory →
 `~/Library/Application Support/pleco-companion/dictionary.db`.
 
 ## Search path

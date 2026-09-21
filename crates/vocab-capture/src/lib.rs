@@ -84,7 +84,8 @@ pub fn guess_mode(word: &str) -> SearchMode {
 ///
 /// Priority when no explicit path is given:
 /// 1. `VOCAB_DICTIONARY` environment variable,
-/// 2. repo `data/dictionary/dictionary.db` if that file exists,
+/// 2. `data/dictionary/dictionary.db` under the current directory or any parent
+///    (so `cargo test -p …` still finds the workspace db),
 /// 3. `dictionary.db` inside the app-data directory.
 #[must_use]
 pub fn dictionary_path(dictionary: Option<&Path>) -> PathBuf {
@@ -96,14 +97,27 @@ pub fn dictionary_path(dictionary: Option<&Path>) -> PathBuf {
             return PathBuf::from(db);
         }
     }
-    let repo = PathBuf::from("data/dictionary/dictionary.db");
-    if repo.is_file() {
+    if let Some(repo) = find_repo_dictionary() {
         return repo;
     }
     if let Ok(dir) = app_data_dir() {
         return dir.join("dictionary.db");
     }
-    repo
+    PathBuf::from("data/dictionary/dictionary.db")
+}
+
+fn find_repo_dictionary() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..8 {
+        let candidate = dir.join("data/dictionary/dictionary.db");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 /// Opens the dictionary database and wraps it in a ranked search service.

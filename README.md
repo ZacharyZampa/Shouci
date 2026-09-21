@@ -65,8 +65,9 @@ Force a rebuild with
 Search ranks match quality first, then frequency, then HSK, then entry id.
 Same query always yields the same order.
 
-Dictionary path if `--dictionary` is omitted: `VOCAB_DICTIONARY` → repo
-`data/dictionary/dictionary.db` (if present) → app-data `dictionary.db`.
+Dictionary path if `--dictionary` is omitted: `VOCAB_DICTIONARY` →
+`data/dictionary/dictionary.db` (current directory or parents) → app-data
+`dictionary.db`.
 
 ## Build & test
 

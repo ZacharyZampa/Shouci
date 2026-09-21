@@ -1,9 +1,11 @@
 //! First-run download + ingest of CC-CEDICT, frequency, and HSK.
 //! Existing installs refresh when the calendar month changes.
 
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use vocab_core::{Result, VocabError};
@@ -25,10 +27,46 @@ const HSK_URL: &str = "https://raw.githubusercontent.com/ivankra/hsk30/master/hs
 ///
 /// First-run download/ingest failure. Refresh failures are logged, not returned.
 pub fn ensure_dictionary_db(output: &Path) -> Result<()> {
-    if output.is_file() {
-        if skip_refresh() || !due_for_monthly_refresh(output, &current_year_month()) {
+    if dictionary_ready(output) {
+        return Ok(());
+    }
+    let lock_path = output.with_extension("fetch.lock");
+    let started = Instant::now();
+    loop {
+        if dictionary_ready(output) {
             return Ok(());
         }
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_lock) => {
+                let result = complete_fetch(output);
+                let _ = std::fs::remove_file(&lock_path);
+                return result;
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                if started.elapsed() > Duration::from_secs(300) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    return Err(VocabError::new(format!(
+                        "timed out waiting for dictionary fetch lock {}",
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(_) => return complete_fetch(output),
+        }
+    }
+}
+
+fn dictionary_ready(output: &Path) -> bool {
+    output.is_file() && (skip_refresh() || !due_for_monthly_refresh(output, &current_year_month()))
+}
+
+fn complete_fetch(output: &Path) -> Result<()> {
+    if output.is_file() {
         match fetch_and_ingest(output, "monthly dictionary update") {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -165,7 +203,7 @@ fn download(url: &str, dest: &Path, force: bool) -> Result<()> {
     if dest.is_file() && !force {
         return Ok(());
     }
-    let tmp = dest.with_extension("tmp");
+    let tmp = sibling_tmp(dest);
     let status = Command::new("curl")
         .args(["-Lsf", "--retry", "2", "-o"])
         .arg(&tmp)
@@ -180,6 +218,13 @@ fn download(url: &str, dest: &Path, force: bool) -> Result<()> {
     }
     std::fs::rename(&tmp, dest)
         .map_err(|err| VocabError::new(format!("save {}: {err}", dest.display())))
+}
+
+fn sibling_tmp(dest: &Path) -> PathBuf {
+    let name = dest.file_name().map_or("download.tmp".into(), |n| {
+        format!("{}.tmp", n.to_string_lossy())
+    });
+    dest.with_file_name(name)
 }
 
 fn decompress_gz(src: &Path, dest: &Path, force: bool) -> Result<()> {
@@ -217,6 +262,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp");
         (dir.clone(), dir.join("dictionary.db"))
+    }
+
+    #[test]
+    fn sibling_tmp_keeps_full_filename() {
+        assert_eq!(
+            sibling_tmp(Path::new("/tmp/cc-cedict.txt.gz")),
+            PathBuf::from("/tmp/cc-cedict.txt.gz.tmp")
+        );
     }
 
     #[test]
