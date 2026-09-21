@@ -1,6 +1,7 @@
-# Pleco Mac Companion
+# Shouci (收词)
 
-Keyboard-first macOS tools for Chinese vocabulary next to Pleco. Local-only, no AI.
+Keyboard-first macOS tools for collecting Chinese vocabulary. Works next to
+Pleco. Local-only, no AI.
 Architecture and contributor notes: [DEV.md](DEV.md).
 
 Two databases: read-only `dictionary.db`, writable `user.db`.

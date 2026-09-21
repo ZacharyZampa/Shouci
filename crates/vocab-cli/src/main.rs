@@ -14,7 +14,7 @@ use vocab_pleco::{CodecRegistry, ExportRow, IssueSeverity};
 
 #[derive(Parser)]
 #[command(name = "vocab")]
-#[command(about = "Pleco Mac Companion: manage Chinese vocabulary alongside Pleco")]
+#[command(about = "Shouci: collect Chinese vocabulary alongside Pleco")]
 struct Cli {
     /// Path to the built dictionary.db (defaults to data/dictionary/dictionary.db).
     #[arg(long, global = true)]
