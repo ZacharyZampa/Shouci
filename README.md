@@ -1,8 +1,10 @@
 # Shouci (收词)
 
-Keyboard-first macOS tools for collecting Chinese vocabulary. Works next to
-Pleco. Local-only, no AI.
-Architecture and contributor notes: [DEV.md](DEV.md).
+Keyboard-first macOS tools for collecting Chinese vocabulary.
+
+Fully free and open source. With a promise of no user info collection.
+
+Want to help? [CONTRIBUTING.md](CONTRIBUTING.md). Architecture: [DEV.md](DEV.md).
 
 Two databases: read-only `dictionary.db`, writable `user.db`.
 
@@ -71,45 +73,5 @@ Dictionary path if `--dictionary` is omitted: `VOCAB_DICTIONARY` →
 
 ## Build & test
 
-After clone:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for issues, PRs, and test rules.
 
-```sh
-./scripts/setup-hooks.sh          # pre-commit = fmt + clippy + all tests
-./scripts/check.sh                # fetches the dictionary if missing, then the gate
-```
-
-Tests include CLI process I/O plus TUI/menu-bar search against
-`fixtures/search/top1000.tsv` (50-word smoke + 1000-word pinyin/hanzi sweep).
-GitHub Actions runs `scripts/check.sh` on macOS. Do not weaken fixtures to
-make a change pass.
-
-```sh
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-## Workspace
-
-| Crate | Role |
-| --- | --- |
-| `vocab-core` | Types, statuses, errors |
-| `vocab-dictionary` | Ingest + SQLite dictionary |
-| `vocab-search` | Ranked search |
-| `vocab-pinyin` | Normalize / segment pinyin |
-| `vocab-pleco` | Pleco UTF-8 text codec |
-| `vocab-db` | `user.db` |
-| `vocab-capture` | Shared search / save / CLI add |
-| `vocab-tui` | Terminal UI |
-| `vocab-mac` | Menu-bar app (VocabBar) |
-| `vocab-cli` | `vocab` |
-
-## Principles
-
-1. Retrieval is not translation — English returns candidates; the user picks.
-2. No silent uncertainty — ambiguity and missing data become `needs_review`.
-3. Deterministic — same DB + query ⇒ same order.
-4. Provenance is kept on every saved item.
-5. Pleco is file-based UTF-8 text, never `.pqb`.
-
-VocabBar log: `tail -f ~/Library/Logs/VocabBar/debug.log`.

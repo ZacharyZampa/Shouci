@@ -39,6 +39,22 @@ flowchart TB
   CAP --> CORE
 ```
 
+
+## Workspace
+
+| Crate | Role |
+| --- | --- |
+| `vocab-core` | Types, statuses, errors |
+| `vocab-dictionary` | Ingest + SQLite dictionary |
+| `vocab-search` | Ranked search |
+| `vocab-pinyin` | Normalize / segment pinyin |
+| `vocab-pleco` | Pleco UTF-8 text codec |
+| `vocab-db` | `user.db` |
+| `vocab-capture` | Shared search / save / CLI add |
+| `vocab-tui` | Terminal UI |
+| `vocab-mac` | Menu-bar app (VocabBar) |
+| `vocab-cli` | `vocab` |
+
 Two files, never mixed:
 
 | File | Role |
@@ -63,6 +79,17 @@ query
       lemma match → other match quality → frequency → HSK → entry_id
   → UI/CLI may cap display (VocabBar: 10)
 ```
+
+## Principles
+
+1. Retrieval is not translation — English returns candidates; the user picks.
+2. No silent uncertainty — ambiguity and missing data become `needs_review`.
+3. Deterministic — same DB + query ⇒ same order.
+4. Provenance is kept on every saved item.
+5. Future Pleco support is file-based UTF-8 text, never `.pqb`.
+
+VocabBar log: `tail -f ~/Library/Logs/VocabBar/debug.log`.
+
 
 `resolve_auto`: guess first; if English hits are not an exact lemma and the
 query looks like untoned multi-syllable pinyin (`jingzi`, `nihao`), fall
