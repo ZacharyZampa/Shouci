@@ -8,6 +8,18 @@ Want to help? [CONTRIBUTING.md](CONTRIBUTING.md). Architecture: [DEV.md](DEV.md)
 
 Two databases: read-only `dictionary.db`, writable `user.db`.
 
+## Screenshots
+
+### Menu Bar
+<img width="404" height="390" alt="Mac Menu Bar" src="https://github.com/user-attachments/assets/99d94816-abf5-4eda-96c9-aa80fdaac3dc" />
+
+
+### TUI
+<img width="1053" height="866" alt="TUI Saved List" src="https://github.com/user-attachments/assets/7092da99-9401-4afc-a540-722a333b5952" />
+<img width="1063" height="867" alt="TUI Search" src="https://github.com/user-attachments/assets/fa5752dd-e011-4687-b0dc-afbdd452afcc" />
+
+
+
 ## Install (macOS)
 
 Needs a Rust toolchain and network on first dictionary fetch. VocabBar is
