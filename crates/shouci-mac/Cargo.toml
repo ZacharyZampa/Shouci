@@ -1,12 +1,12 @@
 [package]
-name = "vocab-mac"
+name = "shouci-mac"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "vocab-mac"
+name = "shouci-mac"
 path = "src/main.rs"
 
 [dependencies]

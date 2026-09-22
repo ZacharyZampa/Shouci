@@ -993,6 +993,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "shouci-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "vocab-capture",
+ "vocab-core",
+ "vocab-db",
+ "vocab-dictionary",
+ "vocab-pleco",
+]
+
+[[package]]
+name = "shouci-mac"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-quartz-core",
+ "rusqlite",
+ "vocab-capture",
+ "vocab-core",
+ "vocab-db",
+ "vocab-dictionary",
+ "vocab-search",
+]
+
+[[package]]
+name = "shouci-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm 0.29.0",
+ "ratatui",
+ "rusqlite",
+ "vocab-capture",
+ "vocab-core",
+ "vocab-db",
+ "vocab-dictionary",
+ "vocab-search",
+]
+
+[[package]]
 name = "signal-hook"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1190,20 +1234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vocab-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "serde",
- "serde_json",
- "vocab-capture",
- "vocab-core",
- "vocab-db",
- "vocab-dictionary",
- "vocab-pleco",
-]
-
-[[package]]
 name = "vocab-core"
 version = "0.1.0"
 dependencies = [
@@ -1231,22 +1261,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vocab-mac"
-version = "0.1.0"
-dependencies = [
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "objc2-quartz-core",
- "rusqlite",
- "vocab-capture",
- "vocab-core",
- "vocab-db",
- "vocab-dictionary",
- "vocab-search",
-]
-
-[[package]]
 name = "vocab-pinyin"
 version = "0.1.0"
 
@@ -1264,20 +1278,6 @@ dependencies = [
  "vocab-core",
  "vocab-dictionary",
  "vocab-pinyin",
-]
-
-[[package]]
-name = "vocab-tui"
-version = "0.1.0"
-dependencies = [
- "crossterm 0.29.0",
- "ratatui",
- "rusqlite",
- "vocab-capture",
- "vocab-core",
- "vocab-db",
- "vocab-dictionary",
- "vocab-search",
 ]
 
 [[package]]

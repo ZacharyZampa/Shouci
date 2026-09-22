@@ -54,7 +54,7 @@ impl Theme {
             .map_or_else(Style::default, |c| Style::default().fg(c))
     }
 
-    /// Panel titles and the `vocab` brand: bold, cyan when colored.
+    /// Panel titles and the `shouci` brand: bold, cyan when colored.
     #[must_use]
     pub(crate) fn accent(self) -> Style {
         self.slot(Color::Cyan, Modifier::BOLD)

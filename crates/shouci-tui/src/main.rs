@@ -4,6 +4,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(dir) => dir.join("user.db"),
         Err(_) => std::path::PathBuf::from("user.db"),
     };
-    vocab_tui::run(&dictionary, &user_db)?;
+    shouci_tui::run(&dictionary, &user_db)?;
     Ok(())
 }

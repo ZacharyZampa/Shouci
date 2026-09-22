@@ -7,9 +7,9 @@ For humans and agents. User-facing usage is in [README.md](README.md).
 ```mermaid
 flowchart TB
   subgraph frontends [Frontends]
-    CLI["vocab-cli"]
-    TUI["vocab-tui"]
-    MAC["vocab-mac / VocabBar"]
+    CLI["shouci-cli"]
+    TUI["shouci-tui"]
+    MAC["shouci-mac / Shouci"]
   end
 
   CAP["vocab-capture\nguess / resolve / search_auto / save_candidate / capture table"]
@@ -51,9 +51,9 @@ flowchart TB
 | `vocab-pleco` | Pleco UTF-8 text codec |
 | `vocab-db` | `user.db` |
 | `vocab-capture` | Shared search / save / CLI add |
-| `vocab-tui` | Terminal UI |
-| `vocab-mac` | Menu-bar app (VocabBar) |
-| `vocab-cli` | `vocab` |
+| `shouci-tui` | Terminal UI |
+| `shouci-mac` | Menu-bar app (Shouci) |
+| `shouci-cli` | `shouci` |
 
 Two files, never mixed:
 
@@ -77,7 +77,7 @@ query
       Chinese: exact / prefix, then character AND fallback (inferred)
   → rank (never drop)
       lemma match → other match quality → frequency → HSK → entry_id
-  → UI/CLI may cap display (VocabBar: 10)
+  → UI/CLI may cap display (Shouci: 10)
 ```
 
 ## Principles
@@ -88,7 +88,7 @@ query
 4. Provenance is kept on every saved item.
 5. Future Pleco support is file-based UTF-8 text, never `.pqb`.
 
-VocabBar log: `tail -f ~/Library/Logs/VocabBar/debug.log`.
+Shouci log: `tail -f ~/Library/Logs/Shouci/debug.log`.
 
 
 `resolve_auto`: guess first; if English hits are not an exact lemma and the
@@ -104,7 +104,7 @@ Where to change what:
 | SQL retrieval, FTS, ingest | `vocab-dictionary/src/sqlite.rs` |
 | Pinyin normalize/segment | `vocab-pinyin` |
 | Auto mode / picker search+save / CLI add table | `vocab-capture` (`resolve`, `search_auto`, `save_candidate`, `capture`) |
-| VocabBar | AppKit only; search `search_auto`, save `save_candidate`; row labels in `vocab-mac/src/capture.rs` |
+| Shouci | AppKit only; search `search_auto`, save `save_candidate`; row labels in `shouci-mac/src/capture.rs` |
 | TUI | ratatui only; search `resolve`, save `save_candidate` |
 
 Do not pull tantivy/fuzzy matchers for dictionary lookup. FTS5 is retrieval;
@@ -115,7 +115,7 @@ ranking is domain-specific.
 Two APIs in `vocab-capture`:
 
 Picker search: `resolve` (explicit mode) or `search_auto` (auto + display cap).
-Picker save: `save_candidate` — TUI and VocabBar persist the **selected** hit.
+Picker save: `save_candidate` — TUI and Shouci persist the **selected** hit.
 
 `capture` / `capture_to_path` (CLI `add` only):
 
@@ -146,7 +146,7 @@ Downloaded sources land in `data/dictionary/sources/` (gitignored).
 ## Conventions
 
 - Rust 1.85+, workspace `edition = 2024`.
-- `unsafe_code = forbid` except `vocab-mac` (ObjC/Carbon wrappers only).
+- `unsafe_code = forbid` except `shouci-mac` (ObjC/Carbon wrappers only).
 - Clippy `all` + `pedantic`, zero warnings (`-D warnings`).
 - No comments in code unless asked. Docs belong here or in crate rustdoc.
 - Fixtures are the contract (`fixtures/`). Do not “fix” tests by weakening them
@@ -171,8 +171,8 @@ calendar month changes (`vocab-dictionary::ensure_dictionary_db`). Tests set
 
 I/O coverage:
 
-- `vocab-cli/tests/e2e.rs` — real `vocab` binary: search / add / list / import / export
-- `vocab-tui` / `vocab-mac` `search_quality` — query in, headword in top 10
+- `shouci-cli/tests/e2e.rs` — real `shouci` binary: search / add / list / import / export
+- `shouci-tui` / `shouci-mac` `search_quality` — query in, headword in top 10
 - Probes: `fixtures/search/top1000.tsv` (regen: `python3 fixtures/search/generate.py`)
 - 50-word smoke includes English; 1000-word sweep is pinyin + hanzi
 - Pleco fixtures under `fixtures/pleco/`
@@ -183,7 +183,7 @@ Do not “fix” a failing I/O test by loosening it.
 
 ```
 crates/vocab-*     library + binaries
-scripts/install.sh macOS install (CLI, TUI, VocabBar)
+scripts/install.sh macOS install (CLI, TUI, Shouci)
 scripts/check.sh   fmt + clippy + all tests
 scripts/setup-hooks.sh  git pre-commit → check.sh
 data/dictionary/   ingest inputs + dictionary.db

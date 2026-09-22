@@ -15,9 +15,9 @@ use objc2_foundation::{NSRect, NSString, NSUserDefaults, ns_string};
 
 use crate::hotkey;
 
-const DEFAULTS_CODE_KEY: &str = "VocabBarHotkeyKeyCode";
-const DEFAULTS_MODS_KEY: &str = "VocabBarHotkeyModifiers";
-const DEFAULTS_DISPLAY_KEY: &str = "VocabBarHotkeyDisplay";
+const DEFAULTS_CODE_KEY: &str = "ShouciHotkeyKeyCode";
+const DEFAULTS_MODS_KEY: &str = "ShouciHotkeyModifiers";
+const DEFAULTS_DISPLAY_KEY: &str = "ShouciHotkeyDisplay";
 
 /// A hotkey binding: Carbon keycode + Carbon modifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

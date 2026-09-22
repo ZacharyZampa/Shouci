@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-pub const LABEL: &str = "com.plecocompanion.vocabbar";
+pub const LABEL: &str = "com.zacharyzampa.shouci";
 
 fn launch_agents_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn label_is_stable() {
         // The checkbox, the plist, and anyone tailing logs agree on this.
-        assert_eq!(LABEL, "com.plecocompanion.vocabbar");
+        assert_eq!(LABEL, "com.zacharyzampa.shouci");
     }
 
     #[test]
@@ -119,7 +119,7 @@ mod tests {
         assert!(
             plist_path()
                 .to_string_lossy()
-                .ends_with("Library/LaunchAgents/com.plecocompanion.vocabbar.plist")
+                .ends_with("Library/LaunchAgents/com.zacharyzampa.shouci.plist")
         );
     }
 }

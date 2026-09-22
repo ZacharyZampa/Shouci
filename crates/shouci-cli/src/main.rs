@@ -7,13 +7,13 @@ use vocab_capture::{
 };
 use vocab_core::{ItemStatus, Result, VocabError};
 use vocab_db::{
-    ExportRun, ImportDecision, ImportPayload, ImportRecord, commit_export, import_sources,
-    item_tags, list_items, persist_import, select_exportable,
+    ExportRun, ImportDecision, ImportPayload, ImportRecord, commit_export, delete_item, get_item,
+    import_sources, item_tags, list_items, persist_import, select_exportable,
 };
 use vocab_pleco::{CodecRegistry, ExportRow, IssueSeverity};
 
 #[derive(Parser)]
-#[command(name = "vocab")]
+#[command(name = "shouci")]
 #[command(about = "Shouci: collect Chinese vocabulary alongside Pleco")]
 struct Cli {
     /// Path to the built dictionary.db (defaults to data/dictionary/dictionary.db).
@@ -37,6 +37,8 @@ enum Command {
     Export(ExportArgs),
     /// List saved vocabulary items, newest first.
     List(ListArgs),
+    /// Delete a saved item by id or simplified headword.
+    Delete(DeleteArgs),
     /// Search the dictionary.
     Search(SearchArgs),
 }
@@ -177,6 +179,13 @@ struct ListArgs {
     status: Option<ItemStatus>,
 }
 
+#[derive(Args)]
+struct DeleteArgs {
+    /// Item id from `shouci list`, or a simplified headword.
+    #[arg(value_name = "ID_OR_HEADWORD")]
+    target: String,
+}
+
 fn parse_status(s: &str) -> std::result::Result<ItemStatus, String> {
     s.parse()
 }
@@ -192,6 +201,7 @@ fn main() -> Result<()> {
         Command::Import(args) => run_import(user_db.as_deref(), &args),
         Command::Export(args) => run_export(user_db.as_deref(), &args),
         Command::List(args) => run_list(user_db.as_deref(), &args),
+        Command::Delete(args) => run_delete(user_db.as_deref(), &args),
         Command::Search(args) => run_search(dictionary.as_deref(), &args),
     }
 }
@@ -303,6 +313,41 @@ fn run_list(cli_user_db: Option<&std::path::Path>, args: &ListArgs) -> Result<()
             clip(&item.definition, 60)
         );
     }
+    Ok(())
+}
+
+fn run_delete(cli_user_db: Option<&std::path::Path>, args: &DeleteArgs) -> Result<()> {
+    let conn = open_capture_db(cli_user_db)?;
+    let target = args.target.trim();
+    if target.is_empty() {
+        return Err(VocabError::new("empty target"));
+    }
+    let item = if let Ok(item_id) = target.parse::<i64>() {
+        get_item(&conn, item_id)?.ok_or_else(|| VocabError::new(format!("no item {item_id}")))?
+    } else {
+        let matches: Vec<_> = list_items(&conn, None)?
+            .into_iter()
+            .filter(|item| item.simplified == target)
+            .collect();
+        match matches.as_slice() {
+            [] => return Err(VocabError::new(format!("no saved item {target:?}"))),
+            [one] => one.clone(),
+            many => {
+                return Err(VocabError::new(format!(
+                    "multiple saved items for {target:?}; pass an id from `shouci list`: {}",
+                    many.iter()
+                        .map(|item| item.item_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+    };
+    delete_item(&conn, item.item_id)?;
+    println!(
+        "deleted: {} / {}  [{}] (item {})",
+        item.simplified, item.traditional, item.pinyin, item.item_id
+    );
     Ok(())
 }
 

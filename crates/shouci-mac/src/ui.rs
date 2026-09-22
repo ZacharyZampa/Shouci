@@ -474,7 +474,7 @@ impl CaptureDelegate {
             );
             let quit_item = NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc(),
-                ns_string!("Quit VocabBar"),
+                ns_string!("Quit Shouci"),
                 Some(sel!(terminate:)),
                 ns_string!("q"),
             );
@@ -602,7 +602,7 @@ impl CaptureDelegate {
                 false,
             )
         };
-        window.setTitle(ns_string!("VocabBar Settings"));
+        window.setTitle(ns_string!("Shouci Settings"));
         // SAFETY: we retain the window in ivars, so AppKit must not release
         // it on close (same contract as the hello-world example).
         unsafe {

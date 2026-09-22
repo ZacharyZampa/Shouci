@@ -1,7 +1,7 @@
 //! Native macOS menu-bar utility (`AppKit` via `objc2`).
 //!
 //! Workspace mapping for the suggested `core / tui / macos` split: the
-//! `vocab-*` workspace crates are the platform-independent core, `vocab-tui`
+//! `vocab-*` workspace crates are the platform-independent core, `shouci-tui`
 //! is the terminal UI, and this crate is the `macos/` layer. It links the
 //! same core code the CLI and TUI use — no subprocesses, no duplicated logic.
 //!
@@ -30,7 +30,7 @@ mod ui;
 mod search_quality;
 
 fn main() {
-    let mtm = MainThreadMarker::new().expect("vocab-mac must start on the main thread");
+    let mtm = MainThreadMarker::new().expect("shouci-mac must start on the main thread");
 
     // Core services first: dictionary search + user database. Failures here
     // do not abort startup; the popover surfaces them in its status line.
@@ -41,11 +41,11 @@ fn main() {
     };
     let user_conn = open_capture_db(Some(&user_db_path));
     if let Err(err) = service.as_ref() {
-        eprintln!("vocab-mac: dictionary unavailable: {err}");
-        eprintln!("vocab-mac: looked at {}", dictionary_path(None).display());
+        eprintln!("shouci-mac: dictionary unavailable: {err}");
+        eprintln!("shouci-mac: looked at {}", dictionary_path(None).display());
     }
     if let Err(err) = user_conn.as_ref() {
-        eprintln!("vocab-mac: user db unavailable: {err}");
+        eprintln!("shouci-mac: user db unavailable: {err}");
     }
 
     let app = NSApplication::sharedApplication(mtm);
@@ -61,7 +61,7 @@ fn main() {
     let delegate = match (service, user_conn) {
         (Ok(service), Ok(user_conn)) => Some(ui::install(mtm, button.clone(), service, user_conn)),
         (Err(err), _) | (_, Err(err)) => {
-            eprintln!("vocab-mac: running menu-only: {err}");
+            eprintln!("shouci-mac: running menu-only: {err}");
             None
         }
     };
@@ -85,7 +85,7 @@ fn main() {
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc(),
-                ns_string!("Quit VocabBar"),
+                ns_string!("Quit Shouci"),
                 Some(sel!(terminate:)),
                 ns_string!("q"),
             )

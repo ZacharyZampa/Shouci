@@ -1,16 +1,16 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/shouci-cli",
+    "crates/shouci-mac",
+    "crates/shouci-tui",
     "crates/vocab-capture",
-    "crates/vocab-cli",
     "crates/vocab-core",
     "crates/vocab-db",
     "crates/vocab-dictionary",
-    "crates/vocab-mac",
     "crates/vocab-pinyin",
     "crates/vocab-pleco",
     "crates/vocab-search",
-    "crates/vocab-tui",
 ]
 
 [workspace.package]

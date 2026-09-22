@@ -1,12 +1,12 @@
 [package]
-name = "vocab-cli"
+name = "shouci-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "vocab"
+name = "shouci"
 path = "src/main.rs"
 
 [dependencies]

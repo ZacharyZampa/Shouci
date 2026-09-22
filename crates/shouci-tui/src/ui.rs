@@ -40,7 +40,7 @@ pub(crate) fn header_line(
     filter_idx: usize,
     filters: &[Option<vocab_core::ItemStatus>],
 ) -> Line<'static> {
-    let mut spans = vec![Span::styled("vocab ", theme.accent())];
+    let mut spans = vec![Span::styled("shouci ", theme.accent())];
     match view {
         View::Search => {
             spans.push(Span::styled(format!("[{mode_label}]"), theme.accent()));
@@ -78,6 +78,7 @@ pub(crate) fn help_line(
     const SAVED_KEYS: &[(&str, &str)] = &[
         ("Shift+Tab", "switch"),
         ("Tab", "filter"),
+        ("d", "delete"),
         ("Ctrl+R", "reload"),
         ("Esc", "search"),
         ("Ctrl+Q", "quit"),
@@ -127,7 +128,7 @@ mod tests {
             &STATUS_FILTERS,
         );
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("vocab"), "{text}");
+        assert!(text.contains("shouci"), "{text}");
         assert!(text.contains("[Pinyin]"), "{text}");
         assert!(text.contains("nihao"), "{text}");
     }

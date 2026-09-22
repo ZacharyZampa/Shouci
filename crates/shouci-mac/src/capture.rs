@@ -1,4 +1,4 @@
-//! `VocabBar` display helpers. Search and save live in `vocab-capture`.
+//! `Shouci` display helpers. Search and save live in `vocab-capture`.
 
 use vocab_dictionary::Candidate;
 

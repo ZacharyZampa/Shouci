@@ -1,4 +1,4 @@
-# vocab-mac — VocabBar
+# shouci-mac — menu-bar app (Shouci)
 
 Native menu-bar capture (`AppKit` via `objc2`). Same core crates as the CLI and TUI.
 
@@ -14,18 +14,18 @@ Native menu-bar capture (`AppKit` via `objc2`). Same core crates as the CLI and 
 | `src/hotkey.rs` | Carbon `RegisterEventHotKey` |
 | `src/settings.rs` | Hotkey + login defaults |
 | `src/login.rs` | LaunchAgent for Open at Login |
-| `src/debuglog.rs` | `~/Library/Logs/VocabBar/debug.log` |
+| `src/debuglog.rs` | `~/Library/Logs/Shouci/debug.log` |
 
 `unsafe` is allowed only in this crate (ObjC/Carbon). It stays in small wrappers; search and save are safe Rust.
 
 ## Build
 
 ```sh
-./package.sh [output]   # default ~/Applications/VocabBar.app
+./package.sh [output]   # default ~/Applications/Shouci.app
 ```
 
 Also installed by `./scripts/install.sh` from the repo root. Rebind the hotkey in Settings.
 
 ```sh
-tail -f ~/Library/Logs/VocabBar/debug.log
+tail -f ~/Library/Logs/Shouci/debug.log
 ```

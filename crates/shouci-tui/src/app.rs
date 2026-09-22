@@ -15,7 +15,7 @@ use ratatui::{
 };
 use vocab_capture::{SearchMode, open_service, resolve, save_candidate};
 use vocab_core::{Result, VocabError, VocabItem};
-use vocab_db::{SaveOutcome, list_items};
+use vocab_db::{SaveOutcome, delete_item, list_items};
 use vocab_dictionary::{Candidate, SqliteDictionary};
 use vocab_search::SearchService;
 
@@ -195,9 +195,27 @@ impl App {
         Ok(())
     }
 
+    fn delete_selected_saved(&mut self) -> Result<()> {
+        let Some(index) = self.saved_state.selected() else {
+            self.status = String::from("nothing selected");
+            return Ok(());
+        };
+        let item = &self.saved[index];
+        let item_id = item.item_id;
+        let head = item.simplified.clone();
+        delete_item(&self.user_conn, item_id)?;
+        self.reload_saved()?;
+        self.status = format!("deleted: {head} (item {item_id})");
+        Ok(())
+    }
+
     fn on_saved_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => self.show_search(),
+            KeyCode::Delete | KeyCode::Char('d') => {
+                let op = self.delete_selected_saved();
+                self.capture(op);
+            }
             KeyCode::Tab => {
                 self.saved_filter_idx = (self.saved_filter_idx + 1) % STATUS_FILTERS.len();
                 let op = self.reload_saved();
@@ -909,6 +927,18 @@ mod tests {
     }
 
     #[test]
+    fn d_deletes_selected_saved_item() {
+        let mut app = app();
+        search_and_save(&mut app, "school");
+        press(&mut app, KeyCode::F(1)).unwrap();
+        assert_eq!(app.saved.len(), 1);
+        press(&mut app, KeyCode::Char('d')).unwrap();
+        assert!(app.saved.is_empty());
+        assert!(app.status.contains("deleted:"), "{}", app.status);
+        assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    #[test]
     fn escape_from_saved_returns_to_search() {
         let mut app = app();
         search_and_save(&mut app, "school");
@@ -1016,7 +1046,7 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol().to_owned())
                 .collect::<String>()
         };
-        assert!(row(2).contains("vocab"), "header shows brand");
+        assert!(row(2).contains("shouci"), "header shows brand");
         assert!(row(2).contains("ni"), "header shows query");
         assert!(row(22).contains("Enter"), "footer shows save hint");
     }

@@ -22,11 +22,11 @@ Two databases: read-only `dictionary.db`, writable `user.db`.
 
 ## Install (macOS)
 
-Needs a Rust toolchain and network on first dictionary fetch. VocabBar is
+Needs a Rust toolchain and network on first dictionary fetch. Shouci is
 unsigned — if Gatekeeper blocks it, right-click → Open.
 
 ```sh
-./scripts/install.sh              # fetches CC-CEDICT + frequency + HSK, then CLI/TUI/VocabBar
+./scripts/install.sh              # fetches CC-CEDICT + frequency + HSK, then CLI/TUI/Shouci
 ./scripts/install.sh --status
 ./scripts/install.sh --uninstall
 ```
@@ -36,20 +36,20 @@ Binaries go to `~/.local/bin` (symlinked on `~/.cargo/bin`). Dictionary and
 
 | App | How |
 | --- | --- |
-| VocabBar | **Ctrl+Opt+V** or left-click 文. Right-click 文 for Settings / Quit |
-| TUI | `vocab-tui` |
+| Shouci | **Ctrl+Opt+V** or left-click 文. Right-click 文 for Settings / Quit |
+| TUI | `shouci-tui` |
 | CLI | `vocab search` / `add` / `list` / `import` / `export` |
 
 ## Daily use
 
-**VocabBar** — type English, pinyin, or Chinese; live hits; **Enter** saves,
+**Shouci** — type English, pinyin, or Chinese; live hits; **Enter** saves,
 **Esc** dismisses. Right-click a row to save, mark needs-review, archive, or
 delete. Settings: rebind the hotkey, Open at Login.
 
 **TUI** — `F1` saved list, `F2` search (`Shift+Tab` toggles). Search: type to
 search, `Tab` cycles pinyin/english/chinese, **Enter** saves, **Esc** clears
 (quits when empty), `PgUp`/`PgDn` scroll detail. Saved: `Tab` filters status,
-`Ctrl+R` reloads. `Ctrl+Q` quits.
+`Ctrl+R` reloads, `d` deletes the selection. `Ctrl+Q` quits.
 
 **CLI**
 
@@ -59,6 +59,8 @@ vocab search english school --format json --limit 5
 vocab search pinyin "lǚ xíng"
 vocab add 学校 --mode chinese
 vocab list --status needs_review
+vocab delete 学校
+vocab delete 12
 vocab import fixtures/pleco/v1/valid/categories.txt
 vocab export /tmp/pleco-export.txt
 ```

@@ -1,4 +1,4 @@
-//! Process-level checks of the `vocab` binary.
+//! Process-level checks of the `shouci` binary.
 //!
 //! Add a search case by appending a row. Add a save/import flow as a named
 //! test that calls [`run`]. Requires `dictionary.db` (see README).
@@ -46,7 +46,7 @@ fn temp_user_db() -> PathBuf {
         .expect("clock")
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "vocab-e2e-{}-{}-{}",
+        "shouci-e2e-{}-{}-{}",
         std::process::id(),
         nanos,
         TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
@@ -56,17 +56,17 @@ fn temp_user_db() -> PathBuf {
 }
 
 fn run(user_db: Option<&Path>, args: &[&str]) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_vocab"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shouci"));
     cmd.arg("--dictionary").arg(dictionary());
     if let Some(path) = user_db {
         cmd.arg("--user-db").arg(path);
     }
-    let output = cmd.args(args).output().expect("spawn vocab");
+    let output = cmd.args(args).output().expect("spawn shouci");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
-        "vocab {args:?} failed {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        "shouci {args:?} failed {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status.code()
     );
     stdout
@@ -105,6 +105,33 @@ fn add_unique_chinese_then_list_and_refuse_duplicate() {
 
     let again = run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
     assert!(again.starts_with("already saved:"), "{again}");
+}
+
+#[test]
+fn add_then_delete_by_headword() {
+    let user_db = temp_user_db();
+    run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
+    let deleted = run(Some(&user_db), &["delete", "学校"]);
+    assert!(
+        deleted.starts_with("deleted:") && deleted.contains("学校"),
+        "{deleted}"
+    );
+    let listed = run(Some(&user_db), &["list"]);
+    assert!(listed.contains("no saved items"), "{listed}");
+}
+
+#[test]
+fn add_then_delete_by_id() {
+    let user_db = temp_user_db();
+    run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
+    let listed = run(Some(&user_db), &["list"]);
+    let id = listed.split_whitespace().next().expect("item id");
+    let deleted = run(Some(&user_db), &["delete", id]);
+    assert!(
+        deleted.starts_with("deleted:") && deleted.contains(id),
+        "{deleted}"
+    );
+    assert!(run(Some(&user_db), &["list"]).contains("no saved items"));
 }
 
 #[test]

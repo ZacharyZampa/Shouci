@@ -15,12 +15,12 @@ I want to make an app that works for us all will be open to any kind of support!
 ./scripts/check.sh          # fmt + clippy + all tests (fetches the dict if needed)
 ```
 
-CI is macOS. VocabBar (`vocab-mac`) will not build on Linux.
+CI is macOS. Shouci (`shouci-mac`) will not build on Linux.
 
 ## What “good” testing looks like (to me)
 
 - **I/O focused.** Query, file, or other input in, headword, saved item, or other output out.
-  Can add a row to `crates/vocab-cli/tests/e2e.rs` or a probe in
+  Can add a row to `crates/shouci-cli/tests/e2e.rs` or a probe in
   `fixtures/search/top1000.tsv` when search behavior changes.
 - **Do not remove a failing test to make the CR pass.** If a test is wrong, then we must fix it. But new or modified functionality should not impact others.
 - **`./scripts/check.sh` must pass.** That is fmt, clippy `-D warnings`, and

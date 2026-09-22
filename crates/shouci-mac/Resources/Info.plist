@@ -5,13 +5,21 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>VocabBar</string>
+    <string>Shouci</string>
     <key>CFBundleIdentifier</key>
-    <string>com.plecocompanion.vocabbar</string>
+    <string>com.zacharyzampa.shouci</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <!-- Brand icon: the 文 glyph on the accent tile, rendered from
+         Resources/AppIcon.png (1254² master) by package.sh via sips+iconutil
+         into AppIcon.icns. Matches the menu-bar 文 so Spotlight creates a
+         recognizable squircle instead of the generic gray placeholder. -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundleName</key>
-    <string>VocabBar</string>
+    <string>Shouci</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
