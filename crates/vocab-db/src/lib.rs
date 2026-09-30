@@ -6,13 +6,18 @@
 
 mod repo;
 mod schema;
+mod session;
 mod transfer;
 
 pub use repo::{
-    NewVocabItem, SaveOutcome, app_data_dir, delete_item, find_saved_item, get_item, list_items,
-    save_vocab_item, set_status,
+    NewVocabItem, SaveOutcome, app_data_dir, delete_item, find_saved_item, find_saved_reading,
+    get_item, list_items, save_vocab_item, set_status,
 };
 pub(crate) use schema::CREATE_USER_SCHEMA;
+pub use session::{
+    InboundInsert, InboundOp, SessionOutcome, TransferCounts, TransferDirection, TransferHeader,
+    apply_inbound, commit_outbound, record_rejected, select_for_transfer,
+};
 pub use transfer::{
     ExportRun, ImportDecision, ImportPayload, ImportRecord, ImportSummary, add_tag, commit_export,
     import_sources, item_tags, persist_import, select_exportable,
@@ -48,7 +53,8 @@ pub fn open_user_db(path: &Path) -> Result<rusqlite::Connection> {
 /// Returns an error if any schema statement fails.
 pub fn apply_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch(CREATE_USER_SCHEMA)
-        .map_err(|err| VocabError::new(format!("failed to apply user schema: {err}")))
+        .map_err(|err| VocabError::new(format!("failed to apply user schema: {err}")))?;
+    schema::migrate_vocabulary_identity(conn)
 }
 
 /// Runs `work` inside a single transaction. On error the transaction rolls back

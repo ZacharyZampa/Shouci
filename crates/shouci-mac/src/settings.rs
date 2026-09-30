@@ -1,7 +1,9 @@
 //! Hotkey recorder view + binding persistence.
 //!
-//! The Settings window's recorder is a tiny `define_class!` view: click to
-//! arm, press the new shortcut, done. Bindings persist in `UserDefaults`;
+//! The Settings window's recorder is a tiny `define_class!` view: click it
+//! (or focus it and press Space / Return) to arm, press the new shortcut,
+//! done. It draws a bezel and a system focus ring and presents itself to
+//! `VoiceOver` as a button whose press arms recording. Bindings persist in `UserDefaults`;
 //! the actual (un)registration lives on the delegate in `ui`, which owns the
 //! Carbon guard.
 
@@ -10,7 +12,10 @@ use std::cell::Cell;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
-use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSTextField, NSView};
+use objc2_app_kit::{
+    NSAccessibility, NSAccessibilityButtonRole, NSBezierPath, NSColor, NSEvent,
+    NSEventModifierFlags, NSTextField, NSView,
+};
 use objc2_foundation::{NSRect, NSString, NSUserDefaults, ns_string};
 
 use crate::hotkey;
@@ -164,18 +169,66 @@ define_class!(
             true
         }
 
+        #[unsafe(method(canBecomeKeyView))]
+        fn can_become_key_view(&self) -> bool {
+            true
+        }
+
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, _event: &NSEvent) {
-            self.ivars().recording.set(true);
-            self.refresh();
-            if let Some(window) = self.window() {
-                window.makeFirstResponder(Some(self));
+            self.begin_recording();
+        }
+
+        /// Bezel: control background, separator outline, accent outline
+        /// while recording. Colors resolve at draw time, so both
+        /// appearances follow the system.
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let path = self.bezel_path();
+            NSColor::controlBackgroundColor().setFill();
+            path.fill();
+            let recording = self.ivars().recording.get();
+            if recording {
+                NSColor::controlAccentColor().setStroke();
+                path.setLineWidth(2.0);
+            } else {
+                NSColor::separatorColor().setStroke();
+                path.setLineWidth(1.0);
             }
+            path.stroke();
+        }
+
+        #[unsafe(method(drawFocusRingMask))]
+        fn draw_focus_ring_mask(&self) {
+            self.bezel_path().fill();
+        }
+
+        #[unsafe(method(focusRingMaskBounds))]
+        fn focus_ring_mask_bounds(&self) -> NSRect {
+            self.bounds()
+        }
+
+        /// `VoiceOver` "press" arms recording, like a click.
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_perform_press(&self) -> bool {
+            self.begin_recording();
+            true
         }
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             if !self.ivars().recording.get() {
+                // Space or Return arms recording from the keyboard; every
+                // other key (Tab, Esc) keeps its usual window meaning.
+                let plain = carbon_modifiers(event.modifierFlags()) == 0;
+                if plain && matches!(event.keyCode(), KEY_SPACE | KEY_RETURN | KEY_ENTER) {
+                    self.begin_recording();
+                } else {
+                    // SAFETY: forwarding the event to `NSView`'s own handler.
+                    unsafe {
+                        let _: () = msg_send![super(self), keyDown: event];
+                    }
+                }
                 return;
             }
             // Plain Esc cancels the recording.
@@ -190,7 +243,7 @@ define_class!(
             };
             if !valid_hotkey(binding.modifiers) {
                 self.ivars().label.setStringValue(ns_string!(
-                    "Need Ctrl, Cmd, or Shift — Esc cancels"
+                    "Add ⌃, ⌘, or ⇧ · Esc cancels"
                 ));
                 return;
             }
@@ -208,18 +261,42 @@ define_class!(
     }
 );
 
+const KEY_RETURN: u16 = 36;
+const KEY_SPACE: u16 = 49;
+const KEY_ENTER: u16 = 76;
+
 impl HotkeyRecorder {
+    fn begin_recording(&self) {
+        self.ivars().recording.set(true);
+        self.refresh();
+        if let Some(window) = self.window() {
+            window.makeFirstResponder(Some(self));
+        }
+    }
+
+    fn bezel_path(&self) -> Retained<NSBezierPath> {
+        let bounds = self.bounds();
+        let inset = NSRect::new(
+            objc2_foundation::NSPoint::new(bounds.origin.x + 1.0, bounds.origin.y + 1.0),
+            objc2_foundation::NSSize::new(bounds.size.width - 2.0, bounds.size.height - 2.0),
+        );
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inset, 6.0, 6.0)
+    }
+
     fn refresh(&self) {
         let ivars = self.ivars();
-        if ivars.recording.get() {
+        let spoken = if ivars.recording.get() {
             ivars
                 .label
                 .setStringValue(ns_string!("Press shortcut… (Esc cancels)"));
+            String::from("Quick Capture hotkey: recording. Press the new shortcut; Escape cancels.")
         } else {
-            ivars
-                .label
-                .setStringValue(&NSString::from_str(&display_string()));
-        }
+            let current = display_string();
+            ivars.label.setStringValue(&NSString::from_str(&current));
+            format!("Quick Capture hotkey: {current}")
+        };
+        self.setAccessibilityLabel(Some(&NSString::from_str(&spoken)));
+        self.setNeedsDisplay(true);
     }
 
     /// Re-reads the stored binding (used after an external change).
@@ -229,15 +306,12 @@ impl HotkeyRecorder {
     }
 }
 
-/// Builds the recorder view (fixed frame; the caller positions it).
-pub(crate) fn recorder_view(mtm: MainThreadMarker, frame: NSRect) -> Retained<HotkeyRecorder> {
+/// Builds the recorder view: a fixed-size control the caller lays out.
+pub(crate) fn recorder_view(mtm: MainThreadMarker) -> Retained<HotkeyRecorder> {
     let label = NSTextField::labelWithString(ns_string!(""), mtm);
-    label.setFrame(NSRect::new(
-        objc2_foundation::NSPoint::new(8.0, 4.0),
-        objc2_foundation::NSSize::new(frame.size.width - 16.0, 20.0),
-    ));
     label.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(13.0)));
     label.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingTail);
     let this = HotkeyRecorder::alloc(mtm).set_ivars(RecorderIvars {
         label: label.clone(),
         recording: Cell::new(false),
@@ -246,6 +320,30 @@ pub(crate) fn recorder_view(mtm: MainThreadMarker, frame: NSRect) -> Retained<Ho
     let this: Retained<HotkeyRecorder> = unsafe { msg_send![super(this), init] };
     this.addSubview(&label);
     this.setWantsLayer(true);
+    // Fixed control size; the label centers inside the bezel.
+    crate::layout::manual(&this);
+    crate::layout::manual(&label);
+    crate::layout::activate(&[
+        this.widthAnchor().constraintEqualToConstant(168.0),
+        this.heightAnchor().constraintEqualToConstant(28.0),
+        label
+            .centerYAnchor()
+            .constraintEqualToAnchor(&this.centerYAnchor()),
+        label
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&this.leadingAnchor(), 8.0),
+        label
+            .trailingAnchor()
+            .constraintEqualToAnchor_constant(&this.trailingAnchor(), -8.0),
+    ]);
+    label.setAccessibilityElement(false);
+    this.setAccessibilityElement(true);
+    // SAFETY: extern static provided by AppKit; read-only.
+    this.setAccessibilityRole(Some(unsafe { NSAccessibilityButtonRole }));
+    this.setAccessibilityHelp(Some(ns_string!("Press to record a new shortcut.")));
+    this.setToolTip(Some(ns_string!(
+        "Click, or press Space, then type the new shortcut."
+    )));
     this.refresh_display();
     this
 }

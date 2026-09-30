@@ -19,6 +19,7 @@ vocab-capture = { path = "../vocab-capture" }
 vocab-core = { path = "../vocab-core" }
 vocab-db = { path = "../vocab-db" }
 vocab-dictionary = { path = "../vocab-dictionary" }
+vocab-pinyin = { path = "../vocab-pinyin" }
 vocab-search = { path = "../vocab-search" }
 
 # NOTE: `[lints] workspace = true` cannot be combined with per-lint

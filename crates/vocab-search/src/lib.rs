@@ -55,4 +55,10 @@ impl<P: DictionaryProvider> SearchService<P> {
         let candidates = self.provider.lookup_chinese(text)?;
         Ok(self.ranker.rank_chinese(text, candidates))
     }
+
+    /// The dictionary behind this service. Transfer uses exact lookup, not ranking.
+    #[must_use]
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
 }

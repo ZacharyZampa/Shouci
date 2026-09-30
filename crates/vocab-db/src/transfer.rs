@@ -327,11 +327,11 @@ fn record_import_run(
     Ok(())
 }
 
-fn count_to_i64(count: usize) -> Result<i64> {
+pub(crate) fn count_to_i64(count: usize) -> Result<i64> {
     i64::try_from(count).map_err(|_| VocabError::new("count out of range for i64"))
 }
 
-fn ensure_tag(conn: &rusqlite::Connection, name: &str) -> Result<i64> {
+pub(crate) fn ensure_tag(conn: &rusqlite::Connection, name: &str) -> Result<i64> {
     let existing = conn
         .query_row(
             "SELECT tag_id FROM tags WHERE name = ?1 COLLATE NOCASE",
@@ -351,7 +351,7 @@ fn ensure_tag(conn: &rusqlite::Connection, name: &str) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-fn link_tag(conn: &rusqlite::Connection, item_id: i64, tag_id: i64) -> Result<()> {
+pub(crate) fn link_tag(conn: &rusqlite::Connection, item_id: i64, tag_id: i64) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO vocabulary_tags (item_id, tag_id) VALUES (?1, ?2)",
         rusqlite::params![item_id, tag_id],
@@ -360,7 +360,11 @@ fn link_tag(conn: &rusqlite::Connection, item_id: i64, tag_id: i64) -> Result<()
     Ok(())
 }
 
-fn record_audit(conn: &rusqlite::Connection, event_type: &str, detail: &str) -> Result<()> {
+pub(crate) fn record_audit(
+    conn: &rusqlite::Connection,
+    event_type: &str,
+    detail: &str,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO audit_events (event_type, detail) VALUES (?1, ?2)",
         rusqlite::params![event_type, detail],

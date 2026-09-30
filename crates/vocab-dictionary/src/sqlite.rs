@@ -581,6 +581,23 @@ impl DictionaryProvider for SqliteDictionary {
         Ok(merged)
     }
 
+    fn entries_by_headword(&self, headword: &str) -> Result<Vec<vocab_core::DictionaryEntry>> {
+        let text = headword.trim();
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let clauses = vec![
+            ("simplified = ?".to_owned(), vec![text.to_owned().into()]),
+            ("traditional = ?".to_owned(), vec![text.to_owned().into()]),
+        ];
+        let candidates =
+            self.select_entries_where(&clauses, MatchBasis::Simplified, false, ClauseJoin::Or)?;
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| candidate.entry)
+            .collect())
+    }
+
     fn schema_version(&self) -> &str {
         &self.schema_version
     }

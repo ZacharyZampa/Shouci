@@ -1,4 +1,5 @@
 use std::io;
+use std::path::{Path, PathBuf};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -8,7 +9,6 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
@@ -16,7 +16,8 @@ use ratatui::{
 use vocab_capture::{SearchMode, open_service, resolve, save_candidate};
 use vocab_core::{Result, VocabError, VocabItem};
 use vocab_db::{SaveOutcome, delete_item, list_items};
-use vocab_dictionary::{Candidate, SqliteDictionary};
+use vocab_dictionary::{Candidate, SqliteDictionary, display_definition};
+use vocab_exchange::{ExportOptions, ImportOptions, export_file, import_file};
 use vocab_search::SearchService;
 
 use crate::state::{
@@ -25,6 +26,62 @@ use crate::state::{
 };
 use crate::theme::Theme;
 use crate::ui::{DETAIL_SCROLL_STEP, MIN_HEIGHT, MIN_WIDTH};
+
+const CODECS: [&str; 2] = ["pleco-utf8-text/v1", "anki-text/v1"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    Import,
+    Export,
+}
+
+#[derive(Debug, Clone)]
+struct TransferPrompt {
+    kind: PromptKind,
+    codec_idx: usize,
+    only_new: bool,
+    path: String,
+    /// False while the prompt is a confirm step that hands off to the native
+    /// panel. True only as a fallback, when no panel can open and the path has
+    /// to be typed after all.
+    typing: bool,
+}
+
+/// A request for the native file panel, answered by the event loop because only
+/// it owns the terminal that has to be handed over to the panel and back.
+#[derive(Debug, Clone)]
+struct PickerRequest {
+    kind: PromptKind,
+    suggested: String,
+}
+
+fn pane_title(name: &'static str, view: View) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" · {}", crate::ui::pane_hint(view)), Theme::dim()),
+    ])
+}
+
+/// Status after backing out of an import or export prompt.
+fn cancelled_message(kind: Option<PromptKind>) -> String {
+    String::from(match kind {
+        Some(PromptKind::Import) => "import cancelled — nothing changed",
+        Some(PromptKind::Export) => "export cancelled — no file written",
+        None => "cancelled",
+    })
+}
+
+fn default_transfer_path(codec: &str) -> String {
+    let name = if codec == CODECS[1] {
+        "shouci-anki.txt"
+    } else {
+        "shouci-pleco.txt"
+    };
+    let home = vocab_exchange::expand_path(Path::new("~")).unwrap_or_default();
+    let desktop = home.join("Desktop");
+    let dir = if desktop.is_dir() { desktop } else { home };
+    dir.join(name).to_string_lossy().into_owned()
+}
 
 /// Two-pane terminal UI:
 ///
@@ -50,6 +107,12 @@ pub struct App {
     status: String,
     error: Option<String>,
     detail_scroll: u16,
+    prompt: Option<TransferPrompt>,
+    /// Set by the prompt when Enter should hand over to the native panel.
+    picker: Option<PickerRequest>,
+    /// Saved item awaiting a `y` to confirm deletion: `(item_id, headword)`.
+    /// Deletion is irreversible, so `d` only arms it.
+    pending_delete: Option<(i64, String)>,
     pub should_quit: bool,
 }
 
@@ -71,6 +134,9 @@ impl App {
             status: String::new(),
             error: None,
             detail_scroll: 0,
+            prompt: None,
+            picker: None,
+            pending_delete: None,
             should_quit: false,
         }
     }
@@ -121,8 +187,32 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
+        if let Some((item_id, head)) = self.pending_delete.take() {
+            let confirmed = matches!(key.code, KeyCode::Char('y' | 'Y'))
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+            if confirmed {
+                let op = self.delete_saved(item_id, &head);
+                self.capture(op);
+                return Ok(());
+            }
+            self.status = format!("kept {head}");
+            // Ctrl commands (quit, import, export) still run; any other key
+            // only cancels, so a stray letter never lands somewhere else.
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(());
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.on_control(key.code);
+            if self.prompt.is_some() {
+                self.on_prompt_control(key.code);
+            } else {
+                self.on_control(key.code);
+            }
+            return Ok(());
+        }
+        if self.prompt.is_some() {
+            let op = self.on_prompt_key(key.code);
+            self.capture(op);
             return Ok(());
         }
         match key.code {
@@ -153,6 +243,8 @@ impl App {
     fn on_control(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q' | 'c') => self.should_quit = true,
+            KeyCode::Char('o') => self.begin_prompt(PromptKind::Import),
+            KeyCode::Char('e') => self.begin_prompt(PromptKind::Export),
             KeyCode::Char('r') if self.view == View::Saved => {
                 let op = self.reload_saved();
                 self.capture(op);
@@ -195,36 +287,235 @@ impl App {
         Ok(())
     }
 
-    fn delete_selected_saved(&mut self) -> Result<()> {
-        let Some(index) = self.saved_state.selected() else {
+    /// Arms deletion of the selected item; the next key confirms (`y`) or
+    /// cancels (anything else). See [`App::on_key`].
+    fn request_delete_selected(&mut self) {
+        let Some(item) = self.saved_state.selected().and_then(|i| self.saved.get(i)) else {
             self.status = String::from("nothing selected");
-            return Ok(());
+            return;
         };
-        let item = &self.saved[index];
-        let item_id = item.item_id;
         let head = item.simplified.clone();
+        self.status =
+            format!("delete {head}? can't be undone · y deletes · any other key keeps it");
+        self.pending_delete = Some((item.item_id, head));
+    }
+
+    fn delete_saved(&mut self, item_id: i64, head: &str) -> Result<()> {
         delete_item(&self.user_conn, item_id)?;
         self.reload_saved()?;
-        self.status = format!("deleted: {head} (item {item_id})");
+        self.status = format!("deleted {head}");
         Ok(())
+    }
+
+    fn begin_prompt(&mut self, kind: PromptKind) {
+        let path = default_transfer_path(CODECS[0]);
+        self.prompt = Some(TransferPrompt {
+            kind,
+            codec_idx: 0,
+            only_new: false,
+            path,
+            typing: false,
+        });
+        self.refresh_prompt_status();
+    }
+
+    /// Takes the pending native-panel request, if the prompt asked for one.
+    fn take_picker(&mut self) -> Option<PickerRequest> {
+        self.picker.take()
+    }
+
+    /// Applies a path chosen in the native panel and runs the transfer.
+    fn accept_picked_path(&mut self, path: String) {
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.path = path;
+        }
+        let op = self.run_prompt();
+        self.capture(op);
+    }
+
+    /// The panel was dismissed, so leave the prompt exactly as it was.
+    fn cancel_picker(&mut self) {
+        let kind = self.prompt.as_ref().map(|prompt| prompt.kind);
+        self.prompt = None;
+        self.status = cancelled_message(kind);
+    }
+
+    /// No panel could be opened, so fall back to typing the path.
+    fn fall_back_to_typing(&mut self, reason: &str) {
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.typing = true;
+        }
+        self.error = None;
+        self.refresh_prompt_status();
+        self.status = format!("no file picker ({reason}) — type the path, Enter runs, Esc cancels");
+    }
+
+    fn on_prompt_control(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q' | 'c') => {
+                self.should_quit = true;
+                return;
+            }
+            KeyCode::Char('t') => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.codec_idx = (prompt.codec_idx + 1) % CODECS.len();
+                    if !prompt.typing {
+                        prompt.path = default_transfer_path(CODECS[prompt.codec_idx]);
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    if prompt.kind == PromptKind::Export {
+                        prompt.only_new = !prompt.only_new;
+                    }
+                }
+            }
+            _ => return,
+        }
+        self.refresh_prompt_status();
+    }
+
+    fn on_prompt_key(&mut self, code: KeyCode) -> Result<()> {
+        let typing = self.prompt.as_ref().is_some_and(|p| p.typing);
+        match code {
+            KeyCode::Esc => {
+                let kind = self.prompt.as_ref().map(|prompt| prompt.kind);
+                self.prompt = None;
+                self.status = cancelled_message(kind);
+                Ok(())
+            }
+            KeyCode::Enter if typing => self.run_prompt(),
+            KeyCode::Enter => {
+                let request = self.prompt.as_ref().map(|prompt| PickerRequest {
+                    kind: prompt.kind,
+                    suggested: prompt.path.clone(),
+                });
+                self.picker = request;
+                Ok(())
+            }
+            KeyCode::Backspace if typing => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.path.pop();
+                }
+                self.refresh_prompt_status();
+                Ok(())
+            }
+            KeyCode::Char(ch) if typing && !ch.is_control() => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.path.push(ch);
+                }
+                self.refresh_prompt_status();
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn run_prompt(&mut self) -> Result<()> {
+        let Some(prompt) = self.prompt.clone() else {
+            return Ok(());
+        };
+        let path = prompt.path.trim();
+        if path.is_empty() {
+            self.status = String::from("type a file path first (Esc cancels)");
+            return Ok(());
+        }
+        let codec = CODECS[prompt.codec_idx].to_owned();
+        let dict = self.service.provider();
+        let report = match prompt.kind {
+            PromptKind::Import => import_file(
+                &mut self.user_conn,
+                Some(dict),
+                Path::new(path),
+                &ImportOptions {
+                    codec,
+                    force: false,
+                    dry_run: false,
+                },
+            )?,
+            PromptKind::Export => export_file(
+                &mut self.user_conn,
+                Some(dict),
+                Path::new(path),
+                &ExportOptions {
+                    codec,
+                    only_new: prompt.only_new,
+                    allow_unresolved: false,
+                    include_archived: false,
+                    tags: Vec::new(),
+                    category: None,
+                    deck: "Shouci".to_owned(),
+                    dry_run: false,
+                },
+            )?,
+        };
+        self.prompt = None;
+        self.reload_saved()?;
+        self.status = report.summary;
+        self.succeeded();
+        Ok(())
+    }
+
+    fn refresh_prompt_status(&mut self) {
+        let Some(prompt) = self.prompt.clone() else {
+            return;
+        };
+        let kind = match prompt.kind {
+            PromptKind::Import => "import",
+            PromptKind::Export => "export",
+        };
+        let scope = if prompt.kind == PromptKind::Export && prompt.only_new {
+            " only-new"
+        } else {
+            ""
+        };
+        let codec = CODECS[prompt.codec_idx];
+        let typed = prompt.path.trim();
+        // Show the real destination, never the shorthand, so there is nothing
+        // left to guess about where the file lands.
+        let resolved = vocab_exchange::expand_path(Path::new(typed)).unwrap_or_default();
+        let state = if typed.is_empty() {
+            "no path".to_owned()
+        } else if prompt.kind == PromptKind::Import {
+            if resolved.exists() {
+                "file found".to_owned()
+            } else {
+                "file missing".to_owned()
+            }
+        } else if resolved.exists() {
+            "will replace".to_owned()
+        } else {
+            "new file".to_owned()
+        };
+        let action = if prompt.typing {
+            "Enter run"
+        } else if prompt.kind == PromptKind::Import {
+            "Enter choose file"
+        } else {
+            "Enter choose location"
+        };
+        self.status = format!(
+            "{kind} {codec}{scope} · {state} · {}  {action} · Ctrl+T codec · Esc cancel",
+            resolved.display()
+        );
     }
 
     fn on_saved_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => self.show_search(),
-            KeyCode::Delete | KeyCode::Char('d') => {
-                let op = self.delete_selected_saved();
-                self.capture(op);
-            }
+            KeyCode::Char('i') => self.begin_prompt(PromptKind::Import),
+            KeyCode::Char('e') => self.begin_prompt(PromptKind::Export),
+            KeyCode::Delete | KeyCode::Char('d') => self.request_delete_selected(),
             KeyCode::Tab => {
                 self.saved_filter_idx = (self.saved_filter_idx + 1) % STATUS_FILTERS.len();
                 let op = self.reload_saved();
                 self.capture(op);
                 if self.error.is_none() {
                     self.status = format!(
-                        "filter: {} — {} item(s)",
+                        "showing {} · {}",
                         crate::state::filter_label(STATUS_FILTERS[self.saved_filter_idx]),
-                        self.saved.len()
+                        crate::state::counted(self.saved.len(), "word", "words")
                     );
                 }
             }
@@ -261,9 +552,9 @@ impl App {
                     SearchMode::Chinese => SearchMode::Pinyin,
                 };
                 self.status = String::from(match self.mode {
-                    SearchMode::English => "english gloss search",
-                    SearchMode::Pinyin => "pinyin search",
-                    SearchMode::Chinese => "chinese lookup",
+                    SearchMode::English => "searching English definitions",
+                    SearchMode::Pinyin => "searching pinyin",
+                    SearchMode::Chinese => "searching Chinese characters",
                 });
             }
             KeyCode::Char(c) if !c.is_control() => {
@@ -283,7 +574,8 @@ impl App {
                     let op = self.save_selected();
                     self.capture(op);
                 } else if !self.query.is_empty() {
-                    self.status = String::from("nothing selected to save");
+                    self.status =
+                        String::from("nothing to save: no matches (Tab tries another mode)");
                 }
             }
             KeyCode::Down => {
@@ -336,8 +628,8 @@ impl App {
         self.detail_scroll = 0;
         self.succeeded();
         self.status = format!(
-            "{} result(s) for {:?}",
-            self.results.len(),
+            "{} · {}",
+            crate::state::counted(self.results.len(), "result", "results"),
             self.mode_label()
         );
         Ok(())
@@ -351,12 +643,13 @@ impl App {
         let outcome = save_candidate(&self.user_conn, candidate)?;
         self.status = match outcome {
             SaveOutcome::Inserted(item) => format!(
-                "saved: {} / {}  [{}] (item {})",
-                item.simplified, item.traditional, item.pinyin, item.item_id
+                "saved {}",
+                crate::ui::plain_headword(&item.simplified, &item.traditional, &item.pinyin)
             ),
             SaveOutcome::Duplicate(item) => format!(
-                "already saved: {} / {}  [{}] (item {})",
-                item.simplified, item.traditional, item.pinyin, item.item_id
+                "already saved {} ({})",
+                crate::ui::plain_headword(&item.simplified, &item.traditional, &item.pinyin),
+                item.status.label()
             ),
         };
         self.succeeded();
@@ -373,7 +666,10 @@ impl App {
 
     fn selected_detail(&self) -> String {
         let Some(index) = self.list_state.selected() else {
-            return String::from("no selection — type a query and press Enter");
+            return format!(
+                "type to search {} · Tab changes what you're searching · Enter saves the highlighted word",
+                self.mode_label()
+            );
         };
         let Some(candidate) = self.results.get(index) else {
             return String::from("no selection");
@@ -383,43 +679,52 @@ impl App {
         } else {
             ""
         };
-        let mut ranks = String::new();
-        match (candidate.entry.frequency_rank, candidate.entry.hsk_rank) {
-            (Some(freq), Some(hsk)) => ranks = format!(" — freq {freq} · HSK {hsk}"),
-            (Some(freq), None) => ranks = format!(" — freq {freq}"),
-            (None, Some(hsk)) => ranks = format!(" — HSK {hsk}"),
-            (None, None) => {}
+        let mut facts = vec![format!(
+            "{}{inferred}",
+            crate::state::basis_label(candidate.diagnostic.basis)
+        )];
+        if let Some(freq) = candidate.entry.frequency_rank {
+            facts.push(format!("frequency rank {freq}"));
+        }
+        if let Some(hsk) = candidate.entry.hsk_rank {
+            facts.push(format!("HSK {hsk}"));
         }
         format!(
-            "{} / {}  [{}]  {} — {:?}{}{}",
-            candidate.entry.simplified,
-            candidate.entry.traditional,
-            candidate.entry.pinyin,
-            candidate.entry.glosses.join("; "),
-            candidate.diagnostic.basis,
-            inferred,
-            ranks,
+            "{}\n{}\n{}",
+            crate::ui::plain_headword(
+                &candidate.entry.simplified,
+                &candidate.entry.traditional,
+                &candidate.entry.pinyin,
+            ),
+            display_definition(&candidate.entry.glosses.join("; ")),
+            facts.join(" · "),
         )
     }
 
     fn saved_detail(&self) -> String {
         let Some(index) = self.saved_state.selected() else {
-            return String::from(
-                "no saved items — switch to search (F2), save a result with Enter,",
-            );
+            return String::from(if self.saved_filter_idx == 0 {
+                "no saved words yet — press F2 to search, then Enter to save a word"
+            } else {
+                "no words with this status — Tab shows the next filter"
+            });
         };
         let Some(item) = self.saved.get(index) else {
             return String::from("no selection");
         };
-        let mut lines = vec![format!(
-            "#{} · {}  (created {}, modified {})",
-            item.item_id, item.status, item.created_at, item.modified_at
+        let mut lines = vec![crate::ui::plain_headword(
+            &item.simplified,
+            &item.traditional,
+            &item.pinyin,
         )];
+        lines.push(display_definition(&item.definition));
         lines.push(format!(
-            "{} / {}  [{}]",
-            item.simplified, item.traditional, item.pinyin
+            "{} · saved {} · changed {} · item {}",
+            item.status.label(),
+            item.created_at,
+            item.modified_at,
+            item.item_id
         ));
-        lines.push(format!("definition: {}", item.definition));
         if let Some(notes) = &item.notes {
             lines.push(format!("notes: {notes}"));
         }
@@ -431,6 +736,7 @@ impl App {
 
     fn render_results(&mut self, frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect) {
         let theme = self.theme;
+        let width = frame.area().width;
         // No index numbers: selection is arrows-only (typing appends to the
         // query), so numbers would be decoration without a function.
         let items: Vec<ListItem> = self
@@ -438,17 +744,16 @@ impl App {
             .iter()
             .map(|c| {
                 let marker = if c.diagnostic.is_inferred {
-                    "▸inferred "
+                    "▸inferred"
                 } else {
                     ""
                 };
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!(
-                        "{marker}{} / {}  [{}]  ",
-                        c.entry.simplified, c.entry.traditional, c.entry.pinyin
-                    )),
-                    Span::styled(c.entry.glosses.join("; "), Theme::dim()),
-                ]))
+                ListItem::new(crate::ui::row_line(
+                    marker,
+                    (&c.entry.simplified, &c.entry.traditional, &c.entry.pinyin),
+                    &display_definition(&c.entry.glosses.join("; ")),
+                    width,
+                ))
             })
             .collect();
         scroll_into_view(&mut self.list_state, area.height as usize);
@@ -459,10 +764,7 @@ impl App {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(theme.focus_border())
-                        .title(Line::styled(
-                            "results",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        )),
+                        .title(pane_title("results", View::Search)),
                 )
                 .highlight_style(Theme::selected()),
             area,
@@ -472,6 +774,7 @@ impl App {
 
     fn render_saved(&mut self, frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect) {
         let theme = self.theme;
+        let width = frame.area().width;
         // No ids or statuses on rows: every save is deliberately picked, so
         // the active filter (header) plus the `selected` detail pane carry
         // that context instead.
@@ -479,13 +782,12 @@ impl App {
             .saved
             .iter()
             .map(|item| {
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!(
-                        "{} / {}  [{}]  ",
-                        item.simplified, item.traditional, item.pinyin
-                    )),
-                    Span::styled(item.definition.clone(), Theme::dim()),
-                ]))
+                ListItem::new(crate::ui::row_line(
+                    "",
+                    (&item.simplified, &item.traditional, &item.pinyin),
+                    &display_definition(&item.definition),
+                    width,
+                ))
             })
             .collect();
         scroll_into_view(&mut self.saved_state, area.height as usize);
@@ -496,10 +798,7 @@ impl App {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(theme.focus_border())
-                        .title(Line::styled(
-                            "saved",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        )),
+                        .title(pane_title("saved", View::Saved)),
                 )
                 .highlight_style(Theme::selected()),
             area,
@@ -516,7 +815,7 @@ impl App {
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
                             .title(Line::styled(
-                                "vocab",
+                                "shouci",
                                 Style::default().add_modifier(Modifier::BOLD),
                             )),
                     );
@@ -524,16 +823,7 @@ impl App {
             return;
         }
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(3),
-                Constraint::Length(6),
-                Constraint::Length(1),
-            ])
-            .split(area);
+        let panes = crate::ui::panes(area);
 
         let theme = self.theme;
         let header = crate::ui::header_line(
@@ -545,6 +835,7 @@ impl App {
             self.saved_filter_idx,
             &STATUS_FILTERS,
         );
+        let header_width = header.width();
         frame.render_widget(
             Paragraph::new(header).block(
                 Block::default()
@@ -556,12 +847,18 @@ impl App {
                         Style::default().add_modifier(Modifier::BOLD),
                     )),
             ),
-            chunks[0],
+            panes.header,
         );
+        // Park the cursor at the end of the query so input-method
+        // composition (pinyin → 汉字) appears where the text goes. Elsewhere
+        // no cursor is shown: saved-view keys are commands, not text.
+        if self.view == View::Search && self.prompt.is_none() {
+            frame.set_cursor_position(crate::ui::query_cursor(panes.header, header_width));
+        }
 
         match self.view {
-            View::Search => self.render_results(frame, chunks[1]),
-            View::Saved => self.render_saved(frame, chunks[1]),
+            View::Search => self.render_results(frame, panes.list),
+            View::Saved => self.render_saved(frame, panes.list),
         }
 
         let detail = match self.view {
@@ -570,13 +867,13 @@ impl App {
         };
         // Clamp the scroll offset to wrapped content: without the pane width
         // the stored offset could scroll past the last row into blank space.
-        let inner_width = chunks[2].width.saturating_sub(2);
-        let visible_height = chunks[2].height.saturating_sub(2);
+        let inner_width = panes.detail.width.saturating_sub(2);
+        let visible_height = panes.detail.height.saturating_sub(2);
         let max = crate::ui::detail_scroll_max(&detail, inner_width, visible_height);
         self.detail_scroll = self.detail_scroll.min(max);
         // Advertise scrolling only when there is somewhere to go.
         let detail_title = if max > 0 {
-            format!("selected {}/{} (PgDn)", self.detail_scroll, max)
+            format!("selected · PgUp/PgDn scroll {}/{}", self.detail_scroll, max)
         } else {
             String::from("selected")
         };
@@ -594,7 +891,7 @@ impl App {
                             Style::default().add_modifier(Modifier::BOLD),
                         )),
                 ),
-            chunks[2],
+            panes.detail,
         );
         frame.render_widget(
             Paragraph::new(crate::ui::help_line(
@@ -602,9 +899,10 @@ impl App {
                 theme,
                 &self.status,
                 self.error.as_deref(),
+                panes.footer.width,
             ))
             .block(Block::default().borders(Borders::NONE)),
-            chunks[3],
+            panes.footer,
         );
     }
 }
@@ -631,6 +929,15 @@ pub fn run(dictionary: &std::path::Path, user_db: &std::path::Path) -> Result<()
             return Err(VocabError::new(format!("terminal init: {err}")));
         }
     };
+
+    // A panic would otherwise leave the shell in raw mode on the alternate
+    // screen. Restore the terminal first, then report as usual.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        default_hook(info);
+    }));
 
     let result = event_loop(&mut terminal, service, user_conn);
 
@@ -659,8 +966,54 @@ fn event_loop(
         {
             app.on_key(&key)?;
         }
+        if let Some(request) = app.take_picker() {
+            match pick_path(terminal, &request) {
+                Ok(Some(path)) => app.accept_picked_path(path),
+                Ok(None) => app.cancel_picker(),
+                Err(reason) => app.fall_back_to_typing(&reason),
+            }
+        }
     }
     Ok(())
+}
+
+/// Opens the native save/open panel for a transfer.
+///
+/// The panel draws on the normal screen, so the alternate screen and raw mode
+/// are handed back before it opens and taken again afterwards. Both restores
+/// run even if the panel fails, otherwise the TUI is left unusable.
+fn pick_path(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    request: &PickerRequest,
+) -> std::result::Result<Option<String>, String> {
+    let suggested = PathBuf::from(&request.suggested);
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(name) = suggested.file_name() {
+        dialog = dialog.set_file_name(name.to_string_lossy().into_owned());
+    }
+    if let Some(parent) = suggested.parent().filter(|p| !p.as_os_str().is_empty()) {
+        dialog = dialog.set_directory(parent);
+    }
+
+    disable_raw_mode().map_err(|err| format!("cannot leave raw mode: {err}"))?;
+    let left = execute!(io::stdout(), LeaveAlternateScreen).map_err(|err| err.to_string());
+
+    let chosen = match request.kind {
+        PromptKind::Import => dialog.pick_file(),
+        PromptKind::Export => dialog.save_file(),
+    };
+
+    let restored = enable_raw_mode()
+        .map_err(|err| format!("cannot restore raw mode: {err}"))
+        .and_then(|()| execute!(io::stdout(), EnterAlternateScreen).map_err(|err| err.to_string()))
+        .and_then(|()| terminal.clear().map_err(|err| err.to_string()));
+    left?;
+    restored?;
+
+    match chosen {
+        Some(path) => Ok(Some(path.to_string_lossy().into_owned())),
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -694,6 +1047,159 @@ mod tests {
         app.on_key(&KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    fn ctrl(app: &mut App, code: KeyCode) -> vocab_core::Result<()> {
+        app.on_key(&KeyEvent::new(code, KeyModifiers::CONTROL))
+    }
+
+    fn open_export_prompt(app: &mut App) {
+        ctrl(app, KeyCode::Char('e')).expect("open export prompt");
+    }
+
+    #[test]
+    fn export_prompt_starts_on_a_default_destination() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        let prompt = app.prompt.as_ref().expect("prompt open");
+        assert!(prompt.path.ends_with("shouci-pleco.txt"), "{}", prompt.path);
+        assert!(Path::new(&prompt.path).is_absolute(), "{}", prompt.path);
+        assert!(!prompt.typing, "should offer the panel, not typing");
+        assert!(
+            app.status.contains("Enter choose location"),
+            "status: {:?}",
+            app.status
+        );
+        assert!(app.status.contains("new file"), "status: {:?}", app.status);
+    }
+
+    #[test]
+    fn codec_toggle_renames_the_default_file() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        ctrl(&mut app, KeyCode::Char('t')).expect("cycle codec");
+        let prompt = app.prompt.as_ref().expect("prompt open");
+        assert!(prompt.path.ends_with("shouci-anki.txt"), "{}", prompt.path);
+        assert!(
+            app.status.contains("anki-text/v1"),
+            "status: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn only_new_toggle_is_export_only() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        ctrl(&mut app, KeyCode::Char('n')).expect("toggle only-new");
+        assert!(app.prompt.as_ref().expect("prompt").only_new);
+        assert!(app.status.contains("only-new"), "{:?}", app.status);
+    }
+
+    #[test]
+    fn enter_requests_the_panel_instead_of_writing() {
+        let mut app = app();
+        search_and_save(&mut app, "school");
+        open_export_prompt(&mut app);
+        press(&mut app, KeyCode::Enter).expect("enter");
+        let request = app.take_picker().expect("panel requested");
+        assert_eq!(request.kind, PromptKind::Export);
+        assert!(app.take_picker().is_none(), "request is taken once");
+        // Nothing was written: the transfer only runs once a path comes back.
+        assert!(!app.status.contains("exported"), "{:?}", app.status);
+    }
+
+    #[test]
+    fn import_prompt_offers_the_open_panel() {
+        let mut app = app();
+        ctrl(&mut app, KeyCode::Char('o')).expect("open import prompt");
+        press(&mut app, KeyCode::Enter).expect("enter");
+        let request = app.take_picker().expect("panel requested");
+        assert_eq!(request.kind, PromptKind::Import);
+        assert!(
+            app.prompt
+                .as_ref()
+                .expect("prompt")
+                .path
+                .ends_with("shouci-pleco.txt"),
+            "import default"
+        );
+    }
+
+    #[test]
+    fn the_confirm_step_ignores_typed_characters() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        let before = app.prompt.as_ref().expect("prompt").path.clone();
+        for ch in "xyz".chars() {
+            press(&mut app, KeyCode::Char(ch)).expect("ignored");
+        }
+        assert_eq!(app.prompt.as_ref().expect("prompt").path, before);
+        assert!(app.take_picker().is_none(), "no panel without Enter");
+    }
+
+    #[test]
+    fn backspace_is_ignored_until_typing_is_enabled() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        let before = app.prompt.as_ref().expect("prompt").path.clone();
+        press(&mut app, KeyCode::Backspace).expect("ignored");
+        assert_eq!(app.prompt.as_ref().expect("prompt").path, before);
+    }
+
+    #[test]
+    fn a_failed_panel_falls_back_to_typing() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        app.fall_back_to_typing("no panel available");
+        let prompt = app.prompt.as_ref().expect("prompt still open");
+        assert!(prompt.typing, "typing enabled after failure");
+        assert!(app.status.contains("type the path"), "{:?}", app.status);
+
+        for ch in "/tmp".chars() {
+            press(&mut app, KeyCode::Char(ch)).expect("typed");
+        }
+        assert!(
+            app.prompt.as_ref().expect("prompt").path.ends_with("/tmp"),
+            "typed into the path"
+        );
+    }
+
+    #[test]
+    fn a_dismissed_panel_leaves_the_prompt_clean() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        press(&mut app, KeyCode::Enter).expect("enter");
+        assert!(app.take_picker().is_some(), "panel requested");
+        app.cancel_picker();
+        assert!(app.prompt.is_none(), "prompt closed");
+        assert_eq!(app.status, "export cancelled — no file written");
+    }
+
+    #[test]
+    fn tilde_is_expanded_in_the_confirm_step() {
+        let mut app = app();
+        open_export_prompt(&mut app);
+        let home = vocab_exchange::expand_path(Path::new("~")).expect("home");
+        app.prompt.as_mut().expect("prompt").typing = true;
+        app.prompt.as_mut().expect("prompt").path = format!("~{HOME_MARK}");
+        app.refresh_prompt_status();
+        assert!(
+            app.status.contains(&home.to_string_lossy().into_owned()),
+            "status should show the expanded path: {:?}",
+            app.status
+        );
+    }
+
+    const HOME_MARK: &str = "/definitely-not-here.txt";
+
+    #[test]
+    fn pane_hints_advertise_the_transfer_keys() {
+        assert_eq!(crate::ui::pane_hint(View::Saved), "i import · e export");
+        assert_eq!(
+            crate::ui::pane_hint(View::Search),
+            "Ctrl+O import · Ctrl+E export"
+        );
+    }
+
     fn search_and_save(app: &mut App, word: &str) {
         if !app.query.is_empty() {
             // Esc on a non-empty query clears it (never quits here).
@@ -708,7 +1214,7 @@ mod tests {
         // Live search already populated results; Enter saves the selection.
         press(app, KeyCode::Enter).unwrap();
         assert!(
-            app.status.starts_with("saved: ") || app.status.starts_with("already saved: "),
+            app.status.starts_with("saved ") || app.status.starts_with("already saved "),
             "unexpected status after Enter: {:?}",
             app.status
         );
@@ -746,7 +1252,7 @@ mod tests {
         }
         press(&mut app, KeyCode::Enter).unwrap();
         assert!(
-            app.status.starts_with("saved: 学校 / 學校"),
+            app.status.starts_with("saved 学校 / 學校"),
             "unexpected status: {:?}",
             app.status
         );
@@ -767,7 +1273,7 @@ mod tests {
         }
         assert!(app.results.is_empty());
         press(&mut app, KeyCode::Enter).unwrap();
-        assert_eq!(app.status, "nothing selected to save");
+        assert!(app.status.starts_with("nothing to save"), "{}", app.status);
         assert!(!app.should_quit);
         assert!(
             list_items(&app.user_conn, None).unwrap().is_empty(),
@@ -802,7 +1308,7 @@ mod tests {
             "Ctrl+S must not save anything"
         );
         assert!(
-            !app.status.starts_with("saved: "),
+            !app.status.starts_with("saved "),
             "Ctrl+S must not report a save: {:?}",
             app.status
         );
@@ -894,7 +1400,15 @@ mod tests {
             "saved list is newest first"
         );
         assert_eq!(app.saved_state.selected(), Some(0));
-        assert!(app.saved_detail().contains("definition:"));
+        let detail = app.saved_detail();
+        assert!(
+            detail.contains(&display_definition(&app.saved[0].definition)),
+            "detail shows the definition: {detail}"
+        );
+        assert!(
+            !detail.contains("needs_review"),
+            "no machine status names: {detail}"
+        );
     }
 
     #[test]
@@ -933,9 +1447,26 @@ mod tests {
         press(&mut app, KeyCode::F(1)).unwrap();
         assert_eq!(app.saved.len(), 1);
         press(&mut app, KeyCode::Char('d')).unwrap();
+        assert_eq!(app.saved.len(), 1, "d alone only asks");
+        assert!(app.status.contains("y deletes"), "{}", app.status);
+        press(&mut app, KeyCode::Char('y')).unwrap();
         assert!(app.saved.is_empty());
-        assert!(app.status.contains("deleted:"), "{}", app.status);
+        assert!(app.status.starts_with("deleted "), "{}", app.status);
         assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    #[test]
+    fn any_other_key_cancels_a_pending_delete() {
+        let mut app = app();
+        search_and_save(&mut app, "school");
+        press(&mut app, KeyCode::F(1)).unwrap();
+        press(&mut app, KeyCode::Delete).unwrap();
+        press(&mut app, KeyCode::Down).unwrap();
+        assert_eq!(app.saved.len(), 1, "cancelled delete keeps the item");
+        assert!(app.status.starts_with("kept "), "{}", app.status);
+        // The cancelling key is consumed; a later y does nothing.
+        press(&mut app, KeyCode::Char('y')).unwrap();
+        assert_eq!(app.saved.len(), 1);
     }
 
     #[test]
@@ -1049,6 +1580,26 @@ mod tests {
         assert!(row(2).contains("shouci"), "header shows brand");
         assert!(row(2).contains("ni"), "header shows query");
         assert!(row(22).contains("Enter"), "footer shows save hint");
+    }
+
+    #[test]
+    fn cursor_follows_the_query_for_input_methods() {
+        use ratatui::{Terminal, backend::TestBackend, layout::Position};
+
+        let mut app = app();
+        for ch in "翻译".chars() {
+            press(&mut app, KeyCode::Char(ch)).unwrap();
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, frame.area()))
+            .unwrap();
+        // Header box at (1, 1); text "shouci [Pinyin]  翻译" is 21 cells wide
+        // (Chinese is double width), so the cursor sits at column 2 + 21.
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            Position::new(23, 2)
+        );
     }
 
     #[test]

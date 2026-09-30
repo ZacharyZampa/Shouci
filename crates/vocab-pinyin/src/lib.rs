@@ -8,7 +8,10 @@
 
 use std::fmt;
 
+mod marks;
 mod syllables;
+
+pub use marks::tone_marks;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NormalizedPinyin(String);

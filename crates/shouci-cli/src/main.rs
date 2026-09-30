@@ -6,11 +6,9 @@ use vocab_capture::{
     open_service, resolve, resolve_auto,
 };
 use vocab_core::{ItemStatus, Result, VocabError};
-use vocab_db::{
-    ExportRun, ImportDecision, ImportPayload, ImportRecord, commit_export, delete_item, get_item,
-    import_sources, item_tags, list_items, persist_import, select_exportable,
-};
-use vocab_pleco::{CodecRegistry, ExportRow, IssueSeverity};
+use vocab_db::{delete_item, get_item, list_items};
+use vocab_dictionary::{DictionaryProvider, SqliteDictionary};
+use vocab_exchange::{ExportOptions, ImportOptions, export_file, import_file};
 
 #[derive(Parser)]
 #[command(name = "shouci")]
@@ -66,9 +64,13 @@ struct ImportArgs {
     /// Import even when the source has error-severity lines.
     #[arg(long)]
     force: bool,
+    /// Resolve and report without writing `user.db`.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
+#[allow(clippy::struct_excessive_bools)]
 struct ExportArgs {
     /// Output file; writes a new file atomically, never overwriting input.
     #[arg(value_name = "FILE")]
@@ -85,6 +87,15 @@ struct ExportArgs {
     /// Allow exporting `needs_review` items (default: refuse).
     #[arg(long)]
     allow_unresolved: bool,
+    /// Include archived items.
+    #[arg(long)]
+    include_archived: bool,
+    /// Skip words already marked for this target.
+    #[arg(long)]
+    only_new: bool,
+    /// Anki deck name.
+    #[arg(long, default_value = "Shouci")]
+    deck: String,
     /// Preview what would be exported without writing the file.
     #[arg(long)]
     dry_run: bool,
@@ -198,8 +209,8 @@ fn main() -> Result<()> {
     } = Cli::parse();
     match command {
         Command::Add(args) => run_add(dictionary.as_deref(), user_db.as_deref(), &args),
-        Command::Import(args) => run_import(user_db.as_deref(), &args),
-        Command::Export(args) => run_export(user_db.as_deref(), &args),
+        Command::Import(args) => run_import(dictionary.as_deref(), user_db.as_deref(), &args),
+        Command::Export(args) => run_export(dictionary.as_deref(), user_db.as_deref(), &args),
         Command::List(args) => run_list(user_db.as_deref(), &args),
         Command::Delete(args) => run_delete(user_db.as_deref(), &args),
         Command::Search(args) => run_search(dictionary.as_deref(), &args),
@@ -351,169 +362,68 @@ fn run_delete(cli_user_db: Option<&std::path::Path>, args: &DeleteArgs) -> Resul
     Ok(())
 }
 
-fn run_import(cli_user_db: Option<&std::path::Path>, args: &ImportArgs) -> Result<()> {
-    let bytes = std::fs::read(&args.path)
-        .map_err(|err| VocabError::new(format!("cannot read {}: {err}", args.path.display())))?;
-    let registry = CodecRegistry::builtin();
-    let codec = registry
-        .get_by_key(&args.codec)
-        .ok_or_else(|| VocabError::new(format!("unknown codec '{}'", args.codec)))?;
-    let parsed = codec.parse(&bytes)?;
-
-    for issue in &parsed.issues {
-        let severity = match issue.severity {
-            IssueSeverity::Info => "info",
-            IssueSeverity::Warning => "warning",
-            IssueSeverity::Error => "error",
-        };
-        println!("  line {} [{}]: {}", issue.line, severity, issue.message);
-    }
-
-    let mut records: Vec<ImportRecord> = Vec::new();
-    let mut dropped_headwords = 0usize;
-    for record in parsed.records {
-        if record.simplified.trim().is_empty() {
-            println!(
-                "  line {} [error]: record has no headword; dropped",
-                record.line
-            );
-            dropped_headwords += 1;
-            continue;
-        }
-        records.push(ImportRecord {
-            simplified: record.simplified,
-            pinyin: record.pinyin,
-            definition: record.definition,
-            category: record.category,
-        });
-    }
-    let issues_errors = parsed
-        .issues
-        .iter()
-        .filter(|issue| issue.severity == IssueSeverity::Error)
-        .count();
-    let issues_warnings = parsed
-        .issues
-        .iter()
-        .filter(|issue| issue.severity == IssueSeverity::Warning)
-        .count();
-
+fn run_import(
+    cli_dictionary: Option<&std::path::Path>,
+    cli_user_db: Option<&std::path::Path>,
+    args: &ImportArgs,
+) -> Result<()> {
     let mut conn = open_capture_db(cli_user_db)?;
-    let payload = ImportPayload {
-        source_path: args.path.to_string_lossy().into_owned(),
-        codec_key: args.codec.clone(),
-        content_sha256: vocab_dictionary::sha256_hex(&bytes),
-        records,
-        issues_errors: issues_errors + dropped_headwords,
-        issues_warnings,
-    };
-    match persist_import(&mut conn, &payload, args.force)? {
-        ImportDecision::Imported(summary) => {
-            println!(
-                "imported {} ({} duplicates skipped, {} seen, {} errors, {} warnings)",
-                summary.records_imported,
-                summary.records_skipped_duplicate,
-                summary.records_seen,
-                summary.issues_errors,
-                summary.issues_warnings
-            );
-        }
-        ImportDecision::Refused => {
-            println!(
-                "refused: source has {} error-severity lines; fix them or pass --force",
-                payload.issues_errors
-            );
-        }
-    }
-    Ok(())
-}
-
-fn run_export(cli_user_db: Option<&std::path::Path>, args: &ExportArgs) -> Result<()> {
-    let mut conn = open_capture_db(cli_user_db)?;
-    let sources = import_sources(&conn)?;
-    if sources
-        .iter()
-        .any(|source| source == &args.path.to_string_lossy())
-    {
-        return Err(VocabError::new(format!(
-            "refusing to overwrite import source {}",
-            args.path.display()
-        )));
-    }
-
-    let mut required_tags = args.tag.clone();
-    if let Some(category) = args.category.as_deref() {
-        required_tags.push(category.to_owned());
-    }
-    let items = select_exportable(&conn, &required_tags, args.allow_unresolved)?;
-    if items.is_empty() {
-        println!("nothing to export");
-        return Ok(());
-    }
-
-    let rows: Vec<ExportRow> = items
-        .iter()
-        .map(|item| ExportRow {
-            simplified: item.simplified.clone(),
-            pinyin: item.pinyin.clone(),
-            definition: item.definition.clone(),
-            category: item_tags(&conn, item.item_id)
-                .ok()
-                .and_then(|tags| tags.into_iter().next()),
-        })
-        .collect();
-
-    if args.dry_run {
-        println!(
-            "dry run: would export {} items to {}",
-            rows.len(),
-            args.path.display()
-        );
-        for row in rows.iter().take(5) {
-            println!(
-                "  {} / {}  [{}]  {}",
-                row.simplified,
-                row.pinyin,
-                row.category.as_deref().unwrap_or(""),
-                row.definition
-            );
-        }
-        return Ok(());
-    }
-
-    let registry = CodecRegistry::builtin();
-    let codec = registry
-        .get_by_key(&args.codec)
-        .ok_or_else(|| VocabError::new(format!("unknown codec '{}'", args.codec)))?;
-    let bytes = codec.serialize(&rows)?;
-    atomic_write(&args.path, &bytes)?;
-
-    commit_export(
+    let dict = open_dictionary_if_present(cli_dictionary)?;
+    let report = import_file(
         &mut conn,
-        &ExportRun {
-            target_path: args.path.to_string_lossy().into_owned(),
-            codec_key: args.codec.clone(),
-            records_written: rows.len(),
+        dict.as_ref().map(|db| db as &dyn DictionaryProvider),
+        &args.path,
+        &ImportOptions {
+            codec: args.codec.clone(),
+            force: args.force,
+            dry_run: args.dry_run,
         },
-        &items.iter().map(|item| item.item_id).collect::<Vec<_>>(),
     )?;
-    println!("exported {} items to {}", rows.len(), args.path.display());
+    println!("{}", report.summary);
+    for line in &report.details {
+        println!("  {line}");
+    }
     Ok(())
 }
 
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| VocabError::new(format!("cannot create output dir: {err}")))?;
-        }
+fn run_export(
+    cli_dictionary: Option<&std::path::Path>,
+    cli_user_db: Option<&std::path::Path>,
+    args: &ExportArgs,
+) -> Result<()> {
+    let mut conn = open_capture_db(cli_user_db)?;
+    let dict = open_dictionary_if_present(cli_dictionary)?;
+    let report = export_file(
+        &mut conn,
+        dict.as_ref().map(|db| db as &dyn DictionaryProvider),
+        &args.path,
+        &ExportOptions {
+            codec: args.codec.clone(),
+            only_new: args.only_new,
+            allow_unresolved: args.allow_unresolved,
+            include_archived: args.include_archived,
+            tags: args.tag.clone(),
+            category: args.category.clone(),
+            deck: args.deck.clone(),
+            dry_run: args.dry_run,
+        },
+    )?;
+    println!("{}", report.summary);
+    for line in &report.details {
+        println!("  {line}");
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)
-        .map_err(|err| VocabError::new(format!("cannot write {}: {err}", tmp.display())))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|err| VocabError::new(format!("cannot replace {}: {err}", path.display())))?;
     Ok(())
+}
+
+fn open_dictionary_if_present(
+    cli_dictionary: Option<&std::path::Path>,
+) -> Result<Option<SqliteDictionary>> {
+    let path = vocab_capture::dictionary_path(cli_dictionary);
+    if path.is_file() {
+        SqliteDictionary::open(&path).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn clip(text: &str, max_chars: usize) -> String {

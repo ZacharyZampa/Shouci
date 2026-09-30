@@ -12,17 +12,19 @@
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSEventMask, NSMenu, NSMenuItem, NSStatusBar,
-    NSVariableStatusItemLength,
+    NSAccessibility, NSApplication, NSApplicationActivationPolicy, NSEventMask, NSMenu, NSMenuItem,
+    NSStatusBar, NSVariableStatusItemLength,
 };
-use objc2_foundation::ns_string;
-use vocab_capture::{dictionary_path, open_capture_db, open_service};
+use objc2_foundation::{NSString, ns_string};
+use vocab_capture::open_capture_db;
 use vocab_db::app_data_dir;
 
 mod capture;
 mod debuglog;
 mod hotkey;
+mod layout;
 mod login;
+mod menus;
 mod settings;
 mod ui;
 
@@ -32,20 +34,17 @@ mod search_quality;
 fn main() {
     let mtm = MainThreadMarker::new().expect("shouci-mac must start on the main thread");
 
-    // Core services first: dictionary search + user database. Failures here
-    // do not abort startup; the popover surfaces them in its status line.
-    let service = open_service(None);
+    // The user database opens here (local, fast). The dictionary does not:
+    // its first download or monthly refresh runs in the background after the
+    // status item is up, and the popover reports progress and failures.
     let user_db_path = match app_data_dir() {
         Ok(dir) => dir.join("user.db"),
         Err(_) => std::path::PathBuf::from("user.db"),
     };
     let user_conn = open_capture_db(Some(&user_db_path));
-    if let Err(err) = service.as_ref() {
-        eprintln!("shouci-mac: dictionary unavailable: {err}");
-        eprintln!("shouci-mac: looked at {}", dictionary_path(None).display());
-    }
     if let Err(err) = user_conn.as_ref() {
         eprintln!("shouci-mac: user db unavailable: {err}");
+        debuglog::event(&format!("user db error {err}"));
     }
 
     let app = NSApplication::sharedApplication(mtm);
@@ -55,14 +54,20 @@ fn main() {
     let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
     let button = item.button(mtm).expect("status item must have a button");
     button.setTitle(ns_string!("文"));
+    // VoiceOver would otherwise read the glyph as "wén".
+    button.setAccessibilityLabel(Some(ns_string!("Shouci")));
+    button.setToolTip(Some(&NSString::from_str(&format!(
+        "Shouci — {} to capture a word",
+        settings::display_string()
+    ))));
 
-    // The controller owns the popover and all its views. Both come up only
-    // when the core services did; otherwise there is nothing to capture to.
-    let delegate = match (service, user_conn) {
-        (Ok(service), Ok(user_conn)) => Some(ui::install(mtm, button.clone(), service, user_conn)),
-        (Err(err), _) | (_, Err(err)) => {
+    // The controller owns the popover and all its views. It needs the user
+    // database; without it there is nothing to save to.
+    let (delegate, user_db_error) = match user_conn {
+        Ok(user_conn) => (Some(ui::install(mtm, button.clone(), user_conn)), None),
+        Err(err) => {
             eprintln!("shouci-mac: running menu-only: {err}");
-            None
+            (None, Some(err.to_string()))
         }
     };
 
@@ -79,9 +84,21 @@ fn main() {
         }
         button.sendActionOn(NSEventMask::LeftMouseUp | NSEventMask::RightMouseUp);
     } else {
-        // Degraded mode (no dictionary/database): a Quit-only menu so the
-        // process is never stranded without UI.
+        // Degraded mode (no user database): say why, and offer Quit, so the
+        // process is never stranded without UI or an explanation.
         let menu = NSMenu::new(mtm);
+        let reason = NSMenuItem::new(mtm);
+        reason.setTitle(&NSString::from_str(&format!(
+            "Can't open your word list: {}",
+            user_db_error.unwrap_or_default()
+        )));
+        reason.setEnabled(false);
+        menu.addItem(&reason);
+        let location = NSMenuItem::new(mtm);
+        location.setTitle(&NSString::from_str(&user_db_path.display().to_string()));
+        location.setEnabled(false);
+        menu.addItem(&location);
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         let quit = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 mtm.alloc(),
@@ -104,7 +121,9 @@ fn main() {
     // changes); binding happens here so a failure is visible at startup.
     if let Some(delegate) = delegate.as_ref() {
         delegate.bind_default_hotkey();
+        delegate.start_dictionary();
     }
+    menus::install(mtm, delegate.as_deref());
 
     debuglog::event("started");
     app.run();

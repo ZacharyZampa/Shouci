@@ -17,7 +17,7 @@ vocab-capture = { path = "../vocab-capture", features = ["clap"] }
 vocab-core = { path = "../vocab-core" }
 vocab-db = { path = "../vocab-db" }
 vocab-dictionary = { path = "../vocab-dictionary" }
-vocab-pleco = { path = "../vocab-pleco" }
+vocab-exchange = { path = "../vocab-exchange" }
 
 [lints]
 workspace = true

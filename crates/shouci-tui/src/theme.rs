@@ -66,6 +66,12 @@ impl Theme {
         self.slot(Color::Yellow, Modifier::BOLD)
     }
 
+    /// The headword in list rows: bold, no hue, so it leads in every theme.
+    #[must_use]
+    pub(crate) fn headword() -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
     /// Secondary text (glosses, separators, counts): dimmed.
     #[must_use]
     pub(crate) fn dim() -> Style {

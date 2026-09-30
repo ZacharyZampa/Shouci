@@ -7,6 +7,7 @@
 //! read-only `dictionary.db` never requires app-code changes.
 
 mod cedict;
+mod display;
 mod fetch;
 mod frequency;
 mod hsk;
@@ -16,6 +17,7 @@ mod schema;
 mod sqlite;
 
 pub use cedict::CedictSource;
+pub use display::display_definition;
 pub use fetch::ensure_dictionary_db;
 pub use frequency::FrequencySource;
 pub use hsk::HskSource;

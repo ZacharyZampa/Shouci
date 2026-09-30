@@ -81,25 +81,22 @@ pub enum SaveOutcome {
 ///
 /// Returns an error if reading or writing the database fails.
 pub fn save_vocab_item(conn: &rusqlite::Connection, item: &NewVocabItem) -> Result<SaveOutcome> {
-    let existing = find_by_forms(
-        conn,
-        &item.simplified,
-        &item.traditional,
-        item.origin_export_id,
-    )?;
+    let key = pinyin_key(&item.pinyin);
+    let existing = find_by_reading(conn, &item.simplified, &item.traditional, &key)?;
     if let Some(stored) = existing {
         return Ok(SaveOutcome::Duplicate(stored));
     }
     let status = item.status.as_str();
     conn.execute(
         "INSERT INTO vocabulary_items \
-         (simplified, traditional, pinyin, definition, status, notes, source_entry_id, \
+         (simplified, traditional, pinyin, pinyin_key, definition, status, notes, source_entry_id, \
           source_id, source_version, import_origin, origin_export_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             item.simplified,
             item.traditional,
             item.pinyin,
+            key,
             item.definition,
             status,
             item.notes,
@@ -228,6 +225,59 @@ pub fn find_saved_item(
     traditional: &str,
 ) -> Result<Option<VocabItem>> {
     find_by_forms(conn, simplified, traditional, None)
+}
+
+/// Finds the saved item for one reading.
+///
+/// Identity is `(simplified, traditional, pinyin_key)`. A different reading of
+/// the same characters is a different item.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn find_saved_reading(
+    conn: &rusqlite::Connection,
+    simplified: &str,
+    traditional: &str,
+    pinyin: &str,
+) -> Result<Option<VocabItem>> {
+    find_by_reading(conn, simplified, traditional, &pinyin_key(pinyin))
+}
+
+pub(crate) fn pinyin_key(pinyin: &str) -> String {
+    let trimmed = pinyin.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        vocab_pinyin::normalize(trimmed).as_str().to_owned()
+    }
+}
+
+pub(crate) fn find_by_reading(
+    conn: &rusqlite::Connection,
+    simplified: &str,
+    traditional: &str,
+    pinyin_key: &str,
+) -> Result<Option<VocabItem>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT item_id FROM vocabulary_items \
+             WHERE simplified = ?1 COLLATE NOCASE AND traditional = ?2 COLLATE NOCASE \
+             AND pinyin_key = ?3 \
+             ORDER BY item_id LIMIT 1",
+        )
+        .map_err(|err| VocabError::new(format!("prepare reading lookup: {err}")))?;
+    let item_id: Option<i64> = stmt
+        .query_row(
+            rusqlite::params![simplified, traditional, pinyin_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| VocabError::new(format!("reading lookup: {err}")))?;
+    match item_id {
+        Some(id) => get_item(conn, id),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn select_items(
@@ -423,6 +473,32 @@ mod tests {
     }
 
     #[test]
+    fn two_readings_are_distinct_items() {
+        let c = conn();
+        let mut walking = new_item("行", "行");
+        walking.pinyin = "xing2".to_owned();
+        let mut bank = new_item("行", "行");
+        bank.pinyin = "hang2".to_owned();
+        let first = match save_vocab_item(&c, &walking).unwrap() {
+            SaveOutcome::Inserted(item) => item,
+            SaveOutcome::Duplicate(_) => panic!("expected first reading"),
+        };
+        let second = match save_vocab_item(&c, &bank).unwrap() {
+            SaveOutcome::Inserted(item) => item,
+            SaveOutcome::Duplicate(_) => panic!("expected second reading"),
+        };
+        assert_ne!(first.item_id, second.item_id);
+        let found = crate::find_saved_reading(&c, "行", "行", "hang2")
+            .unwrap()
+            .expect("bank reading");
+        assert_eq!(found.item_id, second.item_id);
+        let badge = crate::find_saved_item(&c, "行", "行")
+            .unwrap()
+            .expect("badge finds a reading");
+        assert_eq!(badge.item_id, first.item_id);
+    }
+
+    #[test]
     fn open_and_reopen_round_trip() {
         let dir = std::env::temp_dir().join(format!("vocab-db-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -458,5 +534,102 @@ mod tests {
     #[test]
     fn app_data_dir_resolves() {
         let _ = app_data_dir().unwrap();
+    }
+
+    #[test]
+    fn migrates_v1_identity_without_losing_the_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vocabulary_items (
+                item_id INTEGER PRIMARY KEY,
+                simplified TEXT NOT NULL,
+                traditional TEXT NOT NULL,
+                pinyin TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                notes TEXT,
+                source_entry_id INTEGER,
+                source_id TEXT,
+                source_version TEXT,
+                import_origin TEXT,
+                origin_export_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                modified_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vocabulary_items (simplified, traditional, pinyin, definition) \
+             VALUES ('你好', '你好', 'ni3 hao3', 'hello')",
+            [],
+        )
+        .unwrap();
+        let item_id = conn.last_insert_rowid();
+        crate::apply_schema(&conn).unwrap();
+        let key: String = conn
+            .query_row(
+                "SELECT pinyin_key FROM vocabulary_items WHERE item_id = ?1",
+                [item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "ni3 hao3");
+        let loaded = crate::get_item(&conn, item_id).unwrap().unwrap();
+        assert_eq!(loaded.simplified, "你好");
+        // Inserts rely on the timestamp defaults; the migrated table keeps them.
+        conn.execute(
+            "INSERT INTO vocabulary_items (simplified, traditional, pinyin, pinyin_key, definition) \
+             VALUES ('学校', '學校', 'xue2 xiao4', 'xue2 xiao4', 'school')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn repairs_a_migration_that_lost_the_timestamp_defaults() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // The shape an earlier build of the identity migration left behind.
+        conn.execute_batch(
+            "CREATE TABLE vocabulary_items (
+                item_id INTEGER PRIMARY KEY,
+                simplified TEXT NOT NULL,
+                traditional TEXT NOT NULL,
+                pinyin TEXT NOT NULL,
+                pinyin_key TEXT NOT NULL DEFAULT '',
+                definition TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                notes TEXT,
+                source_entry_id INTEGER,
+                source_id TEXT,
+                source_version TEXT,
+                import_origin TEXT,
+                origin_export_id INTEGER,
+                created_at TEXT NOT NULL,
+                modified_at TEXT NOT NULL,
+                UNIQUE (simplified COLLATE NOCASE, traditional COLLATE NOCASE, pinyin_key)
+            );
+            INSERT INTO vocabulary_items
+                (simplified, traditional, pinyin, pinyin_key, definition, created_at, modified_at)
+            VALUES ('你好', '你好', 'ni3 hao3', 'kept-key', 'hello', '2026-01-02', '2026-01-03');",
+        )
+        .unwrap();
+        crate::apply_schema(&conn).unwrap();
+        let (key, created): (String, String) = conn
+            .query_row(
+                "SELECT pinyin_key, created_at FROM vocabulary_items WHERE simplified = '你好'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(key, "kept-key", "repair keeps existing keys");
+        assert_eq!(created, "2026-01-02", "repair keeps existing timestamps");
+        conn.execute(
+            "INSERT INTO vocabulary_items (simplified, traditional, pinyin, pinyin_key, definition) \
+             VALUES ('学校', '學校', 'xue2 xiao4', 'xue2 xiao4', 'school')",
+            [],
+        )
+        .expect("saving works again after the repair");
+        // A second open is a no-op.
+        crate::apply_schema(&conn).unwrap();
     }
 }

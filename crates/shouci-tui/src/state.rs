@@ -25,7 +25,28 @@ pub(crate) const STATUS_FILTERS: [Option<ItemStatus>; 5] = [
 pub(crate) fn filter_label(filter: Option<ItemStatus>) -> &'static str {
     match filter {
         None => "all",
-        Some(status) => status.as_str(),
+        Some(status) => status.label(),
+    }
+}
+
+/// `1 item`, `3 items`: the count with its noun, singular when it is one.
+#[must_use]
+pub(crate) fn counted(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+/// How a search candidate matched, in the user's words.
+#[must_use]
+pub(crate) fn basis_label(basis: vocab_core::MatchBasis) -> &'static str {
+    match basis {
+        vocab_core::MatchBasis::EnglishGloss => "matched the English definition",
+        vocab_core::MatchBasis::Pinyin => "matched the pinyin",
+        vocab_core::MatchBasis::Simplified => "matched the characters",
+        vocab_core::MatchBasis::CharacterFallback => "contains these characters",
     }
 }
 

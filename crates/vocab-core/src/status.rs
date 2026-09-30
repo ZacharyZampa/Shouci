@@ -18,6 +18,19 @@ impl ItemStatus {
             Self::Archived => "archived",
         }
     }
+
+    /// Words for people, not files: `needs review`, not `needs_review`.
+    /// Lowercase so it reads mid-sentence; the stable machine form stays
+    /// [`ItemStatus::as_str`].
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::NeedsReview => "needs review",
+            Self::Exported => "exported",
+            Self::Archived => "archived",
+        }
+    }
 }
 
 impl std::str::FromStr for ItemStatus {

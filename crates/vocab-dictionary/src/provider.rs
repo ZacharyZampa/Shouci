@@ -40,5 +40,12 @@ pub trait DictionaryProvider: Send + Sync {
     /// Returns an error if the underlying dictionary database cannot be queried.
     fn lookup_chinese(&self, text: &str) -> Result<Vec<Candidate>>;
 
+    /// Exact simplified or traditional match. No prefix, no character fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying dictionary database cannot be queried.
+    fn entries_by_headword(&self, headword: &str) -> Result<Vec<DictionaryEntry>>;
+
     fn schema_version(&self) -> &str;
 }
