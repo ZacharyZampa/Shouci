@@ -1,309 +1,198 @@
-use vocab_core::{DictionaryEntry, ItemStatus};
+//! What an imported record becomes, given what the dictionaries say.
+//!
+//! - One dictionary entry with the record's characters (and reading, when
+//!   the record has one) → confirmed, with the dictionary's forms and
+//!   reading. The record's own definition wins when it differs.
+//! - The record's traditional form disagrees with that entry → needs review.
+//! - No entry, but the record has both a reading and a definition →
+//!   confirmed from the file.
+//! - Anything else (several entries, nothing to go on) → needs review.
+//!   Ambiguity is never resolved by guessing.
 
-use crate::card::{ExchangeCard, Field};
+use vocab_core::connector::ExchangeRecord;
+use vocab_core::{DictionaryEntry, Verification};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DictHit {
-    pub simplified: String,
-    pub traditional: String,
-    pub pinyin: String,
-    pub glosses: Vec<String>,
-    pub entry_id: Option<i64>,
-    pub source_id: String,
-    pub source_version: String,
-}
-
-impl DictHit {
-    pub(crate) fn from_entry(entry: &DictionaryEntry) -> Self {
-        Self {
-            simplified: entry.simplified.clone(),
-            traditional: entry.traditional.clone(),
-            pinyin: entry.pinyin.clone(),
-            glosses: entry.glosses.clone(),
-            entry_id: entry.stable_entry_id,
-            source_id: entry.provenance.source.as_str().to_owned(),
-            source_version: entry.provenance.source_version.as_str().to_owned(),
-        }
-    }
-}
+use crate::reading_key;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedCard {
+pub(crate) struct Resolved {
     pub simplified: String,
     pub traditional: String,
     pub pinyin: String,
     pub definition: String,
-    pub notes: Option<String>,
-    pub tags: Vec<String>,
-    pub status: ItemStatus,
-    pub source_entry_id: Option<i64>,
-    pub source_id: String,
-    pub source_version: String,
-    pub line: usize,
-    pub raw: String,
+    pub notes: String,
+    pub verification: Verification,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Resolution {
-    Drop {
-        line: usize,
-        raw: String,
-        message: String,
-    },
-    Card(ResolvedCard),
-}
-
-pub(crate) fn resolve(card: &ExchangeCard, hits: &[DictHit], app: &str) -> Resolution {
-    let headword = card.headword.trim();
+/// `Err` carries why the record cannot be imported at all.
+pub(crate) fn resolve(
+    record: &ExchangeRecord,
+    hits: &[DictionaryEntry],
+) -> Result<Resolved, String> {
+    let headword = record.headword.trim();
     if headword.is_empty() {
-        return Resolution::Drop {
-            line: card.line,
-            raw: card.raw.clone(),
-            message: "record has no headword".to_owned(),
-        };
+        return Err("record has no headword".to_owned());
     }
-    let exact: Vec<&DictHit> = hits
+    let exact = hits
         .iter()
-        .filter(|hit| hit.simplified == headword || hit.traditional == headword)
-        .collect();
-    let pinyin = present_text(&card.pinyin);
-    let narrowed: Vec<&DictHit> = match pinyin {
-        Some(reading) if !reading.is_empty() => {
+        .filter(|hit| hit.simplified == headword || hit.traditional == headword);
+    let narrowed: Vec<&DictionaryEntry> = match record.pinyin.text() {
+        Some(reading) => {
             let key = reading_key(reading);
             exact
-                .into_iter()
                 .filter(|hit| reading_key(&hit.pinyin) == key)
                 .collect()
         }
-        _ => exact,
+        None => exact.collect(),
     };
-    if let Some(hit) = single(&narrowed) {
-        if traditional_disagrees(card.traditional.as_deref(), hit) {
-            return Resolution::Card(unresolved(card, app, headword));
-        }
-        return Resolution::Card(from_hit(card, hit, app));
-    }
-    if narrowed.is_empty() && has_full_user_card(card) {
-        return Resolution::Card(user_card(card, app, headword));
-    }
-    Resolution::Card(unresolved(card, app, headword))
-}
-
-pub(crate) fn reading_key(pinyin: &str) -> String {
-    let trimmed = pinyin.trim();
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        vocab_pinyin::normalize(trimmed).as_str().to_owned()
-    }
-}
-
-pub(crate) fn definition_matches(stored: &str, glosses: &[String]) -> bool {
-    let stored = stored.trim();
-    if stored.is_empty() {
-        return false;
-    }
-    let joined = glosses.join("; ");
-    stored == joined.trim() || glosses.iter().any(|gloss| gloss.trim() == stored)
-}
-
-fn from_hit(card: &ExchangeCard, hit: &DictHit, app: &str) -> ResolvedCard {
-    let inbound = present_text(&card.definition).unwrap_or("");
-    let (definition, source_id, source_version) =
-        if inbound.is_empty() || definition_matches(inbound, &hit.glosses) {
-            (
-                hit.glosses.join("; "),
-                hit.source_id.clone(),
-                hit.source_version.clone(),
-            )
+    if let [hit] = narrowed.as_slice() {
+        let disagrees = record
+            .traditional
+            .text()
+            .is_some_and(|traditional| traditional != hit.traditional);
+        return Ok(if disagrees {
+            from_file(record, headword, Verification::NeedsReview)
         } else {
-            (inbound.to_owned(), app.to_owned(), "import".to_owned())
-        };
-    ResolvedCard {
+            from_hit(record, hit)
+        });
+    }
+    let complete = record.pinyin.text().is_some() && record.definition.text().is_some();
+    Ok(if narrowed.is_empty() && complete {
+        from_file(record, headword, Verification::Confirmed)
+    } else {
+        from_file(record, headword, Verification::NeedsReview)
+    })
+}
+
+/// A definition that says the same as the dictionary: all its glosses joined,
+/// or exactly one of them.
+pub(crate) fn definition_matches(definition: &str, glosses: &[String]) -> bool {
+    let definition = definition.trim();
+    !definition.is_empty()
+        && (definition == glosses.join("; ").trim()
+            || glosses.iter().any(|gloss| gloss.trim() == definition))
+}
+
+fn from_hit(record: &ExchangeRecord, hit: &DictionaryEntry) -> Resolved {
+    let definition = match record.definition.text() {
+        Some(inbound) if !definition_matches(inbound, &hit.glosses) => inbound.to_owned(),
+        _ => hit.glosses.join("; "),
+    };
+    Resolved {
         simplified: hit.simplified.clone(),
         traditional: hit.traditional.clone(),
         pinyin: hit.pinyin.clone(),
         definition,
-        notes: notes_of(card),
-        tags: card.tags.clone(),
-        status: ItemStatus::Confirmed,
-        source_entry_id: hit.entry_id,
-        source_id,
-        source_version,
-        line: card.line,
-        raw: card.raw.clone(),
+        notes: record.notes.text().unwrap_or_default().to_owned(),
+        verification: Verification::Confirmed,
     }
 }
 
-fn user_card(card: &ExchangeCard, app: &str, headword: &str) -> ResolvedCard {
-    let traditional = card
-        .traditional
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(headword);
-    ResolvedCard {
+fn from_file(record: &ExchangeRecord, headword: &str, verification: Verification) -> Resolved {
+    Resolved {
         simplified: headword.to_owned(),
-        traditional: traditional.to_owned(),
-        pinyin: present_text(&card.pinyin).unwrap_or("").to_owned(),
-        definition: present_text(&card.definition).unwrap_or("").to_owned(),
-        notes: notes_of(card),
-        tags: card.tags.clone(),
-        status: ItemStatus::Confirmed,
-        source_entry_id: None,
-        source_id: app.to_owned(),
-        source_version: "import".to_owned(),
-        line: card.line,
-        raw: card.raw.clone(),
-    }
-}
-
-fn unresolved(card: &ExchangeCard, app: &str, headword: &str) -> ResolvedCard {
-    let mut card = user_card(card, app, headword);
-    card.status = ItemStatus::NeedsReview;
-    card.source_entry_id = None;
-    if card.definition.is_empty() {
-        card.definition = format!("unresolved import: {headword}");
-    }
-    card
-}
-
-fn has_full_user_card(card: &ExchangeCard) -> bool {
-    matches!(
-        (
-            present_text(&card.pinyin).filter(|value| !value.is_empty()),
-            present_text(&card.definition).filter(|value| !value.is_empty()),
-        ),
-        (Some(_), Some(_))
-    )
-}
-
-fn traditional_disagrees(file_traditional: Option<&str>, hit: &DictHit) -> bool {
-    match file_traditional
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(traditional) => traditional != hit.traditional,
-        None => false,
-    }
-}
-
-fn single<'a>(hits: &[&'a DictHit]) -> Option<&'a DictHit> {
-    if hits.len() == 1 { Some(hits[0]) } else { None }
-}
-
-fn present_text(field: &Field<String>) -> Option<&str> {
-    match field {
-        Field::Present(value) => Some(value.as_str()),
-        Field::Omitted => None,
-    }
-}
-
-fn notes_of(card: &ExchangeCard) -> Option<String> {
-    match &card.notes {
-        Field::Present(value) if !value.trim().is_empty() => Some(value.trim().to_owned()),
-        Field::Present(_) | Field::Omitted => None,
+        traditional: record.traditional.text().unwrap_or(headword).to_owned(),
+        pinyin: record.pinyin.text().unwrap_or_default().to_owned(),
+        definition: record.definition.text().unwrap_or_default().to_owned(),
+        notes: record.notes.text().unwrap_or_default().to_owned(),
+        verification,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DictHit, Resolution, definition_matches, resolve};
-    use crate::card::{ExchangeCard, Field};
-    use vocab_core::ItemStatus;
+    use vocab_core::connector::{ExchangeRecord, Field};
+    use vocab_core::{DictionaryEntry, SourceId, SourceVersion, Verification};
 
-    fn hit(pinyin: &str, gloss: &str) -> DictHit {
-        DictHit {
+    use super::{definition_matches, resolve};
+
+    fn hit(id: i64, pinyin: &str, gloss: &str) -> DictionaryEntry {
+        DictionaryEntry {
+            source: SourceId("cc-cedict".to_owned()),
+            source_version: SourceVersion("1".to_owned()),
+            entry_id: id,
             simplified: "行".to_owned(),
             traditional: "行".to_owned(),
             pinyin: pinyin.to_owned(),
             glosses: vec![gloss.to_owned()],
-            entry_id: Some(1),
-            source_id: "cc-cedict".to_owned(),
-            source_version: "1".to_owned(),
+            frequency_rank: None,
+            hsk_rank: None,
         }
     }
 
-    fn card(pinyin: Field<String>, definition: Field<String>) -> ExchangeCard {
-        ExchangeCard {
-            line: 1,
-            raw: "行".to_owned(),
-            headword: "行".to_owned(),
-            traditional: None,
-            pinyin,
-            definition,
-            notes: Field::Omitted,
-            tags: Vec::new(),
-        }
+    fn record(pinyin: Field<String>, definition: Field<String>) -> ExchangeRecord {
+        let mut record = ExchangeRecord::new(1, "行", "行");
+        record.pinyin = pinyin;
+        record.definition = definition;
+        record
+    }
+
+    fn present(value: &str) -> Field<String> {
+        Field::Present(value.to_owned())
     }
 
     #[test]
     fn unique_hit_fills_an_omitted_definition() {
         let resolved = resolve(
-            &card(Field::Present("xing2".to_owned()), Field::Omitted),
-            &[hit("xing2", "to walk")],
-            "pleco",
-        );
-        let Resolution::Card(card) = resolved else {
-            panic!("expected a card");
-        };
-        assert_eq!(card.status, ItemStatus::Confirmed);
-        assert_eq!(card.definition, "to walk");
-        assert_eq!(card.source_id, "cc-cedict");
-        assert_eq!(card.source_entry_id, Some(1));
+            &record(present("xing2"), Field::Omitted),
+            &[hit(1, "xing2", "to walk")],
+        )
+        .unwrap();
+        assert_eq!(resolved.verification, Verification::Confirmed);
+        assert_eq!(resolved.definition, "to walk");
     }
 
     #[test]
     fn two_hits_are_not_picked() {
-        let mut other = hit("hang2", "firm");
-        other.entry_id = Some(2);
         let resolved = resolve(
-            &card(Field::Omitted, Field::Omitted),
-            &[hit("xing2", "to walk"), other],
-            "pleco",
-        );
-        let Resolution::Card(card) = resolved else {
-            panic!("expected a card");
-        };
-        assert_eq!(card.status, ItemStatus::NeedsReview);
-        assert!(card.source_entry_id.is_none());
+            &record(Field::Omitted, Field::Omitted),
+            &[hit(1, "xing2", "to walk"), hit(2, "hang2", "firm")],
+        )
+        .unwrap();
+        assert_eq!(resolved.verification, Verification::NeedsReview);
+        assert_eq!(resolved.definition, "", "no invented definition");
     }
 
     #[test]
-    fn full_user_card_with_no_hit_is_confirmed() {
+    fn the_reading_picks_between_hits() {
         let resolved = resolve(
-            &card(
-                Field::Present("xing2".to_owned()),
-                Field::Present("a custom gloss".to_owned()),
-            ),
-            &[],
-            "anki",
-        );
-        let Resolution::Card(card) = resolved else {
-            panic!("expected a card");
-        };
-        assert_eq!(card.status, ItemStatus::Confirmed);
-        assert_eq!(card.source_id, "anki");
-        assert_eq!(card.definition, "a custom gloss");
-        assert!(card.source_entry_id.is_none());
+            &record(present("háng"), Field::Omitted),
+            &[hit(1, "xing2", "to walk"), hit(2, "hang2", "firm")],
+        )
+        .unwrap();
+        assert_eq!(resolved.verification, Verification::Confirmed);
+        assert_eq!(resolved.definition, "firm");
     }
 
     #[test]
-    fn differing_gloss_is_kept() {
+    fn complete_record_with_no_hit_is_confirmed() {
+        let resolved = resolve(&record(present("xing2"), present("a custom gloss")), &[]).unwrap();
+        assert_eq!(resolved.verification, Verification::Confirmed);
+        assert_eq!(resolved.definition, "a custom gloss");
+    }
+
+    #[test]
+    fn a_different_definition_is_kept() {
         let resolved = resolve(
-            &card(
-                Field::Present("xing2".to_owned()),
-                Field::Present("my gloss".to_owned()),
-            ),
-            &[hit("xing2", "to walk")],
-            "pleco",
-        );
-        let Resolution::Card(card) = resolved else {
-            panic!("expected a card");
-        };
-        assert_eq!(card.definition, "my gloss");
-        assert_eq!(card.source_id, "pleco");
-        assert_eq!(card.source_entry_id, Some(1));
+            &record(present("xing2"), present("my gloss")),
+            &[hit(1, "xing2", "to walk")],
+        )
+        .unwrap();
+        assert_eq!(resolved.definition, "my gloss");
         assert!(definition_matches("to walk", &["to walk".to_owned()]));
+    }
+
+    #[test]
+    fn disagreeing_traditional_needs_review() {
+        let mut record = record(present("xing2"), Field::Omitted);
+        record.traditional = present("衍");
+        let resolved = resolve(&record, &[hit(1, "xing2", "to walk")]).unwrap();
+        assert_eq!(resolved.verification, Verification::NeedsReview);
+    }
+
+    #[test]
+    fn blank_headword_is_dropped() {
+        let record = ExchangeRecord::new(1, "", " ");
+        assert!(resolve(&record, &[]).is_err());
     }
 }

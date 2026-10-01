@@ -16,16 +16,31 @@ pub struct AnkiIssue {
     pub message: String,
 }
 
+/// One note read from a file. A field is `None` when the file has no column
+/// for it (a `#columns:` header without `Notes`), which is different from an
+/// empty value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteRow {
     pub line: usize,
+    pub headword: String,
+    pub traditional: Option<String>,
+    pub pinyin: Option<String>,
+    pub definition: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub raw: String,
+}
+
+/// One note to write.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnkiNote {
     pub headword: String,
     pub traditional: String,
     pub pinyin: String,
     pub definition: String,
     pub notes: String,
+    /// Written space-separated, so they must not contain spaces.
     pub tags: Vec<String>,
-    pub raw: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +71,7 @@ impl AnkiTextV1 {
     /// Fails only when the file is not UTF-8, or when a declared separator is not tab.
     pub fn parse(self, bytes: &[u8]) -> Result<ParsedNotes> {
         let text = std::str::from_utf8(bytes).map_err(|err| {
-            VocabError::new(format!("file is not valid UTF-8 (expected {KEY}): {err}"))
+            VocabError::format(format!("file is not valid UTF-8 (expected {KEY}): {err}"))
         })?;
         let mut deck = None;
         let mut html = false;
@@ -68,11 +83,12 @@ impl AnkiTextV1 {
 
         for (index, raw) in text.lines().enumerate() {
             let line_number = index + 1;
-            let line = raw.trim_end_matches('\r').trim();
-            if line.is_empty() {
+            // Trailing tabs are empty fields, not whitespace to trim.
+            let line = raw.trim_end_matches(['\r', '\n']);
+            if line.trim().is_empty() {
                 continue;
             }
-            if let Some(directive) = line.strip_prefix('#') {
+            if let Some(directive) = line.trim().strip_prefix('#') {
                 apply_directive(
                     directive,
                     &mut DirectiveState {
@@ -88,7 +104,7 @@ impl AnkiTextV1 {
                 continue;
             }
             if !separator_seen && !line.contains('\t') {
-                return Err(VocabError::new(
+                return Err(VocabError::format(
                     "anki-text/v1 is tab-only; re-export with a tab separator",
                 ));
             }
@@ -131,9 +147,9 @@ impl AnkiTextV1 {
     /// # Errors
     ///
     /// Returns an error if the deck name contains a newline.
-    pub fn write(self, notes: &[NoteRow], deck: &str) -> Result<Vec<u8>> {
+    pub fn write(self, notes: &[AnkiNote], deck: &str) -> Result<Vec<u8>> {
         if deck.contains(['\n', '\r']) {
-            return Err(VocabError::new("deck name cannot contain a newline"));
+            return Err(VocabError::invalid("deck name cannot contain a newline"));
         }
         let mut out = String::new();
         out.push_str("#separator:tab\n");
@@ -163,11 +179,11 @@ impl AnkiTextV1 {
 
 struct MappedFields {
     headword: String,
-    traditional: String,
-    pinyin: String,
-    definition: String,
-    notes: String,
-    tags: Vec<String>,
+    traditional: Option<String>,
+    pinyin: Option<String>,
+    definition: Option<String>,
+    notes: Option<String>,
+    tags: Option<Vec<String>>,
 }
 
 struct DirectiveState<'a> {
@@ -190,7 +206,7 @@ fn apply_directive(directive: &str, state: &mut DirectiveState<'_>) -> Result<()
         "separator" => {
             *state.separator_seen = true;
             if !value.eq_ignore_ascii_case("tab") {
-                return Err(VocabError::new(
+                return Err(VocabError::format(
                     "anki-text/v1 is tab-only; re-export with a tab separator",
                 ));
             }
@@ -252,35 +268,39 @@ fn map_fields(
     }
     Ok(MappedFields {
         headword: fields[0].trim().to_owned(),
-        traditional: fields[1].trim().to_owned(),
-        pinyin: fields[2].trim().to_owned(),
-        definition: fields[3].trim().to_owned(),
-        notes: fields[4].trim().to_owned(),
-        tags: split_tags(fields[5]),
+        traditional: Some(fields[1].trim().to_owned()),
+        pinyin: Some(fields[2].trim().to_owned()),
+        definition: Some(fields[3].trim().to_owned()),
+        notes: Some(fields[4].trim().to_owned()),
+        tags: Some(split_tags(fields[5])),
     })
 }
 
 fn from_named(fields: &[&str], columns: &[String], tags_column: Option<usize>) -> MappedFields {
     let mut mapped = MappedFields {
         headword: String::new(),
-        traditional: String::new(),
-        pinyin: String::new(),
-        definition: String::new(),
-        notes: String::new(),
-        tags: Vec::new(),
+        traditional: None,
+        pinyin: None,
+        definition: None,
+        notes: None,
+        tags: None,
     };
     for (index, name) in columns.iter().enumerate() {
         let value = fields[index].trim();
         if tags_column == Some(index + 1) || name == "tags" {
-            mapped.tags = split_tags(value);
+            mapped.tags = Some(split_tags(value));
             continue;
         }
+        if matches!(name.as_str(), "headword" | "simplified") {
+            value.clone_into(&mut mapped.headword);
+            continue;
+        }
+        let value = Some(value.to_owned());
         match name.as_str() {
-            "headword" | "simplified" => value.clone_into(&mut mapped.headword),
-            "traditional" => value.clone_into(&mut mapped.traditional),
-            "pinyin" => value.clone_into(&mut mapped.pinyin),
-            "definition" | "meaning" | "english" => value.clone_into(&mut mapped.definition),
-            "notes" => value.clone_into(&mut mapped.notes),
+            "traditional" => mapped.traditional = value,
+            "pinyin" => mapped.pinyin = value,
+            "definition" | "meaning" | "english" => mapped.definition = value,
+            "notes" => mapped.notes = value,
             _ => {}
         }
     }

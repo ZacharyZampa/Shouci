@@ -7,11 +7,14 @@ license.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-vocab-anki = { path = "../vocab-anki" }
-vocab-core = { path = "../vocab-core" }
+serde = { version = "1", features = ["derive"] }
+vocab-core = { path = "../vocab-core", features = ["serde"] }
 vocab-db = { path = "../vocab-db" }
 vocab-dictionary = { path = "../vocab-dictionary" }
 vocab-pinyin = { path = "../vocab-pinyin" }
+
+[dev-dependencies]
+vocab-anki = { path = "../vocab-anki" }
 vocab-pleco = { path = "../vocab-pleco" }
 
 [lints]

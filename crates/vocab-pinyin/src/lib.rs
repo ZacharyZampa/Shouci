@@ -9,9 +9,11 @@
 use std::fmt;
 
 mod marks;
+mod numbered;
 mod syllables;
 
 pub use marks::tone_marks;
+pub use numbered::numbered;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NormalizedPinyin(String);

@@ -1,20 +1,18 @@
-//! Shared types, provenance invariants, and the canonical error type.
+//! Shared vocabulary types: saved items, dictionary entries, errors, and the
+//! [`connector::Connector`] contract that file formats implement.
+//!
+//! This crate has no required dependencies. Connector crates depend on it and
+//! nothing else, so a new format never sees storage.
 
-pub mod error;
-pub mod provenance;
-pub mod status;
+pub mod connector;
 
-mod entry;
+mod dictionary;
+mod error;
+mod item;
 
-pub use entry::{DictionaryEntry, VocabItem};
-pub use error::{Result, VocabError};
-pub use provenance::{ConfirmationState, Provenance, SourceId, SourceVersion};
-pub use status::ItemStatus;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MatchBasis {
-    EnglishGloss,
-    Pinyin,
-    Simplified,
-    CharacterFallback,
-}
+pub use dictionary::{DictionaryEntry, MatchBasis, SourceId, SourceVersion};
+pub use error::{ErrorKind, Result, VocabError};
+pub use item::{
+    ItemPatch, ItemSource, LibraryFilter, LibraryView, Lifecycle, SourceKind, Verification,
+    VocabItem,
+};

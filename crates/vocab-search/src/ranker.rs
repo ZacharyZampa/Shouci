@@ -101,14 +101,14 @@ impl DeterministicRanker {
             source_index: self.source_index(cand),
             frequency: cand.entry.frequency_rank.unwrap_or(u64::MAX),
             hsk: cand.entry.hsk_rank.unwrap_or(u64::MAX),
-            entry_id: cand.entry.stable_entry_id.unwrap_or(i64::MAX),
+            entry_id: cand.entry.entry_id,
         }
     }
 
     fn source_index(&self, cand: &Candidate) -> usize {
         self.source_priority
             .iter()
-            .position(|s| s == &cand.entry.provenance.source)
+            .position(|s| s == &cand.entry.source)
             .unwrap_or(usize::MAX)
     }
 
@@ -221,35 +221,32 @@ impl DeterministicRanker {
     }
 }
 
+/// Sorts by `key`, computing it once per candidate. The sort is stable, so
+/// equal keys keep retrieval order.
+fn sort_by_key(candidates: Vec<Candidate>, key: impl Fn(&Candidate) -> RankKey) -> Vec<Candidate> {
+    let mut keyed: Vec<(RankKey, Candidate)> = candidates
+        .into_iter()
+        .map(|candidate| (key(&candidate), candidate))
+        .collect();
+    keyed.sort_by(|(a, _), (b, _)| a.compare(b));
+    keyed.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
 impl Ranker for DeterministicRanker {
-    fn rank_english(&self, query: &str, mut candidates: Vec<Candidate>) -> Vec<Candidate> {
-        candidates.sort_by(|a, b| {
-            self.english_key(query, a)
-                .compare(&self.english_key(query, b))
-        });
-        candidates
+    fn rank_english(&self, query: &str, candidates: Vec<Candidate>) -> Vec<Candidate> {
+        sort_by_key(candidates, |c| self.english_key(query, c))
     }
 
-    fn rank_pinyin(
-        &self,
-        query: &NormalizedPinyin,
-        mut candidates: Vec<Candidate>,
-    ) -> Vec<Candidate> {
+    fn rank_pinyin(&self, query: &NormalizedPinyin, candidates: Vec<Candidate>) -> Vec<Candidate> {
         let query_variants = ranking_variants(query);
         let min_span = segment_min_span(query);
-        candidates.sort_by(|a, b| {
-            self.pinyin_key(&query_variants, min_span, a)
-                .compare(&self.pinyin_key(&query_variants, min_span, b))
-        });
-        candidates
+        sort_by_key(candidates, |c| {
+            self.pinyin_key(&query_variants, min_span, c)
+        })
     }
 
-    fn rank_chinese(&self, query: &str, mut candidates: Vec<Candidate>) -> Vec<Candidate> {
-        candidates.sort_by(|a, b| {
-            self.chinese_key(query, a)
-                .compare(&self.chinese_key(query, b))
-        });
-        candidates
+    fn rank_chinese(&self, query: &str, candidates: Vec<Candidate>) -> Vec<Candidate> {
+        sort_by_key(candidates, |c| self.chinese_key(query, c))
     }
 }
 
@@ -391,9 +388,7 @@ fn suffix_is_tone_digit(suffix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vocab_core::{
-        ConfirmationState, DictionaryEntry, MatchBasis, Provenance, SourceId, SourceVersion,
-    };
+    use vocab_core::{DictionaryEntry, MatchBasis, SourceId, SourceVersion};
     use vocab_dictionary::CandidateDiagnostic;
 
     fn cand(
@@ -416,13 +411,9 @@ mod tests {
                     .collect(),
                 frequency_rank: freq,
                 hsk_rank: None,
-                stable_entry_id: Some(id),
-                provenance: Provenance {
-                    source: SourceId(source.to_owned()),
-                    source_version: SourceVersion("1.0".to_owned()),
-                    import_origin: None,
-                    confirmation: ConfirmationState::DictionaryAuthority,
-                },
+                entry_id: id,
+                source: SourceId(source.to_owned()),
+                source_version: SourceVersion("1.0".to_owned()),
             },
             diagnostic: CandidateDiagnostic {
                 basis: MatchBasis::EnglishGloss,
@@ -641,7 +632,7 @@ mod tests {
         let a = cand(5, "猫", "貓", "mao1", &["cat"], None, "src");
         let b = cand(2, "猫", "貓", "mao1", &["cat"], None, "src");
         let ranked = ranker().rank_chinese("猫", vec![a.clone(), b.clone()]);
-        assert_eq!(ranked[0].entry.stable_entry_id, Some(2));
+        assert_eq!(ranked[0].entry.entry_id, 2);
     }
 
     #[test]
@@ -650,7 +641,7 @@ mod tests {
         let b = cand(2, "您", "您", "nin2", &["you (formal)"], None, "src");
         let ranked = ranker().rank_pinyin(&normalize("ni3 hao3"), vec![b.clone(), a.clone()]);
         assert_eq!(ranked[0].entry.simplified, "你好");
-        assert!(ranked[1].entry.stable_entry_id.is_some());
+        assert_eq!(ranked[1].entry.entry_id, 2);
     }
 
     #[test]

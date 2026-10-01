@@ -1,86 +1,129 @@
-//! `user.db` schema and connection management.
+//! `user.db`: saved words, their tags and collections, the transfer ledger,
+//! and settings.
 //!
-//! Writable, local-only. All multi-statement operations are transactional (Phase 1
-//! adds the import/export transaction wrappers); this module owns the schema
-//! contract and opens the database with the invariant defaults (WAL, FK checking).
+//! Plain SQLite and plain functions over a [`rusqlite::Connection`]; a
+//! [`rusqlite::Transaction`] works anywhere a connection does. The schema is
+//! versioned with `PRAGMA user_version` (see [`migrate`]). Nothing outside
+//! `shouci-core` calls this crate.
 
-mod repo;
-mod schema;
-mod session;
+mod items;
+mod legacy;
+mod migrate;
+mod organize;
+mod settings;
 mod transfer;
 
-pub use repo::{
-    NewVocabItem, SaveOutcome, app_data_dir, delete_item, find_saved_item, find_saved_reading,
-    get_item, list_items, save_vocab_item, set_status,
+pub use items::{
+    NewItem, Saved, find_by_identity, get_item, insert_item, list_items, purge_item, reading_key,
+    require_item, save_item, set_archived, set_source, set_trashed, set_verification, update_item,
 };
-pub(crate) use schema::CREATE_USER_SCHEMA;
-pub use session::{
-    InboundInsert, InboundOp, SessionOutcome, TransferCounts, TransferDirection, TransferHeader,
-    apply_inbound, commit_outbound, record_rejected, select_for_transfer,
+pub use legacy::{LegacyReport, import_poc_database};
+pub use migrate::SCHEMA_VERSION;
+pub use organize::{
+    NameCount, add_tag, add_to_collection, collection_from_tag, collections, collections_by_item,
+    create_collection, delete_collection, delete_tag, item_collections, item_tags,
+    remove_from_collection, remove_tag, rename_collection, rename_tag, set_collections, set_tags,
+    tags, tags_by_item,
 };
+pub use settings::{get_setting, set_setting};
 pub use transfer::{
-    ExportRun, ImportDecision, ImportPayload, ImportRecord, ImportSummary, add_tag, commit_export,
-    import_sources, item_tags, persist_import, select_exportable,
+    Direction, Outcome, RunCounts, RunRecord, RunStatus, destinations_by_item, import_sources,
+    item_destinations, items_at, record_item, record_run,
 };
 
 use std::path::Path;
+use std::time::Duration;
 
+use rusqlite::Connection;
 use vocab_core::{Result, VocabError};
 
-/// Opens `user.db` at `path`, applying the schema and the invariant defaults
-/// (WAL, foreign keys).
+/// SQL for "now" in the format every timestamp column uses:
+/// `2026-09-30T12:00:00.000Z` (UTC, millisecond precision, sortable).
+pub(crate) const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+
+/// How long a write waits for another process (the menu-bar app, the CLI)
+/// to finish its own before giving up.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Opens `user.db`, creating it when missing, and brings the schema up to
+/// date. WAL mode lets the app and the CLI read while the other writes.
 ///
 /// # Errors
 ///
-/// Returns an error if the database cannot be opened, the pragmas cannot be set,
-/// or the schema cannot be applied.
-pub fn open_user_db(path: &Path) -> Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(path).map_err(|err| {
-        VocabError::new(format!("failed to open user db {}: {err}", path.display()))
-    })?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|err| VocabError::new(format!("failed to enable WAL: {err}")))?;
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(|err| VocabError::new(format!("failed to enable foreign keys: {err}")))?;
-    apply_schema(&conn)?;
+/// Returns an error if the file cannot be opened, is a database this build
+/// cannot use, or a migration fails.
+pub fn open(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .map_err(|err| VocabError::storage(format!("cannot open {}: {err}", path.display())))?;
+    configure(conn)
+}
+
+/// A private in-memory `user.db`, for tests and previews.
+///
+/// # Errors
+///
+/// Returns an error if the schema cannot be applied.
+pub fn open_in_memory() -> Result<Connection> {
+    configure(Connection::open_in_memory()?)
+}
+
+fn configure(mut conn: Connection) -> Result<Connection> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // Returns the resulting mode as a row, so it is queried, not updated.
+    let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    migrate::migrate(&mut conn)?;
     Ok(conn)
 }
 
-/// Applies or upgrades the `user.db` schema in place.
+/// Runs `work` in one transaction: all of it lands, or none of it does.
 ///
 /// # Errors
 ///
-/// Returns an error if any schema statement fails.
-pub fn apply_schema(conn: &rusqlite::Connection) -> Result<()> {
-    conn.execute_batch(CREATE_USER_SCHEMA)
-        .map_err(|err| VocabError::new(format!("failed to apply user schema: {err}")))?;
-    schema::migrate_vocabulary_identity(conn)
-}
-
-/// Runs `work` inside a single transaction. On error the transaction rolls back
-/// and existing data is untouched.
-///
-/// # Errors
-///
-/// Returns the closure's error (rolled back) or an error if the transaction
-/// cannot be begun or committed.
+/// Returns `work`'s error (after rolling back), or an error if the
+/// transaction cannot begin or commit.
 pub fn with_tx<T>(
-    conn: &mut rusqlite::Connection,
+    conn: &mut Connection,
     work: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
 ) -> Result<T> {
-    let tx = conn
-        .transaction()
-        .map_err(|err| VocabError::new(format!("failed to begin transaction: {err}")))?;
-    let result = work(&tx);
-    match result {
-        Ok(value) => {
-            tx.commit()
-                .map_err(|err| VocabError::new(format!("failed to commit: {err}")))?;
-            Ok(value)
-        }
-        Err(err) => {
-            let _ = tx.rollback();
-            Err(err)
-        }
+    let tx = conn.transaction()?;
+    let value = work(&tx)?;
+    tx.commit()?;
+    Ok(value)
+}
+
+/// Changes whenever another connection (another process) commits to this
+/// database. Poll it to notice edits made elsewhere.
+///
+/// # Errors
+///
+/// Returns an error if the pragma cannot be read.
+pub fn data_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA data_version", [], |row| row.get(0))?)
+}
+
+/// Converts a count for storage.
+pub(crate) fn to_i64(count: usize) -> Result<i64> {
+    i64::try_from(count).map_err(|_| VocabError::new("count too large to store"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{data_version, open};
+
+    #[test]
+    fn another_connection_bumps_the_data_version() {
+        let dir = std::env::temp_dir().join(format!("shouci-dv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user.db");
+        let _ = std::fs::remove_file(&path);
+        let watcher = open(&path).unwrap();
+        let writer = open(&path).unwrap();
+        let before = data_version(&watcher).unwrap();
+        writer
+            .execute("INSERT INTO settings (key, value) VALUES ('k', 'v')", [])
+            .unwrap();
+        assert_ne!(data_version(&watcher).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

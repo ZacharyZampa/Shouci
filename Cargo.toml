@@ -1,18 +1,21 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/shouci-cli",
-    "crates/shouci-mac",
-    "crates/shouci-tui",
+    "crates/shouci-core",
     "crates/vocab-anki",
-    "crates/vocab-capture",
-    "crates/vocab-exchange",
     "crates/vocab-core",
     "crates/vocab-db",
     "crates/vocab-dictionary",
+    "crates/vocab-exchange",
     "crates/vocab-pinyin",
     "crates/vocab-pleco",
     "crates/vocab-search",
+]
+# Frontends rejoin as they move onto shouci-core (milestone 2).
+exclude = [
+    "crates/shouci-cli",
+    "crates/shouci-mac",
+    "crates/shouci-tui",
 ]
 
 [workspace.package]
@@ -27,3 +30,9 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# SQLite is compiled from C source (rusqlite's `bundled`). Unoptimized, its
+# FTS and LIKE scans make debug builds, and the search-quality tests, many
+# times slower. Optimizing just that crate keeps debug builds quick to compile.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

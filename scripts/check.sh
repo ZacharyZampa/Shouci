@@ -7,13 +7,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
-export VOCAB_SKIP_DICTIONARY_REFRESH=1
-export VOCAB_DICTIONARY="${ROOT}/data/dictionary/dictionary.db"
+export SHOUCI_SKIP_DICTIONARY_REFRESH=1
+export SHOUCI_DICTIONARIES="${ROOT}/data/dictionaries"
 
-if [ ! -f data/dictionary/dictionary.db ]; then
-  echo "==> dictionary.db missing, fetching"
-  cargo run -p vocab-dictionary --example ensure -- data/dictionary/dictionary.db
+if [ ! -f data/dictionaries/cc-cedict.db ]; then
+  echo "==> cc-cedict.db missing, fetching"
+  cargo run -p vocab-dictionary --example ensure -- data/dictionaries/cc-cedict.db
 fi
+
+echo "==> architecture boundaries"
+"${ROOT}/scripts/check-deps.sh"
 
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check

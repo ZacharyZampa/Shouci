@@ -1,374 +1,298 @@
-//! Pleco import/export transaction boundaries.
-//!
-//! These functions are the only writers of `import_runs` / `export_runs` and the
-//! only path that changes item statuses on an export commit. Everything runs
-//! inside `with_tx`, so a failed run leaves `user.db` untouched.
+//! The transfer ledger: every import and export, and what happened to each
+//! word in it. "Only words not yet sent to Pleco" is a question for this
+//! ledger, asked per destination.
 
-use rusqlite::OptionalExtension;
-use vocab_core::{
-    ConfirmationState, ItemStatus, Provenance, Result, SourceId, SourceVersion, VocabError,
-    VocabItem,
-};
+use std::collections::{HashMap, HashSet};
 
-use crate::repo::{find_by_forms, select_items};
-use crate::{set_status, with_tx};
+use rusqlite::{Connection, params};
+use vocab_core::Result;
 
-/// One staged import record (already validated by the codec layer).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportRecord {
-    pub simplified: String,
-    pub pinyin: String,
-    pub definition: String,
-    pub category: Option<String>,
+use crate::to_i64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    In,
+    Out,
 }
 
-/// Everything the persistence layer needs to stage and commit one import run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportPayload {
-    /// Path of the source file, recorded verbatim for provenance and the
-    /// export-overwrite guard.
-    pub source_path: String,
-    /// Codec key, e.g. `pleco-utf8-text/v1`.
-    pub codec_key: String,
-    /// SHA-256 (hex) of the raw source bytes, pinned in `import_runs`.
-    pub content_sha256: String,
-    pub records: Vec<ImportRecord>,
-    /// Number of error-severity parse issues in the source.
-    pub issues_errors: usize,
-    /// Number of warning-severity parse issues in the source.
-    pub issues_warnings: usize,
+impl Direction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImportSummary {
-    pub records_seen: usize,
-    pub records_imported: usize,
-    pub records_skipped_duplicate: usize,
-    pub issues_errors: usize,
-    pub issues_warnings: usize,
+pub enum RunStatus {
+    Committed,
+    /// Refused (error lines, not forced). Nothing else was written.
+    Rejected,
+}
+
+impl RunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RunCounts {
+    pub seen: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    /// Imported, but marked needs review.
+    pub unresolved: usize,
+    pub dropped: usize,
+    pub errors: usize,
+    pub warnings: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImportDecision {
-    /// The whole run was persisted in one transaction.
-    Imported(ImportSummary),
-    /// The run was refused because the source had error-severity issues and
-    /// `--force` was not given. Nothing was written.
-    Refused,
+pub struct RunRecord {
+    pub direction: Direction,
+    /// Destination key: `pleco`.
+    pub connector_id: String,
+    /// Exact grammar: `pleco-utf8-text/v1`.
+    pub format: String,
+    pub path: String,
+    pub content_sha256: Option<String>,
+    pub counts: RunCounts,
+    pub status: RunStatus,
 }
 
-/// Stages and commits one import run, or refuses it.
-///
-/// When the source contains error-severity issues and `force` is false the run
-/// is refused without touching the database. Duplicates (matching the schema's
-/// case-insensitive `(simplified, traditional)` key) are skipped and counted,
-/// never overwritten. Records missing a definition or pinyin import as
-/// `needs_review` so the gap stays visible.
-///
-/// # Errors
-///
-/// Returns an error if the transaction cannot be begun, committed, or any
-/// statement fails; on error nothing is committed.
-pub fn persist_import(
-    conn: &mut rusqlite::Connection,
-    payload: &ImportPayload,
-    force: bool,
-) -> Result<ImportDecision> {
-    if payload.issues_errors > 0 && !force {
-        return Ok(ImportDecision::Refused);
-    }
+/// What happened to one word or line in a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Inserted,
+    Updated,
+    /// Already saved; left alone. The word is known to be at the source.
+    Skipped,
+    Dropped,
+    Rejected,
+    Written,
+}
 
-    with_tx(conn, |tx| {
-        let mut imported = 0usize;
-        let mut skipped = 0usize;
-        for record in &payload.records {
-            let simplified = record.simplified.trim();
-            if simplified.is_empty() {
-                continue;
-            }
-            if find_by_forms(tx, simplified, simplified, None)?.is_some() {
-                skipped += 1;
-                continue;
-            }
-            let status = if record.pinyin.trim().is_empty() || record.definition.trim().is_empty() {
-                ItemStatus::NeedsReview
-            } else {
-                ItemStatus::Confirmed
-            };
-            let item_id = insert_item(tx, record, status)?;
-            if let Some(category) = record
-                .category
-                .as_deref()
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-            {
-                let tag_id = ensure_tag(tx, category)?;
-                link_tag(tx, item_id, tag_id)?;
-            }
-            imported += 1;
+impl Outcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::Updated => "updated",
+            Self::Skipped => "skipped",
+            Self::Dropped => "dropped",
+            Self::Rejected => "rejected",
+            Self::Written => "written",
         }
-        record_import_run(tx, payload, imported, skipped)?;
-        record_audit(
-            tx,
-            "import",
-            &format!(
-                "{} | seen {} imported {} skipped {} errors {} warnings {}",
-                payload.codec_key,
-                payload.records.len(),
-                imported,
-                skipped,
-                payload.issues_errors,
-                payload.issues_warnings
-            ),
-        )?;
-        Ok(ImportSummary {
-            records_seen: payload.records.len(),
-            records_imported: imported,
-            records_skipped_duplicate: skipped,
-            issues_errors: payload.issues_errors,
-            issues_warnings: payload.issues_warnings,
-        })
-    })
-    .map(ImportDecision::Imported)
+    }
 }
 
-/// Selects items eligible for export: never `needs_review` unless explicitly
-/// allowed, optionally restricted to items carrying *all* the named tags.
+/// Outcomes that mean the destination has the word.
+const AT_DESTINATION: &str = "('inserted', 'updated', 'skipped', 'written')";
+
+/// Records a run and returns its id.
 ///
 /// # Errors
 ///
-/// Returns an error if the query fails.
-pub fn select_exportable(
-    conn: &rusqlite::Connection,
-    required_tags: &[String],
-    include_unresolved: bool,
-) -> Result<Vec<VocabItem>> {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<rusqlite::types::Value> = Vec::new();
-    if !include_unresolved {
-        conditions.push("status <> 'needs_review'".to_owned());
-    }
-    for tag in required_tags {
-        conditions.push(
-            "EXISTS (SELECT 1 FROM vocabulary_tags vt JOIN tags t ON vt.tag_id = t.tag_id \
-             WHERE vt.item_id = vocabulary_items.item_id \
-             AND t.name = ? COLLATE NOCASE)"
-                .to_owned(),
-        );
-        params.push(tag.clone().into());
-    }
-    if let Some(first) = conditions.first_mut() {
-        first.insert_str(0, "WHERE ");
-    }
-    let tail = format!("{} ORDER BY item_id", conditions.join(" AND "));
-    select_items(conn, &tail, rusqlite::params_from_iter(params.iter()))
-}
-
-/// Metadata recorded for a completed export run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExportRun {
-    pub target_path: String,
-    pub codec_key: String,
-    pub records_written: usize,
-}
-
-/// Marks the exported items as `exported` and records the run, atomically.
-///
-/// # Errors
-///
-/// Returns an error if the transaction fails; on error nothing is committed.
-pub fn commit_export(
-    conn: &mut rusqlite::Connection,
-    run: &ExportRun,
-    exported_item_ids: &[i64],
-) -> Result<()> {
-    with_tx(conn, |tx| {
-        for &item_id in exported_item_ids {
-            set_status(tx, item_id, ItemStatus::Exported)?;
-        }
-        tx.execute(
-            "INSERT INTO export_runs \
-             (target_path, codec_key, records_written, status) \
-             VALUES (?1, ?2, ?3, 'committed')",
-            rusqlite::params![
-                run.target_path,
-                run.codec_key,
-                count_to_i64(run.records_written)?,
-            ],
-        )
-        .map_err(|err| VocabError::new(format!("record export run: {err}")))?;
-        record_audit(
-            tx,
-            "export",
-            &format!(
-                "{} | written {} -> {}",
-                run.codec_key, run.records_written, run.target_path
-            ),
-        )?;
-        Ok(())
-    })
-}
-
-/// Every path ever imported, used to refuse overwriting an import source.
-///
-/// # Errors
-///
-/// Returns an error if the query fails.
-pub fn import_sources(conn: &rusqlite::Connection) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare("SELECT DISTINCT source_path FROM import_runs ORDER BY source_path")
-        .map_err(|err| VocabError::new(format!("prepare import source query: {err}")))?;
-    let mut rows = stmt
-        .query([])
-        .map_err(|err| VocabError::new(format!("run import source query: {err}")))?;
-    let mut sources = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|err| VocabError::new(format!("read import source row: {err}")))?
-    {
-        sources.push(row.get(0)?);
-    }
-    Ok(sources)
-}
-
-/// Attaches a named tag to an item, creating the tag row on first use.
-///
-/// # Errors
-///
-/// Returns an error if the database write fails.
-pub fn add_tag(conn: &rusqlite::Connection, item_id: i64, name: &str) -> Result<()> {
-    let tag_id = ensure_tag(conn, name)?;
-    link_tag(conn, item_id, tag_id)
-}
-
-/// Tags attached to one item, in stable name order.
-///
-/// # Errors
-///
-/// Returns an error if the query fails.
-pub fn item_tags(conn: &rusqlite::Connection, item_id: i64) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT t.name FROM vocabulary_tags vt JOIN tags t ON vt.tag_id = t.tag_id \
-             WHERE vt.item_id = ?1 ORDER BY t.name",
-        )
-        .map_err(|err| VocabError::new(format!("prepare item tags query: {err}")))?;
-    let mut rows = stmt
-        .query(rusqlite::params![item_id])
-        .map_err(|err| VocabError::new(format!("run item tags query: {err}")))?;
-    let mut names = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|err| VocabError::new(format!("read item tags row: {err}")))?
-    {
-        names.push(row.get(0)?);
-    }
-    Ok(names)
-}
-
-fn insert_item(
-    tx: &rusqlite::Transaction<'_>,
-    record: &ImportRecord,
-    status: ItemStatus,
-) -> Result<i64> {
-    let provenance = Provenance {
-        source: SourceId("pleco".to_owned()),
-        source_version: SourceVersion("import".to_owned()),
-        import_origin: None,
-        confirmation: status_confirmation(status),
-    };
-    tx.execute(
-        "INSERT INTO vocabulary_items \
-         (simplified, traditional, pinyin, definition, status, source_id, source_version) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![
-            record.simplified.trim(),
-            record.simplified.trim(),
-            record.pinyin.trim(),
-            record.definition.trim(),
-            status.as_str(),
-            provenance.source.as_str(),
-            provenance.source_version.as_str(),
-        ],
-    )
-    .map_err(|err| VocabError::new(format!("insert imported item: {err}")))?;
-    Ok(tx.last_insert_rowid())
-}
-
-fn status_confirmation(status: ItemStatus) -> ConfirmationState {
-    match status {
-        ItemStatus::NeedsReview => ConfirmationState::NeedsReview,
-        _ => ConfirmationState::DictionaryAuthority,
-    }
-}
-
-fn record_import_run(
-    tx: &rusqlite::Transaction<'_>,
-    payload: &ImportPayload,
-    imported: usize,
-    skipped: usize,
-) -> Result<()> {
-    tx.execute(
-        "INSERT INTO import_runs \
-         (source_path, codec_key, content_sha256, records_seen, records_imported, \
-          records_skipped_duplicate, issues_errors, status) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'committed')",
-        rusqlite::params![
-            payload.source_path,
-            payload.codec_key,
-            payload.content_sha256,
-            count_to_i64(payload.records.len())?,
-            count_to_i64(imported)?,
-            count_to_i64(skipped)?,
-            count_to_i64(payload.issues_errors)?,
-        ],
-    )
-    .map_err(|err| VocabError::new(format!("record import run: {err}")))?;
-    Ok(())
-}
-
-pub(crate) fn count_to_i64(count: usize) -> Result<i64> {
-    i64::try_from(count).map_err(|_| VocabError::new("count out of range for i64"))
-}
-
-pub(crate) fn ensure_tag(conn: &rusqlite::Connection, name: &str) -> Result<i64> {
-    let existing = conn
-        .query_row(
-            "SELECT tag_id FROM tags WHERE name = ?1 COLLATE NOCASE",
-            rusqlite::params![name],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|err| VocabError::new(format!("lookup tag: {err}")))?;
-    if let Some(tag_id) = existing {
-        return Ok(tag_id);
-    }
+/// Returns an error if the write fails.
+pub fn record_run(conn: &Connection, run: &RunRecord) -> Result<i64> {
+    let c = &run.counts;
     conn.execute(
-        "INSERT INTO tags (name) VALUES (?1)",
-        rusqlite::params![name],
-    )
-    .map_err(|err| VocabError::new(format!("insert tag: {err}")))?;
+        "INSERT INTO transfer_runs (direction, connector_id, format, path, content_sha256, \
+         seen, inserted, updated, skipped, unresolved, dropped, errors, warnings, status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            run.direction.as_str(),
+            run.connector_id,
+            run.format,
+            run.path,
+            run.content_sha256,
+            to_i64(c.seen)?,
+            to_i64(c.inserted)?,
+            to_i64(c.updated)?,
+            to_i64(c.skipped)?,
+            to_i64(c.unresolved)?,
+            to_i64(c.dropped)?,
+            to_i64(c.errors)?,
+            to_i64(c.warnings)?,
+            run.status.as_str(),
+        ],
+    )?;
     Ok(conn.last_insert_rowid())
 }
 
-pub(crate) fn link_tag(conn: &rusqlite::Connection, item_id: i64, tag_id: i64) -> Result<()> {
+/// Records what happened to one word or line.
+///
+/// # Errors
+///
+/// Returns an error if the write fails.
+pub fn record_item(
+    conn: &Connection,
+    run_id: i64,
+    item_id: Option<i64>,
+    line: Option<usize>,
+    raw: Option<&str>,
+    outcome: Outcome,
+    detail: &str,
+) -> Result<()> {
+    let line = line.map(to_i64).transpose()?;
     conn.execute(
-        "INSERT OR IGNORE INTO vocabulary_tags (item_id, tag_id) VALUES (?1, ?2)",
-        rusqlite::params![item_id, tag_id],
-    )
-    .map_err(|err| VocabError::new(format!("link tag: {err}")))?;
+        "INSERT INTO transfer_items (run_id, item_id, line, raw, outcome, detail) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![run_id, item_id, line, raw, outcome.as_str(), detail],
+    )?;
     Ok(())
 }
 
-pub(crate) fn record_audit(
-    conn: &rusqlite::Connection,
-    event_type: &str,
-    detail: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO audit_events (event_type, detail) VALUES (?1, ?2)",
-        rusqlite::params![event_type, detail],
-    )
-    .map_err(|err| VocabError::new(format!("record audit event: {err}")))?;
-    Ok(())
+/// Files that were imported from. Exports never overwrite them.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn import_sources(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT path FROM transfer_runs \
+         WHERE direction = 'in' AND status = 'committed' ORDER BY path",
+    )?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+/// Words the destination already has: exported there, or imported (or
+/// matched) from it.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn items_at(conn: &Connection, connector_id: &str) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT ti.item_id FROM transfer_items ti \
+         JOIN transfer_runs tr ON tr.id = ti.run_id \
+         WHERE tr.connector_id = ?1 AND tr.status = 'committed' \
+         AND ti.item_id IS NOT NULL AND ti.outcome IN {AT_DESTINATION}"
+    ))?;
+    let rows = stmt.query_map([connector_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<HashSet<i64>>>()?)
+}
+
+/// The destinations that have one word, by id.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn item_destinations(conn: &Connection, item_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT tr.connector_id FROM transfer_items ti \
+         JOIN transfer_runs tr ON tr.id = ti.run_id \
+         WHERE ti.item_id = ?1 AND tr.status = 'committed' \
+         AND ti.outcome IN {AT_DESTINATION} ORDER BY tr.connector_id"
+    ))?;
+    let rows = stmt.query_map([item_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+}
+
+/// For every word, the destinations that have it, by id.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn destinations_by_item(conn: &Connection) -> Result<HashMap<i64, Vec<String>>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT ti.item_id, tr.connector_id FROM transfer_items ti \
+         JOIN transfer_runs tr ON tr.id = ti.run_id \
+         WHERE tr.status = 'committed' AND ti.item_id IS NOT NULL \
+         AND ti.outcome IN {AT_DESTINATION} ORDER BY tr.connector_id"
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut out: HashMap<i64, Vec<String>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        out.entry(row.get(0)?).or_default().push(row.get(1)?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use vocab_core::{ItemSource, Verification};
+
+    use super::{
+        Direction, Outcome, RunCounts, RunRecord, RunStatus, import_sources, items_at, record_item,
+        record_run,
+    };
+    use crate::items::{NewItem, save_item};
+    use crate::open_in_memory;
+
+    fn run(direction: Direction, connector: &str, path: &str, status: RunStatus) -> RunRecord {
+        RunRecord {
+            direction,
+            connector_id: connector.to_owned(),
+            format: format!("{connector}/v1"),
+            path: path.to_owned(),
+            content_sha256: None,
+            counts: RunCounts::default(),
+            status,
+        }
+    }
+
+    #[test]
+    fn destinations_are_tracked_separately() {
+        let conn = open_in_memory().unwrap();
+        let id = save_item(
+            &conn,
+            &NewItem {
+                simplified: "学校".to_owned(),
+                traditional: String::new(),
+                pinyin: "xue2 xiao4".to_owned(),
+                definition: "school".to_owned(),
+                notes: String::new(),
+                verification: Verification::Confirmed,
+                source: ItemSource::manual(),
+            },
+        )
+        .unwrap()
+        .item()
+        .id;
+        let out = record_run(
+            &conn,
+            &run(Direction::Out, "pleco", "/tmp/p.txt", RunStatus::Committed),
+        )
+        .unwrap();
+        record_item(&conn, out, Some(id), None, None, Outcome::Written, "").unwrap();
+        assert!(items_at(&conn, "pleco").unwrap().contains(&id));
+        assert_eq!(super::item_destinations(&conn, id).unwrap(), vec!["pleco"]);
+        assert!(items_at(&conn, "anki").unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_committed_imports_are_sources() {
+        let conn = open_in_memory().unwrap();
+        record_run(
+            &conn,
+            &run(Direction::In, "pleco", "/tmp/in.txt", RunStatus::Committed),
+        )
+        .unwrap();
+        record_run(
+            &conn,
+            &run(Direction::In, "pleco", "/tmp/bad.txt", RunStatus::Rejected),
+        )
+        .unwrap();
+        record_run(
+            &conn,
+            &run(
+                Direction::Out,
+                "pleco",
+                "/tmp/out.txt",
+                RunStatus::Committed,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            import_sources(&conn).unwrap(),
+            vec!["/tmp/in.txt".to_owned()]
+        );
+    }
 }

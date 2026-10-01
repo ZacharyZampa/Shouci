@@ -4,10 +4,7 @@ use std::sync::Mutex;
 
 use rusqlite::OpenFlags;
 use sha2::{Digest, Sha256};
-use vocab_core::{
-    ConfirmationState, DictionaryEntry, MatchBasis, Provenance, Result, SourceId, SourceVersion,
-    VocabError,
-};
+use vocab_core::{DictionaryEntry, MatchBasis, Result, SourceId, SourceVersion, VocabError};
 use vocab_pinyin::{NormalizedPinyin, normalize, segment};
 
 use crate::schema::{
@@ -404,10 +401,8 @@ impl SqliteDictionary {
                 false,
             )?;
             for candidate in batch {
-                if let Some(id) = candidate.entry.stable_entry_id {
-                    if seen.insert(id) {
-                        candidates.push(candidate);
-                    }
+                if seen.insert(candidate.entry.entry_id) {
+                    candidates.push(candidate);
                 }
             }
         }
@@ -553,10 +548,7 @@ impl DictionaryProvider for SqliteDictionary {
         let exact_and_prefix =
             self.select_entries_where(&clauses, MatchBasis::Simplified, false, ClauseJoin::Or)?;
         let mut merged: Vec<Candidate> = exact_and_prefix;
-        let mut known: BTreeSet<i64> = merged
-            .iter()
-            .filter_map(|c| c.entry.stable_entry_id)
-            .collect();
+        let mut known: BTreeSet<i64> = merged.iter().map(|c| c.entry.entry_id).collect();
 
         let mut char_clauses: Vec<(String, Vec<rusqlite::types::Value>)> = Vec::new();
         for ch in text.chars() {
@@ -572,10 +564,8 @@ impl DictionaryProvider for SqliteDictionary {
             true,
             ClauseJoin::And,
         )? {
-            if let Some(id) = cand.entry.stable_entry_id {
-                if known.insert(id) {
-                    merged.push(cand);
-                }
+            if known.insert(cand.entry.entry_id) {
+                merged.push(cand);
             }
         }
         Ok(merged)
@@ -670,13 +660,9 @@ fn candidate_from_row(
             glosses: Vec::new(),
             frequency_rank: frequency_rank.and_then(|v| u64::try_from(v).ok()),
             hsk_rank: hsk_rank.and_then(|v| u64::try_from(v).ok()),
-            stable_entry_id: Some(entry_id),
-            provenance: Provenance {
-                source: SourceId(source_id),
-                source_version: SourceVersion(source_version),
-                import_origin: None,
-                confirmation: ConfirmationState::DictionaryAuthority,
-            },
+            entry_id,
+            source: SourceId(source_id),
+            source_version: SourceVersion(source_version),
         },
         diagnostic: CandidateDiagnostic { basis, is_inferred },
     })
@@ -686,14 +672,11 @@ fn attach_glosses(conn: &rusqlite::Connection, candidates: &mut [Candidate]) -> 
     if candidates.is_empty() {
         return Ok(());
     }
-    let ids: Vec<i64> = candidates
-        .iter()
-        .filter_map(|c| c.entry.stable_entry_id)
-        .collect();
+    let ids: Vec<i64> = candidates.iter().map(|c| c.entry.entry_id).collect();
     let index: HashMap<i64, usize> = candidates
         .iter()
         .enumerate()
-        .filter_map(|(position, c)| c.entry.stable_entry_id.map(|id| (id, position)))
+        .map(|(position, c)| (c.entry.entry_id, position))
         .collect();
     for chunk in ids.chunks(BIND_CHUNK) {
         let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");

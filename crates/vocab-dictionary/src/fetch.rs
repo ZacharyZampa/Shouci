@@ -1,5 +1,8 @@
 //! First-run download + ingest of CC-CEDICT, frequency, and HSK.
 //! Existing installs refresh when the calendar month changes.
+//!
+//! Nothing here prints: progress goes to the caller's callback, and a failed
+//! refresh comes back as [`Ensured::RefreshFailed`] for the caller to show.
 
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
@@ -19,22 +22,54 @@ const CEDICT_URL: &str =
 const FREQ_URL: &str = "https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/zh_cn/zh_cn_50k.txt";
 const HSK_URL: &str = "https://raw.githubusercontent.com/ivankra/hsk30/master/hsk30-expanded.csv";
 
+/// What a fetch is doing, for progress display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStage {
+    /// Another process is building this dictionary; waiting for it.
+    Waiting,
+    Downloading,
+    /// Parsing the downloads into the database.
+    Building,
+}
+
+/// What [`ensure_dictionary_db`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ensured {
+    /// Present and current (or refreshing is turned off).
+    Current,
+    /// Built for the first time.
+    Built,
+    /// Replaced with this month's sources.
+    Refreshed,
+    /// This month's refresh failed; the previous build is still in use.
+    RefreshFailed(String),
+}
+
 /// Builds `output` if missing. If it exists and was fetched in a previous
-/// calendar month, re-downloads and replaces it. A failed refresh keeps the
-/// current file. Set `VOCAB_SKIP_DICTIONARY_REFRESH=1` to never refresh.
+/// calendar month, re-downloads and replaces it; a failed refresh keeps the
+/// current file. Set `SHOUCI_SKIP_DICTIONARY_REFRESH=1` to never refresh.
+///
+/// One process fetches at a time (a lock file next to `output`). While
+/// another process holds it, an existing build is used as-is, and a missing
+/// one is waited for.
 ///
 /// # Errors
 ///
-/// First-run download/ingest failure. Refresh failures are logged, not returned.
-pub fn ensure_dictionary_db(output: &Path) -> Result<()> {
+/// When a first build fails (no network, say). A failed refresh is not an
+/// error; see [`Ensured::RefreshFailed`].
+pub fn ensure_dictionary_db(
+    output: &Path,
+    progress: &mut dyn FnMut(FetchStage),
+) -> Result<Ensured> {
     if dictionary_ready(output) {
-        return Ok(());
+        return Ok(Ensured::Current);
     }
     let lock_path = output.with_extension("fetch.lock");
     let started = Instant::now();
+    let mut waiting = false;
     loop {
         if dictionary_ready(output) {
-            return Ok(());
+            return Ok(Ensured::Current);
         }
         match OpenOptions::new()
             .write(true)
@@ -42,11 +77,19 @@ pub fn ensure_dictionary_db(output: &Path) -> Result<()> {
             .open(&lock_path)
         {
             Ok(_lock) => {
-                let result = complete_fetch(output);
+                let result = complete_fetch(output, progress);
                 let _ = std::fs::remove_file(&lock_path);
                 return result;
             }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                if output.is_file() {
+                    // Someone else is refreshing; this month's copy can wait.
+                    return Ok(Ensured::Current);
+                }
+                if !waiting {
+                    progress(FetchStage::Waiting);
+                    waiting = true;
+                }
                 if started.elapsed() > Duration::from_secs(300) {
                     let _ = std::fs::remove_file(&lock_path);
                     return Err(VocabError::new(format!(
@@ -56,7 +99,7 @@ pub fn ensure_dictionary_db(output: &Path) -> Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
-            Err(_) => return complete_fetch(output),
+            Err(_) => return complete_fetch(output, progress),
         }
     }
 }
@@ -65,23 +108,20 @@ fn dictionary_ready(output: &Path) -> bool {
     output.is_file() && (skip_refresh() || !due_for_monthly_refresh(output, &current_year_month()))
 }
 
-fn complete_fetch(output: &Path) -> Result<()> {
+fn complete_fetch(output: &Path, progress: &mut dyn FnMut(FetchStage)) -> Result<Ensured> {
     if output.is_file() {
-        match fetch_and_ingest(output, "monthly dictionary update") {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                eprintln!("dictionary update failed; keeping existing: {err}");
-                Ok(())
-            }
-        }
+        Ok(match fetch_and_ingest(output, progress) {
+            Ok(()) => Ensured::Refreshed,
+            Err(err) => Ensured::RefreshFailed(err.to_string()),
+        })
     } else {
-        fetch_and_ingest(output, "first run")
+        fetch_and_ingest(output, progress).map(|()| Ensured::Built)
     }
 }
 
 fn skip_refresh() -> bool {
     matches!(
-        std::env::var("VOCAB_SKIP_DICTIONARY_REFRESH"),
+        std::env::var("SHOUCI_SKIP_DICTIONARY_REFRESH"),
         Ok(value) if value != "0" && !value.is_empty()
     )
 }
@@ -140,7 +180,7 @@ fn write_stamp(db: &Path, stamp: &str) -> Result<()> {
         .map_err(|err| VocabError::new(format!("stamp {}: {err}", stamp_path(db).display())))
 }
 
-fn fetch_and_ingest(output: &Path, reason: &str) -> Result<()> {
+fn fetch_and_ingest(output: &Path, progress: &mut dyn FnMut(FetchStage)) -> Result<()> {
     let parent = output.parent().filter(|p| !p.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
@@ -149,7 +189,7 @@ fn fetch_and_ingest(output: &Path, reason: &str) -> Result<()> {
     std::fs::create_dir_all(&sources)
         .map_err(|err| VocabError::new(format!("create {}: {err}", sources.display())))?;
 
-    eprintln!("downloading CC-CEDICT, frequency, and HSK ({reason})…");
+    progress(FetchStage::Downloading);
     let cedict_gz = sources.join("cc-cedict.txt.gz");
     let cedict = sources.join("cc-cedict-1.0.u8.txt");
     let freq = sources.join("opensubtitles-zh-cn-50k-2018.txt");
@@ -176,7 +216,7 @@ fn fetch_and_ingest(output: &Path, reason: &str) -> Result<()> {
         (&frequency, frequency_bytes.as_slice()),
         (&hsk_source, hsk_bytes.as_slice()),
     ];
-    eprintln!("ingesting {}…", output.display());
+    progress(FetchStage::Building);
     let result =
         build_dictionary_db_with_layers(&mut conn, &CedictSource::default(), &artifact, &layers);
     drop(conn);
@@ -293,7 +333,9 @@ mod tests {
         let (dir, path) = temp_db();
         std::fs::write(&path, b"keep").expect("write");
         std::fs::write(stamp_path(&path), current_year_month()).expect("stamp");
-        ensure_dictionary_db(&path).expect("noop");
+        let outcome =
+            ensure_dictionary_db(&path, &mut |_| panic!("no work expected")).expect("noop");
+        assert_eq!(outcome, super::Ensured::Current);
         assert_eq!(std::fs::read(&path).expect("read"), b"keep");
         let _ = std::fs::remove_dir_all(&dir);
     }

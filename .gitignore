@@ -3,16 +3,15 @@
 .DS_Store
 
 # Dictionary source artifacts are hash-pinned elsewhere, never committed.
-data/dictionary/sources/*
-!data/dictionary/sources/README.md
-!data/dictionary/sources.manifest.example.json
+data/dictionaries/sources/*
+!data/dictionaries/sources/README.md
 
-# Generated dictionary build + the raw CC-CEDICT source download live locally.
-data/dictionary/*.db
-data/dictionary/*.db-wal
-data/dictionary/*.db-shm
-data/dictionary/*.u8.txt
-data/dictionary/*.u8.txt.gz
+# Generated dictionary builds live locally.
+data/dictionaries/*.db
+data/dictionaries/*.db-wal
+data/dictionaries/*.db-shm
+data/dictionaries/*.fetched
+data/dictionaries/*.fetch.lock
 
 # Local databases are user data, not source.
 data/user/*.db

@@ -9,6 +9,12 @@ license.workspace = true
 vocab-core = { path = "../vocab-core" }
 vocab-dictionary = { path = "../vocab-dictionary" }
 vocab-pinyin = { path = "../vocab-pinyin" }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
 
 [lints]
 workspace = true
+[dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }

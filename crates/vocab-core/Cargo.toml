@@ -5,8 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# No required dependencies: connector crates depend on this one and must never
+# pull in storage. `sqlite` adds `From<rusqlite::Error>` for the crates that
+# do own a database; `serde` derives for the crates that serialize.
 [dependencies]
-rusqlite = "0.40.2"
+rusqlite = { version = "0.40.2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+sqlite = ["dep:rusqlite"]
+serde = ["dep:serde"]
 
 [lints]
 workspace = true
