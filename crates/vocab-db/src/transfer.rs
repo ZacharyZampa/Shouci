@@ -94,6 +94,13 @@ impl Outcome {
 /// Outcomes that mean the destination has the word.
 const AT_DESTINATION: &str = "('inserted', 'updated', 'skipped', 'written')";
 
+/// Joins a ledger row to the saved word it is about: by id, or, for a word
+/// purged and saved again, by identity.
+const SAME_WORD: &str = "(ti.item_id = i.id OR (ti.item_id IS NULL \
+     AND ti.simplified = i.simplified COLLATE NOCASE \
+     AND ti.traditional = i.traditional COLLATE NOCASE \
+     AND ti.reading_key = i.reading_key))";
+
 /// Records a run and returns its id.
 ///
 /// # Errors
@@ -134,15 +141,18 @@ pub fn record_item(
     conn: &Connection,
     run_id: i64,
     item_id: Option<i64>,
-    line: Option<usize>,
+    line: Option<u32>,
     raw: Option<&str>,
     outcome: Outcome,
     detail: &str,
 ) -> Result<()> {
-    let line = line.map(to_i64).transpose()?;
+    // The word's identity is copied, so this history still matches it after
+    // a purge and a fresh save.
     conn.execute(
-        "INSERT INTO transfer_items (run_id, item_id, line, raw, outcome, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO transfer_items (run_id, item_id, simplified, traditional, reading_key, \
+         line, raw, outcome, detail) \
+         SELECT ?1, ?2, i.simplified, i.traditional, i.reading_key, ?3, ?4, ?5, ?6 \
+         FROM (SELECT 1) LEFT JOIN items i ON i.id = ?2",
         params![run_id, item_id, line, raw, outcome.as_str(), detail],
     )?;
     Ok(())
@@ -170,10 +180,10 @@ pub fn import_sources(conn: &Connection) -> Result<Vec<String>> {
 /// Returns an error if the query fails.
 pub fn items_at(conn: &Connection, connector_id: &str) -> Result<HashSet<i64>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT DISTINCT ti.item_id FROM transfer_items ti \
+        "SELECT DISTINCT i.id FROM items i JOIN transfer_items ti ON {SAME_WORD} \
          JOIN transfer_runs tr ON tr.id = ti.run_id \
          WHERE tr.connector_id = ?1 AND tr.status = 'committed' \
-         AND ti.item_id IS NOT NULL AND ti.outcome IN {AT_DESTINATION}"
+         AND ti.outcome IN {AT_DESTINATION}"
     ))?;
     let rows = stmt.query_map([connector_id], |row| row.get(0))?;
     Ok(rows.collect::<rusqlite::Result<HashSet<i64>>>()?)
@@ -186,9 +196,9 @@ pub fn items_at(conn: &Connection, connector_id: &str) -> Result<HashSet<i64>> {
 /// Returns an error if the query fails.
 pub fn item_destinations(conn: &Connection, item_id: i64) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT DISTINCT tr.connector_id FROM transfer_items ti \
+        "SELECT DISTINCT tr.connector_id FROM items i JOIN transfer_items ti ON {SAME_WORD} \
          JOIN transfer_runs tr ON tr.id = ti.run_id \
-         WHERE ti.item_id = ?1 AND tr.status = 'committed' \
+         WHERE i.id = ?1 AND tr.status = 'committed' \
          AND ti.outcome IN {AT_DESTINATION} ORDER BY tr.connector_id"
     ))?;
     let rows = stmt.query_map([item_id], |row| row.get(0))?;
@@ -202,9 +212,9 @@ pub fn item_destinations(conn: &Connection, item_id: i64) -> Result<Vec<String>>
 /// Returns an error if the query fails.
 pub fn destinations_by_item(conn: &Connection) -> Result<HashMap<i64, Vec<String>>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT DISTINCT ti.item_id, tr.connector_id FROM transfer_items ti \
+        "SELECT DISTINCT i.id, tr.connector_id FROM items i JOIN transfer_items ti ON {SAME_WORD} \
          JOIN transfer_runs tr ON tr.id = ti.run_id \
-         WHERE tr.status = 'committed' AND ti.item_id IS NOT NULL \
+         WHERE tr.status = 'committed' \
          AND ti.outcome IN {AT_DESTINATION} ORDER BY tr.connector_id"
     ))?;
     let mut rows = stmt.query([])?;
@@ -265,6 +275,32 @@ mod tests {
         assert!(items_at(&conn, "pleco").unwrap().contains(&id));
         assert_eq!(super::item_destinations(&conn, id).unwrap(), vec!["pleco"]);
         assert!(items_at(&conn, "anki").unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_outlives_a_purge() {
+        let conn = open_in_memory().unwrap();
+        let word = NewItem {
+            simplified: "学校".to_owned(),
+            traditional: String::new(),
+            pinyin: "xue2 xiao4".to_owned(),
+            definition: "school".to_owned(),
+            notes: String::new(),
+            verification: Verification::Confirmed,
+            source: ItemSource::manual(),
+        };
+        let id = save_item(&conn, &word).unwrap().item().id;
+        let out = record_run(
+            &conn,
+            &run(Direction::Out, "pleco", "/tmp/p.txt", RunStatus::Committed),
+        )
+        .unwrap();
+        record_item(&conn, out, Some(id), None, None, Outcome::Written, "").unwrap();
+        crate::set_trashed(&conn, id, true).unwrap();
+        crate::purge_item(&conn, id).unwrap();
+        let again = save_item(&conn, &word).unwrap().item().id;
+        assert_ne!(again, id, "ids are never reused");
+        assert!(items_at(&conn, "pleco").unwrap().contains(&again));
     }
 
     #[test]

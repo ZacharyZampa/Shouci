@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, params};
 use vocab_core::{Result, VocabError};
 
-use crate::items::require_item;
+use crate::items::{mark_changed, require_item};
 
 /// A tag or collection and how many words outside the trash it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,14 +89,14 @@ fn require(conn: &Connection, group: Group, name: &str) -> Result<i64> {
 
 fn ensure(conn: &Connection, group: Group, name: &str) -> Result<i64> {
     let name = clean_name(group, name)?;
-    if let Some(id) = find(conn, group, &name)? {
-        return Ok(id);
-    }
+    // Insert-or-ignore, then look up: safe when another process creates the
+    // same name at the same moment.
     conn.execute(
-        &format!("INSERT INTO {} (name) VALUES (?1)", group.table()),
+        &format!("INSERT OR IGNORE INTO {} (name) VALUES (?1)", group.table()),
         [&name],
     )?;
-    Ok(conn.last_insert_rowid())
+    find(conn, group, &name)?
+        .ok_or_else(|| VocabError::new(format!("{} {name} vanished", group.noun())))
 }
 
 fn list(conn: &Connection, group: Group) -> Result<Vec<NameCount>> {
@@ -153,7 +153,7 @@ fn names_by_item(conn: &Connection, group: Group) -> Result<HashMap<i64, Vec<Str
 fn link(conn: &Connection, group: Group, item_id: i64, name: &str) -> Result<()> {
     require_item(conn, item_id)?;
     let group_id = ensure(conn, group, name)?;
-    conn.execute(
+    let added = conn.execute(
         &format!(
             "INSERT OR IGNORE INTO {} (item_id, {}) VALUES (?1, ?2)",
             group.links(),
@@ -161,6 +161,9 @@ fn link(conn: &Connection, group: Group, item_id: i64, name: &str) -> Result<()>
         ),
         params![item_id, group_id],
     )?;
+    if added > 0 {
+        mark_changed(conn, item_id)?;
+    }
     Ok(())
 }
 
@@ -168,7 +171,7 @@ fn unlink(conn: &Connection, group: Group, item_id: i64, name: &str) -> Result<(
     let Some(group_id) = find(conn, group, name.trim())? else {
         return Ok(());
     };
-    conn.execute(
+    let removed = conn.execute(
         &format!(
             "DELETE FROM {} WHERE item_id = ?1 AND {} = ?2",
             group.links(),
@@ -176,11 +179,19 @@ fn unlink(conn: &Connection, group: Group, item_id: i64, name: &str) -> Result<(
         ),
         params![item_id, group_id],
     )?;
+    if removed > 0 {
+        mark_changed(conn, item_id)?;
+    }
     Ok(())
 }
 
 fn replace(conn: &Connection, group: Group, item_id: i64, names: &[String]) -> Result<()> {
     require_item(conn, item_id)?;
+    // Every name must be valid before the old ones go.
+    for name in names {
+        clean_name(group, name)?;
+    }
+    mark_changed(conn, item_id)?;
     conn.execute(
         &format!("DELETE FROM {} WHERE item_id = ?1", group.links()),
         [item_id],
@@ -206,11 +217,26 @@ fn rename(conn: &Connection, group: Group, from: &str, to: &str) -> Result<()> {
         &format!("UPDATE {} SET name = ?1 WHERE id = ?2", group.table()),
         params![to, id],
     )?;
+    mark_members_changed(conn, group, id)
+}
+
+/// Every word in a tag or collection changed with it.
+fn mark_members_changed(conn: &Connection, group: Group, group_id: i64) -> Result<()> {
+    conn.execute(
+        &format!(
+            "UPDATE items SET modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+             rev = rev + 1 WHERE id IN (SELECT item_id FROM {} WHERE {} = ?1)",
+            group.links(),
+            group.key()
+        ),
+        [group_id],
+    )?;
     Ok(())
 }
 
 fn delete(conn: &Connection, group: Group, name: &str) -> Result<()> {
     let id = require(conn, group, name.trim())?;
+    mark_members_changed(conn, group, id)?;
     conn.execute(
         &format!("DELETE FROM {} WHERE id = ?1", group.table()),
         [id],
@@ -383,6 +409,7 @@ pub fn collection_from_tag(conn: &Connection, tag: &str) -> Result<NameCount> {
         row.get(0)
     })?;
     let collection_id = ensure(conn, Group::Collection, &name)?;
+    mark_members_changed(conn, Group::Tag, tag_id)?;
     conn.execute(
         "INSERT OR IGNORE INTO collection_items (collection_id, item_id) \
          SELECT ?1, item_id FROM item_tags WHERE tag_id = ?2",
@@ -465,6 +492,26 @@ mod tests {
             delete_tag(&conn, "b").unwrap_err().kind(),
             ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn a_bad_name_leaves_the_old_tags_alone() {
+        let conn = open_in_memory().unwrap();
+        let a = saved(&conn, "一", "yi1");
+        add_tag(&conn, a, "keep").unwrap();
+        assert!(set_tags(&conn, a, &["new".to_owned(), "  ".to_owned()]).is_err());
+        assert_eq!(item_tags(&conn, a).unwrap(), vec!["keep"]);
+    }
+
+    #[test]
+    fn tag_edits_count_as_changes_to_the_word() {
+        let conn = open_in_memory().unwrap();
+        let a = saved(&conn, "一", "yi1");
+        let before = crate::require_item(&conn, a).unwrap().rev;
+        add_tag(&conn, a, "x").unwrap();
+        rename_tag(&conn, "x", "y").unwrap();
+        let after = crate::require_item(&conn, a).unwrap().rev;
+        assert_eq!(after, before + 2);
     }
 
     #[test]

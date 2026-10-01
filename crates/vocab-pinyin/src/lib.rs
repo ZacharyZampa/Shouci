@@ -63,7 +63,7 @@ impl std::str::FromStr for NormalizedPinyin {
 pub fn normalize(input: &str) -> NormalizedPinyin {
     let mut out = String::with_capacity(input.len());
     let mut pending_tone: Option<u8> = None;
-    let lowered = input.trim().to_lowercase();
+    let lowered = compose(input.trim()).to_lowercase();
     let mut chars = lowered.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -138,23 +138,16 @@ fn token_forms(token: &str) -> Vec<String> {
     if hard_boundaries.is_empty() {
         return Vec::new();
     }
-    let mut per_boundary: Vec<Vec<String>> = Vec::new();
-    for part in hard_boundaries {
-        let mut forms = Vec::new();
-        let mut walked = Vec::new();
-        walk_syllables(part, &mut walked, &mut forms);
-        forms.sort_by(|a, b| syllable_count_order(a, b));
-        forms.truncate(MAX_SEGMENTATIONS);
-        per_boundary.push(forms);
-    }
-    per_boundary
+    hard_boundaries
         .into_iter()
+        .map(part_forms)
         .reduce(cross_join)
         .unwrap_or_default()
 }
 
 /// Takes ownership to satisfy `Iterator::reduce`'s `Fn` bound while avoiding
-/// needless clones of the accumulating segment lists.
+/// needless clones of the accumulating segment lists. Capped like a single
+/// part, so many tokens cannot multiply into a huge list.
 #[allow(clippy::needless_pass_by_value)]
 fn cross_join(left: Vec<String>, right: Vec<String>) -> Vec<String> {
     let mut joined = Vec::with_capacity(left.len() * right.len());
@@ -163,37 +156,65 @@ fn cross_join(left: Vec<String>, right: Vec<String>) -> Vec<String> {
             joined.push(format!("{a} {b}"));
         }
     }
+    joined.sort_by(|a, b| syllable_count_order(a, b));
+    joined.truncate(MAX_SEGMENTATIONS);
     joined
 }
 
-fn walk_syllables<'a>(part: &'a str, walked: &mut Vec<&'a str>, forms: &mut Vec<String>) {
+/// Every way to split `part` into syllables, fewest syllables first, capped
+/// at [`MAX_SEGMENTATIONS`].
+///
+/// Dynamic programming over positions: each suffix is split once and its
+/// best splits reused, so the work grows with the length of the input, not
+/// with the (exponential) number of possible splits. Keeping only the best
+/// [`MAX_SEGMENTATIONS`] per suffix loses nothing: prefixing one syllable
+/// preserves the order within a suffix's list.
+fn part_forms(part: &str) -> Vec<String> {
+    let mut memo: Vec<Option<Vec<String>>> = vec![None; part.len() + 1];
+    suffix_forms(part, 0, &mut memo)
+}
+
+fn suffix_forms(part: &str, pos: usize, memo: &mut Vec<Option<Vec<String>>>) -> Vec<String> {
+    if let Some(done) = &memo[pos] {
+        return done.clone();
+    }
     let bytes = part.as_bytes();
-    if walked.iter().map(|w| w.len()).sum::<usize>() == part.len() {
-        forms.push(walked.join(" "));
-        return;
+    let mut forms = Vec::new();
+    if pos == bytes.len() {
+        forms.push(String::new());
+    } else {
+        for syllable in syllables::SYLLABLES {
+            // Single-letter syllables (a, e, o, n, r, ...) and the
+            // interjections (m, n, ng, hm, hng) are excluded from
+            // segmentation: they would otherwise produce spurious splits like
+            // `xi a n`, `gu o`, or `xi ng2` for `xing2`. Standalone queries
+            // for these still reach the raw (unsegmented) path.
+            if syllable.len() == 1 || matches!(*syllable, "m" | "n" | "ng" | "hm" | "hng") {
+                continue;
+            }
+            let s = syllable.as_bytes();
+            if !bytes[pos..].starts_with(s) {
+                continue;
+            }
+            let mut end = pos + s.len();
+            if end < bytes.len() && (b'1'..=b'5').contains(&bytes[end]) {
+                end += 1;
+            }
+            let head = &part[pos..end];
+            for rest in suffix_forms(part, end, memo) {
+                forms.push(if rest.is_empty() {
+                    head.to_owned()
+                } else {
+                    format!("{head} {rest}")
+                });
+            }
+        }
+        forms.sort_by(|a, b| syllable_count_order(a, b));
+        forms.dedup();
+        forms.truncate(MAX_SEGMENTATIONS);
     }
-    let pos = walked.iter().map(|w| w.len()).sum::<usize>();
-    for syllable in syllables::SYLLABLES {
-        // Single-letter syllables (a, e, o, n, r, ...) and the interjections
-        // (m, n, ng, hm, hng) are excluded from segmentation: they would
-        // otherwise produce spurious splits like `xi a n`, `gu o`, or
-        // `xi ng2` for `xing2`. Standalone queries for these still reach the
-        // raw (unsegmented) path.
-        if syllable.len() == 1 || matches!(*syllable, "m" | "n" | "ng" | "hm" | "hng") {
-            continue;
-        }
-        let s = syllable.as_bytes();
-        if !bytes[pos..].starts_with(s) {
-            continue;
-        }
-        let mut end = pos + s.len();
-        if end < bytes.len() && (b'1'..=b'5').contains(&bytes[end]) {
-            end += 1;
-        }
-        walked.push(&part[pos..end]);
-        walk_syllables(part, walked, forms);
-        walked.pop();
-    }
+    memo[pos] = Some(forms.clone());
+    forms
 }
 
 fn syllable_count_order(a: &str, b: &str) -> std::cmp::Ordering {
@@ -229,13 +250,89 @@ fn marked_tone(c: char) -> Option<(char, u8)> {
         'ǘ' => Some(('v', 2)),
         'ǚ' => Some(('v', 3)),
         'ǜ' => Some(('v', 4)),
+        // Syllabic nasals: 嗯 ń / ň / ǹ, 呣 ḿ.
+        'ń' => Some(('n', 2)),
+        'ň' => Some(('n', 3)),
+        'ǹ' => Some(('n', 4)),
+        'ḿ' => Some(('m', 2)),
         _ => None,
     }
+}
+
+/// Folds a vowel followed by a combining tone mark (decomposed text, as some
+/// keyboards and copy sources produce: `u` + U+0301) into the single
+/// precomposed character (`ú`), so both spellings read the same.
+pub(crate) fn compose(input: &str) -> std::borrow::Cow<'_, str> {
+    if !input
+        .chars()
+        .any(|c| ('\u{0300}'..='\u{030C}').contains(&c))
+    {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut out: Vec<char> = Vec::with_capacity(input.len());
+    for c in input.chars() {
+        let combined = out.last().and_then(|&base| combine(base, c));
+        match combined {
+            Some(composed) => {
+                out.pop();
+                out.push(composed);
+            }
+            None => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out.into_iter().collect())
+}
+
+fn combine(base: char, mark: char) -> Option<char> {
+    if mark == '\u{0308}' {
+        return match base {
+            'u' => Some('ü'),
+            'U' => Some('Ü'),
+            _ => None,
+        };
+    }
+    let tone = match mark {
+        '\u{0304}' => 0,
+        '\u{0301}' => 1,
+        '\u{030C}' => 2,
+        '\u{0300}' => 3,
+        _ => return None,
+    };
+    let row: [char; 4] = match base {
+        'a' => ['ā', 'á', 'ǎ', 'à'],
+        'e' => ['ē', 'é', 'ě', 'è'],
+        'i' => ['ī', 'í', 'ǐ', 'ì'],
+        'o' => ['ō', 'ó', 'ǒ', 'ò'],
+        'u' => ['ū', 'ú', 'ǔ', 'ù'],
+        'ü' => ['ǖ', 'ǘ', 'ǚ', 'ǜ'],
+        'A' => ['Ā', 'Á', 'Ǎ', 'À'],
+        'E' => ['Ē', 'É', 'Ě', 'È'],
+        'I' => ['Ī', 'Í', 'Ǐ', 'Ì'],
+        'O' => ['Ō', 'Ó', 'Ǒ', 'Ò'],
+        'U' => ['Ū', 'Ú', 'Ǔ', 'Ù'],
+        'Ü' => ['Ǖ', 'Ǘ', 'Ǚ', 'Ǜ'],
+        _ => return None,
+    };
+    row.get(tone).copied()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{normalize, segment};
+
+    #[test]
+    fn segmenting_long_input_is_fast_and_capped() {
+        let long = "xian".repeat(30);
+        let started = std::time::Instant::now();
+        let forms = segment(&long);
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!forms.is_empty() && forms.len() <= super::MAX_SEGMENTATIONS);
+        assert!(forms.contains(&vec!["xian"; 30].join(" ")));
+    }
 
     #[test]
     fn segments_unspaced_pinyin() {

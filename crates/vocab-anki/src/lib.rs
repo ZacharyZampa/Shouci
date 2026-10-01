@@ -5,8 +5,8 @@
 //! - The `#deck:` header becomes a collection.
 //! - Columns a file lacks are omitted, never read as empty.
 //! - On export, the deck is the chosen deck, else the one collection being
-//!   exported, else "Shouci". Anki tags cannot contain spaces, so spaces
-//!   become underscores.
+//!   exported, else none (Anki asks for one on import). Anki tags cannot
+//!   contain spaces, so spaces become underscores.
 
 mod text;
 
@@ -18,9 +18,6 @@ use vocab_core::connector::{
     WriteOptions, Written,
 };
 
-/// Deck used when neither a deck nor a single collection is given.
-pub const DEFAULT_DECK: &str = "Shouci";
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Anki;
 
@@ -30,14 +27,7 @@ fn field<T>(value: Option<T>) -> Field<T> {
 
 impl Connector for Anki {
     fn info(&self) -> ConnectorInfo {
-        ConnectorInfo {
-            id: "anki",
-            name: "Anki",
-            format: KEY,
-            extensions: &["txt", "tsv"],
-            can_import: true,
-            can_export: true,
-        }
+        ConnectorInfo::new("anki", "Anki", KEY).with_extensions(&["txt", "tsv"])
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<ParsedRecords> {
@@ -46,28 +36,23 @@ impl Connector for Anki {
         let issues = parsed
             .issues
             .into_iter()
-            .map(|issue| Issue {
-                line: issue.line,
-                severity: match issue.severity {
+            .map(|issue| {
+                let severity = match issue.severity {
                     IssueSeverity::Info => Severity::Info,
                     IssueSeverity::Warning => Severity::Warning,
                     IssueSeverity::Error => Severity::Error,
-                },
-                message: issue.message,
+                };
+                Issue::new(line(issue.line), severity, issue.message)
             })
             .collect();
         let mut records = Vec::with_capacity(parsed.notes.len());
         let mut issues: Vec<Issue> = issues;
         for note in parsed.notes {
             if note.headword.trim().is_empty() {
-                issues.push(Issue {
-                    line: note.line,
-                    severity: Severity::Error,
-                    message: "note has no headword".to_owned(),
-                });
+                issues.push(Issue::error(line(note.line), "note has no headword"));
                 continue;
             }
-            let mut record = ExchangeRecord::new(note.line, note.raw, note.headword);
+            let mut record = ExchangeRecord::new(line(note.line), note.raw, note.headword);
             record.traditional = field(note.traditional.filter(|value| !value.is_empty()));
             record.pinyin = field(note.pinyin);
             record.definition = field(note.definition);
@@ -77,15 +62,11 @@ impl Connector for Anki {
             records.push(record);
         }
         issues.sort_by_key(|issue| issue.line);
-        Ok(ParsedRecords { records, issues })
+        Ok(ParsedRecords::new(records, issues))
     }
 
     fn write(&self, records: &[ExportRecord], options: &WriteOptions) -> Result<Written> {
-        let deck = options
-            .deck
-            .clone()
-            .or_else(|| options.collection.clone())
-            .unwrap_or_else(|| DEFAULT_DECK.to_owned());
+        let deck = options.deck.clone().or_else(|| options.collection.clone());
         let mut renamed: Vec<String> = Vec::new();
         let notes: Vec<AnkiNote> = records
             .iter()
@@ -125,9 +106,14 @@ impl Connector for Anki {
                 renamed.join(", ")
             ));
         }
-        Ok(Written {
-            bytes: AnkiTextV1.write(&notes, &deck)?,
-            notes: notes_out,
-        })
+        Ok(Written::new(
+            AnkiTextV1.write(&notes, deck.as_deref())?,
+            notes_out,
+        ))
     }
+}
+
+/// Note lines are 1-based `usize`s in the grammar.
+fn line(number: usize) -> u32 {
+    u32::try_from(number).unwrap_or(u32::MAX)
 }

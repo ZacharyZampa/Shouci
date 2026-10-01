@@ -30,8 +30,14 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     Ok(dir.join(name))
 }
 
-fn read(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|err| Error::io(format!("cannot read {}: {err}", path.display())))
+fn read_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            Error::not_found(format!("no file at {}", path.display()))
+        } else {
+            Error::io(format!("cannot read {}: {err}", path.display()))
+        }
+    })
 }
 
 fn text(path: &Path) -> String {
@@ -64,10 +70,10 @@ impl Shouci {
     ) -> Result<ImportPlan> {
         let connector = self.connectors.get(connector)?;
         let path = absolute(path)?;
-        let bytes = read(&path)?;
+        let bytes = read_file(&path)?;
         let loaded = self.loaded_opt();
         vocab_exchange::plan_import(
-            &*self.db()?,
+            &*self.read()?,
             loaded.as_deref().map(crate::dictionaries::Loaded::provider),
             connector,
             &bytes,
@@ -84,7 +90,7 @@ impl Shouci {
     /// [`crate::ErrorKind::Conflict`] when the file or an affected word
     /// changed since the preview (preview again); I/O or storage errors.
     pub fn apply_import(&self, plan: &ImportPlan) -> Result<TransferSummary> {
-        let bytes = read(Path::new(&plan.path))?;
+        let bytes = read_file(Path::new(&plan.path))?;
         vocab_exchange::apply_import(&mut *self.db()?, plan, &content_hash(&bytes))
     }
 
@@ -104,7 +110,7 @@ impl Shouci {
         let path = absolute(path)?;
         let loaded = self.loaded_opt();
         vocab_exchange::plan_export(
-            &*self.db()?,
+            &*self.read()?,
             loaded.as_deref().map(crate::dictionaries::Loaded::provider),
             connector,
             &text(&path),

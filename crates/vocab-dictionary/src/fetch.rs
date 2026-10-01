@@ -45,13 +45,55 @@ pub enum Ensured {
     RefreshFailed(String),
 }
 
-/// Builds `output` if missing. If it exists and was fetched in a previous
+/// What a dictionary file needs, without doing anything about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildState {
+    Missing,
+    /// Present but cannot be opened (a half-copied or damaged file). It will
+    /// be rebuilt.
+    Unusable(String),
+    /// Usable, and either refreshed this month, refresh is off, or a refresh
+    /// already failed today.
+    Current,
+    /// Usable, and from an earlier month.
+    RefreshDue,
+}
+
+/// How long a fetch lock may sit untouched before it is treated as left
+/// behind by a process that died mid-fetch.
+const STALE_LOCK: Duration = Duration::from_secs(30 * 60);
+
+/// How long to wait for another process's first build before giving up.
+const FIRST_BUILD_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// Whether `output` needs building or refreshing.
+#[must_use]
+pub fn build_state(output: &Path) -> BuildState {
+    if !output.is_file() {
+        return BuildState::Missing;
+    }
+    if let Err(err) = crate::SqliteDictionary::open(output).and_then(|dict| dict.info(Some(output)))
+    {
+        return BuildState::Unusable(err.to_string());
+    }
+    let refresh = !skip_refresh()
+        && due_for_monthly_refresh(output, &current_year_month())
+        && !refresh_failed_today(output);
+    if refresh {
+        BuildState::RefreshDue
+    } else {
+        BuildState::Current
+    }
+}
+
+/// Builds `output` if missing or unusable. If it was fetched in an earlier
 /// calendar month, re-downloads and replaces it; a failed refresh keeps the
-/// current file. Set `SHOUCI_SKIP_DICTIONARY_REFRESH=1` to never refresh.
+/// current file and is not retried until the next day. Set
+/// `SHOUCI_SKIP_DICTIONARY_REFRESH=1` to never refresh.
 ///
 /// One process fetches at a time (a lock file next to `output`). While
-/// another process holds it, an existing build is used as-is, and a missing
-/// one is waited for.
+/// another process holds it, a usable build is used as-is, and a missing one
+/// is waited for. A lock untouched for 30 minutes is assumed abandoned.
 ///
 /// # Errors
 ///
@@ -61,14 +103,19 @@ pub fn ensure_dictionary_db(
     output: &Path,
     progress: &mut dyn FnMut(FetchStage),
 ) -> Result<Ensured> {
-    if dictionary_ready(output) {
-        return Ok(Ensured::Current);
+    match build_state(output) {
+        BuildState::Current => return Ok(Ensured::Current),
+        BuildState::Unusable(_) => {
+            // A cache, not user data: rebuild it.
+            let _ = std::fs::remove_file(output);
+        }
+        BuildState::Missing | BuildState::RefreshDue => {}
     }
     let lock_path = output.with_extension("fetch.lock");
     let started = Instant::now();
     let mut waiting = false;
     loop {
-        if dictionary_ready(output) {
+        if build_state(output) == BuildState::Current {
             return Ok(Ensured::Current);
         }
         match OpenOptions::new()
@@ -82,7 +129,11 @@ pub fn ensure_dictionary_db(
                 return result;
             }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                if output.is_file() {
+                if lock_is_stale(&lock_path) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                if build_state(output) == BuildState::RefreshDue {
                     // Someone else is refreshing; this month's copy can wait.
                     return Ok(Ensured::Current);
                 }
@@ -90,11 +141,10 @@ pub fn ensure_dictionary_db(
                     progress(FetchStage::Waiting);
                     waiting = true;
                 }
-                if started.elapsed() > Duration::from_secs(300) {
-                    let _ = std::fs::remove_file(&lock_path);
-                    return Err(VocabError::new(format!(
-                        "timed out waiting for dictionary fetch lock {}",
-                        lock_path.display()
+                if started.elapsed() > FIRST_BUILD_WAIT {
+                    return Err(VocabError::unavailable(format!(
+                        "timed out waiting for another process to build {}",
+                        output.display()
                     )));
                 }
                 std::thread::sleep(Duration::from_millis(250));
@@ -104,19 +154,42 @@ pub fn ensure_dictionary_db(
     }
 }
 
-fn dictionary_ready(output: &Path) -> bool {
-    output.is_file() && (skip_refresh() || !due_for_monthly_refresh(output, &current_year_month()))
+fn lock_is_stale(lock: &Path) -> bool {
+    std::fs::metadata(lock)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > STALE_LOCK)
 }
 
 fn complete_fetch(output: &Path, progress: &mut dyn FnMut(FetchStage)) -> Result<Ensured> {
     if output.is_file() {
         Ok(match fetch_and_ingest(output, progress) {
             Ok(()) => Ensured::Refreshed,
-            Err(err) => Ensured::RefreshFailed(err.to_string()),
+            Err(err) => {
+                let _ = std::fs::write(failed_stamp_path(output), today());
+                Ensured::RefreshFailed(err.to_string())
+            }
         })
     } else {
         fetch_and_ingest(output, progress).map(|()| Ensured::Built)
     }
+}
+
+fn failed_stamp_path(db: &Path) -> PathBuf {
+    db.with_extension("refresh-failed")
+}
+
+fn refresh_failed_today(db: &Path) -> bool {
+    std::fs::read_to_string(failed_stamp_path(db)).is_ok_and(|day| day.trim() == today())
+}
+
+fn today() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (year, month, day) = civil_utc(i64::try_from(secs / 86_400).unwrap_or(0));
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn skip_refresh() -> bool {
@@ -245,7 +318,16 @@ fn download(url: &str, dest: &Path, force: bool) -> Result<()> {
     }
     let tmp = sibling_tmp(dest);
     let status = Command::new("curl")
-        .args(["-Lsf", "--retry", "2", "-o"])
+        .args([
+            "-Lsf",
+            "--retry",
+            "2",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "600",
+            "-o",
+        ])
         .arg(&tmp)
         .arg(url)
         .status()
@@ -329,14 +411,36 @@ mod tests {
     }
 
     #[test]
+    fn damaged_files_and_stale_locks_are_noticed() {
+        let (dir, path) = temp_db();
+        std::fs::write(&path, b"not a database").expect("write");
+        assert!(matches!(
+            super::build_state(&path),
+            super::BuildState::Unusable(_)
+        ));
+        let lock = path.with_extension("fetch.lock");
+        std::fs::write(&lock, b"").expect("lock");
+        assert!(!super::lock_is_stale(&lock), "fresh lock");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ensure_leaves_current_month_file_alone() {
         let (dir, path) = temp_db();
-        std::fs::write(&path, b"keep").expect("write");
+        let mut conn = rusqlite::Connection::open(&path).expect("open");
+        crate::build_dictionary_db(
+            &mut conn,
+            &crate::CedictSource::default(),
+            "你好 你好 [ni3 hao3] /hello/\n".as_bytes(),
+        )
+        .expect("build");
+        drop(conn);
+        let before = std::fs::read(&path).expect("read");
         std::fs::write(stamp_path(&path), current_year_month()).expect("stamp");
         let outcome =
             ensure_dictionary_db(&path, &mut |_| panic!("no work expected")).expect("noop");
         assert_eq!(outcome, super::Ensured::Current);
-        assert_eq!(std::fs::read(&path).expect("read"), b"keep");
+        assert_eq!(std::fs::read(&path).expect("read"), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

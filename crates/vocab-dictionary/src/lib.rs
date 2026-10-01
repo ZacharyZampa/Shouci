@@ -22,7 +22,7 @@ mod sqlite;
 pub use catalog::{DictionaryInfo, DictionarySpec};
 pub use cedict::CedictSource;
 pub use display::display_definition;
-pub use fetch::{Ensured, FetchStage, ensure_dictionary_db};
+pub use fetch::{BuildState, Ensured, FetchStage, build_state, ensure_dictionary_db};
 pub use frequency::FrequencySource;
 pub use hsk::HskSource;
 pub use ingest::{DataSourceDescriptor, IngestSource, LayerKind, RawEntry};

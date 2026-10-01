@@ -42,7 +42,7 @@ impl Shouci {
     ///
     /// Storage errors.
     pub fn list_items(&self, filter: &LibraryFilter) -> Result<Vec<ItemView>> {
-        let conn = self.db()?;
+        let conn = self.read()?;
         let items = vocab_db::list_items(&conn, filter)?;
         item_views(&conn, items)
     }
@@ -51,7 +51,7 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::NotFound`] or a storage error.
     pub fn item(&self, id: i64) -> Result<ItemView> {
-        let conn = self.db()?;
+        let conn = self.read()?;
         let item = vocab_db::require_item(&conn, id)?;
         item_view(&conn, item)
     }
@@ -69,22 +69,31 @@ impl Shouci {
         item_view(&conn, item)
     }
 
-    /// Applies `action` to every word in `ids`, all or nothing.
+    /// Applies `action` to every word in `ids`, all or nothing. Repeated ids
+    /// count once.
     ///
     /// # Errors
     ///
     /// The first failure (an unknown id, purging a word that isn't in the
     /// trash, a blank tag name); nothing changes then.
     pub fn bulk(&self, ids: &[i64], action: &BulkAction) -> Result<BulkResult> {
-        if ids.is_empty() {
+        let mut unique: Vec<i64> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        if unique.is_empty() {
             return Ok(BulkResult { changed: 0 });
         }
         let mut conn = self.db()?;
         vocab_db::with_tx(&mut conn, |tx| {
-            for &id in ids {
+            for &id in &unique {
                 apply(tx, id, action)?;
             }
-            Ok(BulkResult { changed: ids.len() })
+            Ok(BulkResult {
+                changed: crate::count(unique.len()),
+            })
         })
     }
 
@@ -95,7 +104,7 @@ impl Shouci {
     /// Storage errors.
     pub fn empty_trash(&self) -> Result<BulkResult> {
         let ids: Vec<i64> = {
-            let conn = self.db()?;
+            let conn = self.read()?;
             vocab_db::list_items(
                 &conn,
                 &LibraryFilter {
@@ -114,7 +123,7 @@ impl Shouci {
     ///
     /// Storage errors.
     pub fn tags(&self) -> Result<Vec<GroupView>> {
-        Ok(vocab_db::tags(&*self.db()?)?
+        Ok(vocab_db::tags(&*self.read()?)?
             .into_iter()
             .map(GroupView::from)
             .collect())
@@ -141,7 +150,7 @@ impl Shouci {
     ///
     /// Storage errors.
     pub fn collections(&self) -> Result<Vec<GroupView>> {
-        Ok(vocab_db::collections(&*self.db()?)?
+        Ok(vocab_db::collections(&*self.read()?)?
             .into_iter()
             .map(GroupView::from)
             .collect())

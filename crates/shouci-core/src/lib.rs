@@ -51,12 +51,22 @@ pub mod text {
 }
 
 use connectors::Registry;
-use dictionaries::DictState;
+use dictionaries::{DictState, LoadControl};
+
+/// Longest query accepted, in characters. Real queries are a few words; this
+/// keeps pasted paragraphs from tying up search.
+pub const MAX_QUERY_CHARS: usize = 100;
 
 pub struct Shouci {
     config: Config,
+    /// Every write goes through this connection.
     user: Mutex<Connection>,
+    /// Reads (search, listings, previews) use their own connection, so a long
+    /// import never blocks them, and so `data_version` sees this process's
+    /// own writes.
+    reader: Mutex<Connection>,
     dictionaries: RwLock<DictState>,
+    load: LoadControl,
     connectors: Registry,
     startup_notes: Vec<String>,
 }
@@ -81,18 +91,18 @@ impl Shouci {
             ))
         })?;
         let path = config.user_db_path();
-        let fresh = !path.exists();
         let mut conn = vocab_db::open(&path)?;
+        let reader = vocab_db::open(&path)?;
         let mut startup_notes = Vec::new();
-        if fresh {
-            if let Some(legacy) = &config.legacy_dir {
-                bring_over(&config, legacy, &mut conn, &mut startup_notes);
-            }
+        if let Some(legacy) = &config.legacy_dir {
+            bring_over(&config, legacy, &mut conn, &mut startup_notes);
         }
         Ok(Self {
             config,
             user: Mutex::new(conn),
+            reader: Mutex::new(reader),
             dictionaries: RwLock::new(DictState::NotLoaded),
+            load: LoadControl::default(),
             connectors: Registry::builtin(),
             startup_notes,
         })
@@ -110,14 +120,15 @@ impl Shouci {
         &self.startup_notes
     }
 
-    /// Changes when another process (the CLI, the menu-bar app) commits to
-    /// the library. Poll it to refresh an open window.
+    /// Changes whenever the library changes: from this `Shouci` (the popover
+    /// saving a word) or another process (the CLI). Poll it to refresh an
+    /// open window.
     ///
     /// # Errors
     ///
     /// Storage errors.
     pub fn data_version(&self) -> Result<i64> {
-        vocab_db::data_version(&*self.db()?)
+        vocab_db::data_version(&*self.read()?)
     }
 
     /// Brings words, tags, and transfer history over from a
@@ -129,29 +140,68 @@ impl Shouci {
     /// When the file is missing or not a POC database, or writing fails.
     pub fn import_poc(&self, legacy_db: &Path) -> Result<LegacyImport> {
         let mut conn = self.db()?;
-        Ok(vocab_db::import_poc_database(&mut conn, legacy_db)?.into())
+        Ok(vocab_db::import_poc_database(&mut conn, &expand_tilde(legacy_db)?)?.into())
     }
 
+    /// The connection for writes.
     pub(crate) fn db(&self) -> Result<MutexGuard<'_, Connection>> {
         self.user
             .lock()
             .map_err(|_| Error::new("the library is unavailable after an earlier failure"))
     }
+
+    /// The connection for reads.
+    pub(crate) fn read(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.reader
+            .lock()
+            .map_err(|_| Error::new("the library is unavailable after an earlier failure"))
+    }
 }
 
-/// First run after the proof of concept: copy its words, and its built
-/// dictionary so the first launch needs no download. Failures are reported,
-/// never fatal.
+/// A count for the API. Counts never come near `u32::MAX`.
+pub(crate) fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// A trimmed query, or why it is refused.
+pub(crate) fn check_query(query: &str) -> Result<&str> {
+    let query = query.trim();
+    if query.chars().count() > MAX_QUERY_CHARS {
+        return Err(Error::invalid(format!(
+            "search is limited to {MAX_QUERY_CHARS} characters"
+        )));
+    }
+    Ok(query)
+}
+
+/// After the proof of concept: copy its words once, and its built
+/// dictionary so the first launch needs no download. Runs on every open
+/// until the words have come over (an interrupted first launch tries
+/// again). Failures are reported, never fatal.
 fn bring_over(config: &Config, legacy: &Path, conn: &mut Connection, notes: &mut Vec<String>) {
     let legacy_db = legacy.join("user.db");
-    if legacy_db.is_file() {
+    let done = vocab_db::get_setting(conn, vocab_db::LEGACY_IMPORTED_SETTING)
+        .ok()
+        .flatten()
+        .is_some();
+    if legacy_db.is_file() && !done {
         match vocab_db::import_poc_database(conn, &legacy_db) {
-            Ok(report) if report.items_added > 0 => notes.push(format!(
-                "Brought {} words over from {}.",
-                report.items_added,
-                legacy_db.display()
-            )),
-            Ok(_) => {}
+            Ok(report) => {
+                if report.items_added > 0 {
+                    notes.push(format!(
+                        "Brought {} words over from {}.",
+                        report.items_added,
+                        legacy_db.display()
+                    ));
+                }
+                if !report.skipped.is_empty() {
+                    notes.push(format!(
+                        "{} could not come over: {}",
+                        report.skipped.len(),
+                        report.skipped.join("; ")
+                    ));
+                }
+            }
             Err(err) => notes.push(format!(
                 "Could not bring words over from {}: {err}. Try `shouci migrate-poc`.",
                 legacy_db.display()
@@ -164,13 +214,18 @@ fn bring_over(config: &Config, legacy: &Path, conn: &mut Connection, notes: &mut
         vocab_dictionary::catalog::CC_CEDICT.id,
     );
     if legacy_dictionary.is_file() && !target.exists() {
+        // Copy beside, then rename: a copy cut short never looks finished.
+        let partial = target.with_extension("building.db");
         let copied = std::fs::create_dir_all(&config.dictionaries_dir)
-            .and_then(|()| std::fs::copy(&legacy_dictionary, &target));
+            .and_then(|()| std::fs::copy(&legacy_dictionary, &partial))
+            .and_then(|_| std::fs::rename(&partial, &target));
         if copied.is_ok() {
             let stamp = legacy_dictionary.with_extension("fetched");
             if stamp.is_file() {
                 let _ = std::fs::copy(stamp, target.with_extension("fetched"));
             }
+        } else {
+            let _ = std::fs::remove_file(&partial);
         }
     }
 }

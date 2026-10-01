@@ -5,6 +5,12 @@
 //! and 行 `hang2` are two words; 学校 typed with tone marks or tone numbers
 //! is one. Trashed words keep their identity, so saving one again brings it
 //! back instead of making a copy.
+//!
+//! Two lenient matches keep partial information from making duplicates:
+//! - a word saved without its traditional form matches the one saved word
+//!   with the same simplified form and reading;
+//! - saving a word with a reading completes a saved placeholder with the
+//!   same characters and no reading (a capture made with no dictionary).
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use vocab_core::{
@@ -16,7 +22,10 @@ use crate::NOW;
 
 const COLUMNS: &str = "id, simplified, traditional, pinyin, definition, notes, verification, \
      archived_at, deleted_at, source_kind, source_id, source_version, import_origin, \
-     created_at, modified_at";
+     created_at, modified_at, rev";
+
+/// SQL that marks a word changed.
+const CHANGED: &str = "modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), rev = rev + 1";
 
 /// A word about to be saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,21 +48,34 @@ pub enum Saved {
     Existing(VocabItem),
     /// It was in the trash and is back.
     Restored(VocabItem),
+    /// A placeholder saved without a reading was filled in.
+    Completed(VocabItem),
 }
 
 impl Saved {
     #[must_use]
     pub fn item(&self) -> &VocabItem {
         match self {
-            Self::Inserted(item) | Self::Existing(item) | Self::Restored(item) => item,
+            Self::Inserted(item)
+            | Self::Existing(item)
+            | Self::Restored(item)
+            | Self::Completed(item) => item,
         }
     }
 }
 
-/// The reading part of a word's identity: normalized pinyin without
-/// spaces, so `xué xiào`, `xuéxiào`, and `xue2 xiao4` are one reading.
-/// (The characters are part of the identity too, so dropping the spaces
-/// cannot merge two different words.) Empty when there is no reading.
+/// The reading part of a word's identity, so that every way of writing one
+/// reading gives one key:
+///
+/// - tone marks or numbers, spaced or not: `xué xiào`, `xuéxiào`,
+///   `xue2 xiao4`;
+/// - the neutral tone written as `5` or not at all: `ma1 ma5`, `māma`;
+/// - `ü` as `u:`, `v`, or (after `l` and `n`, before `e`) plain `u`:
+///   `lu:e4`, `lve4`, `lue4`;
+/// - apostrophes, capitals, and spacing ignored: `Xi1'an1`, `xi1 an1`.
+///
+/// The characters are part of the identity too, so this cannot merge two
+/// different words. Empty when there is no reading.
 #[must_use]
 pub fn reading_key(pinyin: &str) -> String {
     let numbered = vocab_pinyin::numbered(pinyin);
@@ -63,13 +85,26 @@ pub fn reading_key(pinyin: &str) -> String {
     vocab_pinyin::normalize(&numbered)
         .as_str()
         .split_whitespace()
+        .map(|syllable| {
+            let syllable: String = syllable
+                .chars()
+                .filter(|&c| c != '\'' && c != '5')
+                .collect();
+            match syllable.get(..3) {
+                Some("lue" | "nue") => format!("{}ve{}", &syllable[..1], &syllable[3..]),
+                _ => syllable,
+            }
+        })
         .collect()
 }
 
-/// Pinyin as stored: tone marks become numbers (`lǚxíng` → `lv3 xing2`);
-/// anything else is kept as written.
+/// Pinyin as stored: tone marks become numbers (`lǚxíng` → `lv3 xing2`),
+/// whitespace is collapsed, and anything else is kept as written.
 fn stored_pinyin(pinyin: &str) -> String {
     vocab_pinyin::numbered(pinyin)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn clean_forms(simplified: &str, traditional: &str) -> Result<(String, String)> {
@@ -86,7 +121,8 @@ fn clean_forms(simplified: &str, traditional: &str) -> Result<(String, String)> 
     Ok((simplified.to_owned(), traditional.to_owned()))
 }
 
-/// Saves a word unless it is already saved. A trashed copy is restored.
+/// Saves a word unless it is already saved. A trashed copy is restored; a
+/// placeholder without a reading is completed.
 ///
 /// # Errors
 ///
@@ -99,10 +135,64 @@ pub fn save_item(conn: &Connection, item: &NewItem) -> Result<Saved> {
         }
         Some(existing) => Ok(Saved::Existing(existing)),
         None => {
+            if let Some(placeholder) = find_placeholder(conn, item)? {
+                complete(conn, placeholder.id, item)?;
+                return Ok(Saved::Completed(require_item(conn, placeholder.id)?));
+            }
             let id = insert_item(conn, item)?;
             Ok(Saved::Inserted(require_item(conn, id)?))
         }
     }
+}
+
+/// A saved word with the same characters and no reading, which `item` (with
+/// a reading) can complete.
+fn find_placeholder(conn: &Connection, item: &NewItem) -> Result<Option<VocabItem>> {
+    if reading_key(&item.pinyin).is_empty() {
+        return Ok(None);
+    }
+    let (simplified, traditional) = clean_forms(&item.simplified, &item.traditional)?;
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLUMNS} FROM items WHERE simplified = ?1 COLLATE NOCASE \
+                 AND reading_key = '' \
+                 AND (traditional = ?2 COLLATE NOCASE OR traditional = simplified) \
+                 ORDER BY id LIMIT 1"
+            ),
+            params![simplified, traditional],
+            item_from_row,
+        )
+        .optional()?)
+}
+
+fn complete(conn: &Connection, id: i64, item: &NewItem) -> Result<()> {
+    let (simplified, traditional) = clean_forms(&item.simplified, &item.traditional)?;
+    let pinyin = stored_pinyin(&item.pinyin);
+    conn.execute(
+        &format!(
+            "UPDATE items SET traditional = ?1, pinyin = ?2, reading_key = ?3, \
+             definition = CASE WHEN definition = '' THEN ?4 ELSE definition END, \
+             notes = CASE WHEN notes = '' THEN ?5 ELSE notes END, verification = ?6, \
+             source_kind = ?7, source_id = ?8, source_version = ?9, import_origin = ?10, \
+             deleted_at = NULL, {CHANGED} WHERE id = ?11"
+        ),
+        params![
+            traditional,
+            pinyin,
+            reading_key(&pinyin),
+            item.definition.trim(),
+            item.notes.trim(),
+            item.verification.as_str(),
+            item.source.kind.as_str(),
+            item.source.id,
+            item.source.version,
+            item.source.import_origin,
+            id,
+        ],
+    )
+    .map_err(|err| identity_error(err, &simplified, &pinyin))?;
+    Ok(())
 }
 
 /// Inserts a word that is known not to exist yet.
@@ -175,6 +265,11 @@ pub fn require_item(conn: &Connection, id: i64) -> Result<VocabItem> {
 
 /// The saved word with these characters and this reading, trashed or not.
 ///
+/// A blank `traditional` means "unknown": the word saved with the same
+/// simplified form (as its traditional form too) matches first, then the one
+/// saved word with this simplified form and reading, whatever its
+/// traditional form. Several such words match none.
+///
 /// # Errors
 ///
 /// Returns an error if the query fails.
@@ -184,19 +279,35 @@ pub fn find_by_identity(
     traditional: &str,
     pinyin: &str,
 ) -> Result<Option<VocabItem>> {
-    let Ok((simplified, traditional)) = clean_forms(simplified, traditional) else {
+    let Ok((simplified, full_traditional)) = clean_forms(simplified, traditional) else {
         return Ok(None);
     };
-    Ok(conn
+    let key = reading_key(pinyin);
+    let exact = conn
         .query_row(
             &format!(
                 "SELECT {COLUMNS} FROM items WHERE simplified = ?1 COLLATE NOCASE \
                  AND traditional = ?2 COLLATE NOCASE AND reading_key = ?3"
             ),
-            params![simplified, traditional, reading_key(pinyin)],
+            params![simplified, full_traditional, key],
             item_from_row,
         )
-        .optional()?)
+        .optional()?;
+    if exact.is_some() || !traditional.trim().is_empty() {
+        return Ok(exact);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLUMNS} FROM items WHERE simplified = ?1 COLLATE NOCASE \
+         AND reading_key = ?2 LIMIT 2"
+    ))?;
+    let mut matches = stmt
+        .query_map(params![simplified, key], item_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    })
 }
 
 /// Words matching `filter`, newest first.
@@ -266,15 +377,20 @@ pub fn update_item(conn: &Connection, id: i64, patch: &ItemPatch) -> Result<Voca
     let pinyin = stored_pinyin(patch.pinyin.as_deref().unwrap_or(&current.pinyin));
     if let Some(other) = find_by_identity(conn, &simplified, &traditional, &pinyin)? {
         if other.id != id {
+            let place = if other.deleted_at.is_some() {
+                "in the trash; restore that one instead"
+            } else {
+                "already saved as another word"
+            };
             return Err(VocabError::conflict(format!(
-                "{simplified} [{pinyin}] is already saved as another word"
+                "{simplified} [{pinyin}] is {place}"
             )));
         }
     }
     conn.execute(
         &format!(
             "UPDATE items SET simplified = ?1, traditional = ?2, pinyin = ?3, reading_key = ?4, \
-             definition = ?5, notes = ?6, verification = ?7, modified_at = {NOW} WHERE id = ?8"
+             definition = ?5, notes = ?6, verification = ?7, {CHANGED} WHERE id = ?8"
         ),
         params![
             simplified,
@@ -297,7 +413,7 @@ pub fn update_item(conn: &Connection, id: i64, patch: &ItemPatch) -> Result<Voca
 
 fn touch(conn: &Connection, id: i64, assignment: &str, value: &dyn rusqlite::ToSql) -> Result<()> {
     let changed = conn.execute(
-        &format!("UPDATE items SET {assignment}, modified_at = {NOW} WHERE id = ?2"),
+        &format!("UPDATE items SET {assignment}, {CHANGED} WHERE id = ?2"),
         params![value, id],
     )?;
     if changed == 0 {
@@ -350,7 +466,7 @@ pub fn set_source(conn: &Connection, id: i64, source: &ItemSource) -> Result<()>
     let changed = conn.execute(
         &format!(
             "UPDATE items SET source_kind = ?1, source_id = ?2, source_version = ?3, \
-             import_origin = ?4, modified_at = {NOW} WHERE id = ?5"
+             import_origin = ?4, {CHANGED} WHERE id = ?5"
         ),
         params![
             source.kind.as_str(),
@@ -409,7 +525,14 @@ fn item_from_row(row: &Row<'_>) -> rusqlite::Result<VocabItem> {
         },
         created_at: row.get(13)?,
         modified_at: row.get(14)?,
+        rev: row.get(15)?,
     })
+}
+
+/// Marks a word changed: its tags or collections were edited.
+pub(crate) fn mark_changed(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(&format!("UPDATE items SET {CHANGED} WHERE id = ?1"), [id])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -564,6 +687,82 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn readings_written_any_way_are_one_word() {
+        let conn = open_in_memory().unwrap();
+        save_item(&conn, &word("妈妈", "媽媽", "ma1 ma5")).unwrap();
+        assert!(matches!(
+            save_item(&conn, &word("妈妈", "媽媽", "māma")).unwrap(),
+            Saved::Existing(_)
+        ));
+        save_item(&conn, &word("哪儿", "哪兒", "na3 r5")).unwrap();
+        assert!(matches!(
+            save_item(&conn, &word("哪儿", "哪兒", "nǎr")).unwrap(),
+            Saved::Existing(_)
+        ));
+        save_item(&conn, &word("略", "", "lve4")).unwrap();
+        assert!(matches!(
+            save_item(&conn, &word("略", "", "lue4")).unwrap(),
+            Saved::Existing(_)
+        ));
+        save_item(&conn, &word("西安", "", "Xi1 an1")).unwrap();
+        assert!(matches!(
+            save_item(&conn, &word("西安", "", "xi1'an1")).unwrap(),
+            Saved::Existing(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_traditional_matches_the_one_saved_word() {
+        let conn = open_in_memory().unwrap();
+        save_item(&conn, &word("学校", "學校", "xue2 xiao4")).unwrap();
+        assert!(matches!(
+            save_item(&conn, &word("学校", "", "xué xiào")).unwrap(),
+            Saved::Existing(_)
+        ));
+    }
+
+    #[test]
+    fn a_placeholder_without_a_reading_is_completed() {
+        let conn = open_in_memory().unwrap();
+        let mut placeholder = word("学校", "", "");
+        placeholder.definition = String::new();
+        placeholder.verification = Verification::NeedsReview;
+        let id = save_item(&conn, &placeholder).unwrap().item().id;
+        let completed = save_item(&conn, &word("学校", "學校", "xue2 xiao4")).unwrap();
+        let Saved::Completed(item) = completed else {
+            panic!("expected completion: {completed:?}");
+        };
+        assert_eq!(item.id, id);
+        assert_eq!(item.traditional, "學校");
+        assert_eq!(item.definition, "gloss");
+        assert_eq!(item.verification, Verification::Confirmed);
+    }
+
+    #[test]
+    fn editing_into_a_trashed_word_says_so() {
+        let conn = open_in_memory().unwrap();
+        let gone = save_item(&conn, &word("行", "", "xing2"))
+            .unwrap()
+            .item()
+            .id;
+        set_trashed(&conn, gone, true).unwrap();
+        let hang = save_item(&conn, &word("行", "", "hang2"))
+            .unwrap()
+            .item()
+            .id;
+        let err = update_item(
+            &conn,
+            hang,
+            &ItemPatch {
+                pinyin: Some("xing2".to_owned()),
+                ..ItemPatch::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("trash"), "{err}");
     }
 
     #[test]

@@ -14,7 +14,7 @@ fn note() -> AnkiNote {
 
 #[test]
 fn round_trips_notes() {
-    let bytes = AnkiTextV1.write(&[note()], "Shouci").unwrap();
+    let bytes = AnkiTextV1.write(&[note()], Some("Shouci")).unwrap();
     let text = String::from_utf8(bytes.clone()).unwrap();
     assert!(text.starts_with("#separator:tab\n"), "{text}");
     let parsed = AnkiTextV1.parse(&bytes).unwrap();
@@ -61,25 +61,12 @@ fn missing_columns_are_omitted_and_the_deck_is_a_collection() {
 
 #[test]
 fn export_uses_the_collection_as_deck_and_fixes_tags() {
-    let record = ExportRecord {
-        simplified: "学校".to_owned(),
-        traditional: "學校".to_owned(),
-        pinyin: "xue2 xiao4".to_owned(),
-        definition: "school".to_owned(),
-        notes: String::new(),
-        definition_is_dictionary_default: true,
-        tags: vec!["HSK 1".to_owned(), "places".to_owned()],
-        collections: Vec::new(),
-    };
-    let written = Anki
-        .write(
-            &[record],
-            &WriteOptions {
-                collection: Some("Lesson 3".to_owned()),
-                deck: None,
-            },
-        )
-        .unwrap();
+    let mut record = ExportRecord::new("学校", "學校", "xue2 xiao4", "school");
+    record.definition_is_dictionary_default = true;
+    record.tags = vec!["HSK 1".to_owned(), "places".to_owned()];
+    let mut options = WriteOptions::default();
+    options.collection = Some("Lesson 3".to_owned());
+    let written = Anki.write(&[record.clone()], &options).unwrap();
     let text = String::from_utf8(written.bytes).unwrap();
     assert!(text.contains("#deck:Lesson 3\n"), "{text}");
     assert!(
@@ -87,6 +74,11 @@ fn export_uses_the_collection_as_deck_and_fixes_tags() {
         "Anki always gets the definition: {text}"
     );
     assert!(written.notes[0].contains("HSK 1 → HSK_1"));
+    let plain = Anki.write(&[record], &WriteOptions::default()).unwrap();
+    assert!(
+        !String::from_utf8(plain.bytes).unwrap().contains("#deck:"),
+        "no invented deck"
+    );
 }
 
 #[test]
@@ -94,7 +86,7 @@ fn empty_trailing_fields_survive_a_round_trip() {
     let mut bare = note();
     bare.notes.clear();
     bare.tags.clear();
-    let bytes = AnkiTextV1.write(&[bare], "Shouci").unwrap();
+    let bytes = AnkiTextV1.write(&[bare], Some("Shouci")).unwrap();
     let parsed = AnkiTextV1.parse(&bytes).unwrap();
     assert!(!parsed.has_errors(), "{:?}", parsed.issues);
     assert_eq!(parsed.notes[0].notes.as_deref(), Some(""));

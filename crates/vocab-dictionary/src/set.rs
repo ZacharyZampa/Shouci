@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use vocab_core::{DictionaryEntry, Result, SourceId};
-use vocab_pinyin::{NormalizedPinyin, normalize};
+use vocab_pinyin::NormalizedPinyin;
 
 use crate::{Candidate, DictionaryInfo, DictionaryProvider, SqliteDictionary};
 
@@ -74,25 +74,35 @@ impl DictionarySet {
         self.members.is_empty()
     }
 
+    /// Every member's results, highest priority first. An entry is dropped
+    /// only when a higher-priority dictionary has the same word with exactly
+    /// the same pinyin. Entries within one dictionary are never merged:
+    /// 白 `Bai2` (a surname) and 白 `bai2` (white) are different entries.
     fn gather<T>(
         &self,
         query: impl Fn(&SqliteDictionary) -> Result<Vec<T>>,
         entry: impl Fn(&T) -> &DictionaryEntry,
     ) -> Result<Vec<T>> {
-        let mut seen = HashSet::new();
+        let key = |e: &DictionaryEntry| {
+            (
+                e.simplified.clone(),
+                e.traditional.clone(),
+                e.pinyin.clone(),
+            )
+        };
+        let mut earlier: HashSet<(String, String, String)> = HashSet::new();
         let mut out = Vec::new();
         for (_, dict) in &self.members {
-            for found in query(dict)? {
-                let e = entry(&found);
-                let key = (
-                    e.simplified.clone(),
-                    e.traditional.clone(),
-                    normalize(&e.pinyin).as_str().to_owned(),
-                );
-                if seen.insert(key) {
-                    out.push(found);
+            let found = query(dict)?;
+            let mut this_one = HashSet::new();
+            for result in found {
+                let k = key(entry(&result));
+                if !earlier.contains(&k) {
+                    this_one.insert(k);
+                    out.push(result);
                 }
             }
+            earlier.extend(this_one);
         }
         Ok(out)
     }
@@ -130,6 +140,14 @@ mod tests {
         build_dictionary_db(&mut conn, &CedictSource::new(id, "1"), text.as_bytes()).unwrap();
         let dict = SqliteDictionary::from_connection(conn).unwrap();
         (dict.info(None).unwrap(), dict)
+    }
+
+    #[test]
+    fn entries_within_one_dictionary_are_never_merged() {
+        let only = build("only", "白 白 [Bai2] /surname Bai/\n白 白 [bai2] /white/\n");
+        let set = DictionarySet::new(vec![only]);
+        let hits = set.entries_by_headword("白").unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use shouci_core::{Config, QueryKind, Shouci};
 use vocab_search::load_search_probes;
 
 /// What the menu-bar popover shows.
-const POPOVER: usize = 10;
+const POPOVER: u32 = 10;
 
 fn shouci() -> Shouci {
     let dictionaries = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/dictionaries");

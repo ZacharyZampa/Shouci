@@ -44,18 +44,23 @@ pub struct ExportRequest {
     pub deck: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A rendered export, ready to write. It can be shown (serialized) but not
+/// read back: the file's bytes stay in memory, so an apply always writes
+/// exactly what was previewed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExportPlan {
     pub connector_id: String,
     pub format: String,
     pub path: String,
     pub item_ids: Vec<i64>,
-    /// Headwords, in file order, for a preview.
+    /// Headwords of the exported words, oldest first, for a preview.
     pub words: Vec<String>,
     /// Matching words left out because they need review.
-    pub left_out_needs_review: usize,
+    pub left_out_needs_review: u32,
     /// Matching words left out because the destination has them (scope `new`).
-    pub left_out_already_there: usize,
+    pub left_out_already_there: u32,
+    /// A file already exists at `path` and will be replaced. Confirm first.
+    pub replaces_existing: bool,
     /// What the format could not carry.
     pub notes: Vec<String>,
     #[serde(skip)]
@@ -103,36 +108,34 @@ pub fn plan_export(
     if !request.include_needs_review {
         items.retain(|item| item.verification != Verification::NeedsReview);
     }
-    let left_out_needs_review = before - items.len();
+    let left_out_needs_review = crate::count(before - items.len());
     let before = items.len();
     if request.scope == ExportScope::New {
         let already = items_at(conn, info.id)?;
         items.retain(|item| !already.contains(&item.id));
     }
-    let left_out_already_there = before - items.len();
+    let left_out_already_there = crate::count(before - items.len());
 
     let mut tags = tags_by_item(conn)?;
     let mut collections = collections_by_item(conn)?;
     let mut records = Vec::with_capacity(items.len());
     for item in &items {
-        records.push(ExportRecord {
-            simplified: item.simplified.clone(),
-            traditional: item.traditional.clone(),
-            pinyin: item.pinyin.clone(),
-            definition: item.definition.clone(),
-            notes: item.notes.clone(),
-            definition_is_dictionary_default: is_dictionary_default(dict, item)?,
-            tags: tags.remove(&item.id).unwrap_or_default(),
-            collections: collections.remove(&item.id).unwrap_or_default(),
-        });
+        let mut record = ExportRecord::new(
+            &item.simplified,
+            &item.traditional,
+            &item.pinyin,
+            &item.definition,
+        );
+        record.notes.clone_from(&item.notes);
+        record.definition_is_dictionary_default = is_dictionary_default(dict, item)?;
+        record.tags = tags.remove(&item.id).unwrap_or_default();
+        record.collections = collections.remove(&item.id).unwrap_or_default();
+        records.push(record);
     }
-    let written = connector.write(
-        &records,
-        &WriteOptions {
-            collection: request.filter.collection.clone(),
-            deck: request.deck.clone(),
-        },
-    )?;
+    let mut options = WriteOptions::default();
+    options.collection.clone_from(&request.filter.collection);
+    options.deck.clone_from(&request.deck);
+    let written = connector.write(&records, &options)?;
     Ok(ExportPlan {
         connector_id: info.id.to_owned(),
         format: info.format.to_owned(),
@@ -141,6 +144,7 @@ pub fn plan_export(
         words: items.iter().map(|item| item.simplified.clone()).collect(),
         left_out_needs_review,
         left_out_already_there,
+        replaces_existing: Path::new(path).exists(),
         notes: written.notes,
         bytes: written.bytes,
     })
@@ -178,6 +182,11 @@ pub fn apply_export(conn: &mut Connection, plan: &ExportPlan) -> Result<Transfer
         summary.notes.push("nothing to export".to_owned());
         return Ok(summary);
     }
+    if plan.bytes.is_empty() {
+        return Err(VocabError::invalid(
+            "this export plan has no file contents; preview the export again",
+        ));
+    }
     atomic_write(Path::new(&plan.path), &plan.bytes)?;
     let run = RunRecord {
         direction: Direction::Out,
@@ -198,6 +207,6 @@ pub fn apply_export(conn: &mut Connection, plan: &ExportPlan) -> Result<Transfer
         }
         Ok(())
     })?;
-    summary.written = plan.item_ids.len();
+    summary.written = crate::count(plan.item_ids.len());
     Ok(summary)
 }

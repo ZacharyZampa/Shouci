@@ -16,14 +16,19 @@ use vocab_core::{ItemSource, Result, SourceKind, Verification, VocabError};
 
 use crate::items::{NewItem, find_by_identity, insert_item};
 use crate::organize::add_tag;
-use crate::with_tx;
+use crate::{set_setting, with_tx};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Setting written after a successful import: the path imported from.
+pub const IMPORTED_SETTING: &str = "legacy.poc_imported_from";
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LegacyReport {
     pub items_added: usize,
     /// Words that were already in the new library.
     pub items_already_saved: usize,
     pub runs_added: usize,
+    /// Rows that could not be brought over, with why.
+    pub skipped: Vec<String>,
 }
 
 struct LegacyItem {
@@ -70,6 +75,12 @@ pub fn import_poc_database(conn: &mut Connection, legacy_path: &Path) -> Result<
         let mut report = LegacyReport::default();
         let mut ids: HashMap<i64, i64> = HashMap::new();
         for item in &items {
+            if item.simplified.trim().is_empty() {
+                report
+                    .skipped
+                    .push(format!("row {} has no characters", item.id));
+                continue;
+            }
             if let Some(existing) =
                 find_by_identity(tx, &item.simplified, &item.traditional, &item.pinyin)?
             {
@@ -93,6 +104,7 @@ pub fn import_poc_database(conn: &mut Connection, legacy_path: &Path) -> Result<
                 report.runs_added += 1;
             }
         }
+        set_setting(tx, IMPORTED_SETTING, &legacy_path.to_string_lossy())?;
         Ok(report)
     })
 }
@@ -101,6 +113,16 @@ fn open_legacy(path: &Path) -> Result<Connection> {
     if !path.is_file() {
         return Err(VocabError::not_found(format!(
             "no database at {}",
+            path.display()
+        )));
+    }
+    let mut header = [0u8; 16];
+    let is_sqlite = std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .is_ok_and(|()| &header == b"SQLite format 3\0");
+    if !is_sqlite {
+        return Err(VocabError::format(format!(
+            "{} is not a SQLite database",
             path.display()
         )));
     }
@@ -371,8 +393,10 @@ fn insert_legacy_run(conn: &Connection, run: &LegacyRun, ids: &HashMap<i64, i64>
             _ => continue,
         };
         conn.execute(
-            "INSERT INTO transfer_items (run_id, item_id, line, raw, outcome, detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO transfer_items (run_id, item_id, simplified, traditional, reading_key, \
+             line, raw, outcome, detail) \
+             SELECT ?1, ?2, i.simplified, i.traditional, i.reading_key, ?3, ?4, ?5, ?6 \
+             FROM (SELECT 1) LEFT JOIN items i ON i.id = ?2",
             params![
                 run_id,
                 item_id.and_then(|id| ids.get(&id).copied()),
@@ -426,10 +450,10 @@ INSERT INTO transfer_runs VALUES (1, 'out', 'pleco', 'pleco-utf8-text/v1', 'plec
 INSERT INTO transfer_items VALUES (1, 1, 1, NULL, NULL, 'written', '');
 ";
 
-    fn legacy_file() -> std::path::PathBuf {
+    fn legacy_file(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("shouci-legacy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("user.db");
+        let path = dir.join(format!("{name}.db"));
         let _ = std::fs::remove_file(&path);
         rusqlite::Connection::open(&path)
             .unwrap()
@@ -440,7 +464,7 @@ INSERT INTO transfer_items VALUES (1, 1, 1, NULL, NULL, 'written', '');
 
     #[test]
     fn words_tags_and_history_come_over_once() {
-        let path = legacy_file();
+        let path = legacy_file("once");
         let mut conn = open_in_memory().unwrap();
         let first = import_poc_database(&mut conn, &path).unwrap();
         assert_eq!(first.items_added, 3);
@@ -471,6 +495,30 @@ INSERT INTO transfer_items VALUES (1, 1, 1, NULL, NULL, 'written', '');
         assert_eq!(again.items_already_saved, 3);
         assert_eq!(again.runs_added, 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_bad_row_is_skipped_not_fatal_and_junk_is_a_format_error() {
+        let path = legacy_file("bad-row");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO vocabulary_items VALUES (9, ' ', ' ', '', '', '', 'confirmed', \
+                 NULL, NULL, NULL, NULL, NULL, NULL, '2026-09-20 10:00:00', \
+                 '2026-09-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+        let mut conn = open_in_memory().unwrap();
+        let report = import_poc_database(&mut conn, &path).unwrap();
+        assert_eq!(report.items_added, 3);
+        assert_eq!(report.skipped.len(), 1);
+        let junk = path.with_file_name("junk.db");
+        std::fs::write(&junk, b"not a database at all").unwrap();
+        let err = import_poc_database(&mut conn, &junk).unwrap_err();
+        assert_eq!(err.kind(), vocab_core::ErrorKind::Format);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&junk);
     }
 
     #[test]

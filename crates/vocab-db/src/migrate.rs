@@ -1,32 +1,48 @@
 //! Schema versions, tracked in `PRAGMA user_version`.
 //!
-//! Each entry of [`MIGRATIONS`] moves the schema one version forward and runs
-//! in its own transaction. To change the schema, append a migration; never
-//! edit one that has shipped.
+//! Each entry of [`MIGRATIONS`] moves the schema one version forward. To
+//! change the schema, append a migration; never edit one that has shipped.
+//! A migration may be SQL or Rust (for data that must be recomputed, such as
+//! reading keys after a pinyin rule changes).
+//!
+//! How a migration runs, so table rebuilds are safe:
+//! 1. foreign keys are switched off (impossible inside a transaction, which
+//!    is why the runner does it, not the migration);
+//! 2. an IMMEDIATE transaction takes the write lock before the version is
+//!    read, so two processes opening the database at once never both
+//!    migrate;
+//! 3. after the migration, `PRAGMA foreign_key_check` must find nothing, or
+//!    everything rolls back;
+//! 4. foreign keys come back on.
+//!
+//! Enum-like columns have no CHECK constraints: widening one would need a
+//! table rebuild. Values are validated in Rust instead.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use vocab_core::{Result, VocabError};
 
 const V1: &str = r"
 CREATE TABLE items (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     simplified TEXT NOT NULL,
     traditional TEXT NOT NULL,
     pinyin TEXT NOT NULL DEFAULT '',
     reading_key TEXT NOT NULL DEFAULT '',
     definition TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
-    verification TEXT NOT NULL DEFAULT 'confirmed'
-        CHECK (verification IN ('confirmed', 'needs_review')),
+    -- confirmed | needs_review
+    verification TEXT NOT NULL DEFAULT 'confirmed',
     archived_at TEXT,
     deleted_at TEXT,
-    source_kind TEXT NOT NULL DEFAULT 'manual'
-        CHECK (source_kind IN ('dictionary', 'import', 'manual')),
+    -- dictionary | import | manual
+    source_kind TEXT NOT NULL DEFAULT 'manual',
     source_id TEXT,
     source_version TEXT,
     import_origin TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     modified_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- Bumped by every change to the word, its tags, or its collections.
+    rev INTEGER NOT NULL DEFAULT 1,
     UNIQUE (simplified COLLATE NOCASE, traditional COLLATE NOCASE, reading_key)
 );
 
@@ -57,8 +73,9 @@ CREATE TABLE collection_items (
 -- One row per import or export. `connector_id` is the destination key
 -- (`pleco`), so 'only new words' is answered per destination.
 CREATE TABLE transfer_runs (
-    id INTEGER PRIMARY KEY,
-    direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- in | out
+    direction TEXT NOT NULL,
     connector_id TEXT NOT NULL,
     format TEXT NOT NULL,
     path TEXT NOT NULL,
@@ -71,19 +88,25 @@ CREATE TABLE transfer_runs (
     dropped INTEGER NOT NULL DEFAULT 0,
     errors INTEGER NOT NULL DEFAULT 0,
     warnings INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL CHECK (status IN ('committed', 'rejected')),
+    -- committed | rejected
+    status TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
--- What happened to each word (or line) in a run.
+-- What happened to each word (or line) in a run. The word's identity is
+-- copied in, so the history outlives a purged word and matches it if it is
+-- saved again.
 CREATE TABLE transfer_items (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL REFERENCES transfer_runs(id) ON DELETE CASCADE,
     item_id INTEGER REFERENCES items(id) ON DELETE SET NULL,
+    simplified TEXT,
+    traditional TEXT,
+    reading_key TEXT,
     line INTEGER,
     raw TEXT,
-    outcome TEXT NOT NULL
-        CHECK (outcome IN ('inserted', 'updated', 'skipped', 'dropped', 'rejected', 'written')),
+    -- inserted | updated | skipped | dropped | rejected | written
+    outcome TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT ''
 );
 
@@ -92,42 +115,82 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 );
 
-CREATE INDEX idx_items_simplified ON items(simplified);
+CREATE INDEX idx_items_simplified ON items(simplified COLLATE NOCASE);
 CREATE INDEX idx_item_tags_tag ON item_tags(tag_id);
 CREATE INDEX idx_collection_items_item ON collection_items(item_id);
 CREATE INDEX idx_transfer_items_item ON transfer_items(item_id);
 CREATE INDEX idx_transfer_items_run ON transfer_items(run_id);
+CREATE INDEX idx_transfer_items_word ON transfer_items(simplified COLLATE NOCASE, reading_key);
 ";
 
-const MIGRATIONS: &[&str] = &[V1];
+/// One step forward.
+pub(crate) enum Migration {
+    Sql(&'static str),
+    /// For data that SQL alone cannot recompute.
+    #[allow(dead_code)] // the first Rust migration has not been needed yet
+    Rust(fn(&Transaction<'_>) -> Result<()>),
+}
+
+const MIGRATIONS: &[Migration] = &[Migration::Sql(V1)];
 
 /// The schema version this build writes.
 #[allow(clippy::cast_possible_wrap)] // a handful of migrations
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
+    run(conn, MIGRATIONS)
+}
+
+pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
+    #[allow(clippy::cast_possible_wrap)]
+    let latest = migrations.len() as i64;
+    // Cheap check first: nothing to do (and nothing to lock) when current.
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if current > SCHEMA_VERSION {
+    if current == latest {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = run_locked(conn, migrations, latest);
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    result
+}
+
+fn run_locked(conn: &mut Connection, migrations: &[Migration], latest: i64) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Read inside the write lock: another process may have just migrated.
+    let current: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > latest {
         return Err(VocabError::storage(format!(
             "this user.db was written by a newer Shouci (schema {current}; this build \
-             understands up to {SCHEMA_VERSION}). Update Shouci to open it."
+             understands up to {latest}). Update Shouci to open it."
         )));
     }
-    if current == 0 && is_poc_database(conn)? {
+    if current == 0 && is_poc_database(&tx)? {
         return Err(VocabError::invalid(
             "this is a Shouci proof-of-concept database. Open a new user.db and bring \
              these words in with `shouci migrate-poc`.",
         ));
     }
     let start = usize::try_from(current).unwrap_or(0);
-    for (index, sql) in MIGRATIONS.iter().enumerate().skip(start) {
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql).map_err(|err| {
-            VocabError::storage(format!("schema migration {} failed: {err}", index + 1))
-        })?;
-        tx.pragma_update(None, "user_version", crate::to_i64(index + 1)?)?;
-        tx.commit()?;
+    for (index, migration) in migrations.iter().enumerate().skip(start) {
+        let step = index + 1;
+        match migration {
+            Migration::Sql(sql) => tx.execute_batch(sql).map_err(|err| {
+                VocabError::storage(format!("schema migration {step} failed: {err}"))
+            })?,
+            Migration::Rust(apply) => apply(&tx)?,
+        }
+        tx.pragma_update(None, "user_version", crate::to_i64(step)?)?;
     }
+    let broken: Option<String> = tx
+        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+        .ok();
+    if let Some(table) = broken {
+        return Err(VocabError::storage(format!(
+            "schema migration left broken references in {table}; nothing was changed"
+        )));
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -144,7 +207,7 @@ fn is_poc_database(conn: &Connection) -> Result<bool> {
 mod tests {
     use rusqlite::Connection;
 
-    use super::{SCHEMA_VERSION, migrate};
+    use super::{MIGRATIONS, Migration, SCHEMA_VERSION, migrate, run};
 
     #[test]
     fn fresh_database_reaches_the_latest_version_once() {
@@ -173,5 +236,58 @@ mod tests {
             .unwrap();
         let err = migrate(&mut conn).unwrap_err();
         assert!(err.to_string().contains("migrate-poc"), "{err}");
+    }
+
+    /// The shape of a future migration that rebuilds `items` (to change a
+    /// column): with foreign keys on, dropping the table would cascade into
+    /// tags and collections.
+    const REBUILD_ITEMS: &str = r"
+CREATE TABLE items_new AS SELECT * FROM items;
+DROP TABLE items;
+ALTER TABLE items_new RENAME TO items;
+";
+
+    #[test]
+    fn a_table_rebuild_keeps_tags_and_collections() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (simplified, traditional) VALUES ('一', '一');
+             INSERT INTO tags (name) VALUES ('HSK1');
+             INSERT INTO item_tags (item_id, tag_id) VALUES (1, 1);",
+        )
+        .unwrap();
+        let steps = [Migration::Sql(super::V1), Migration::Sql(REBUILD_ITEMS)];
+        run(&mut conn, &steps).unwrap();
+        let tagged: i64 = conn
+            .query_row("SELECT count(*) FROM item_tags", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tagged, 1);
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "back on afterwards");
+        assert_eq!(MIGRATIONS.len(), 1);
+    }
+
+    #[test]
+    fn processes_opening_a_new_database_together_do_not_collide() {
+        let dir = std::env::temp_dir().join(format!("shouci-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for round in 0..20 {
+            let path = dir.join(format!("user-{round}.db"));
+            let _ = std::fs::remove_file(&path);
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || crate::open(&path).map(|_| ()))
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

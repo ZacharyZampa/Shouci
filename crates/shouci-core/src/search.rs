@@ -1,7 +1,7 @@
 //! Searching the dictionaries and the library, and saving words.
 
 use rusqlite::Connection;
-use vocab_core::{ItemSource, LibraryFilter, Result, SourceKind, Verification};
+use vocab_core::{ItemSource, LibraryFilter, Result, SourceKind, Verification, VocabItem};
 use vocab_db::{NewItem, Saved};
 use vocab_dictionary::Candidate;
 use vocab_search::{LibraryDoc, QueryKind, match_library};
@@ -11,10 +11,10 @@ use crate::dto::{
     SaveResult, SavedRef,
 };
 use crate::library::{item_view, item_views};
-use crate::{Error, Shouci};
+use crate::{Error, Shouci, check_query, count};
 
-/// Results returned when the caller gives no limit.
-pub const DEFAULT_LIMIT: usize = 50;
+/// Dictionary results returned when the caller gives no limit.
+pub const DEFAULT_LIMIT: u32 = 50;
 
 fn saved_ref(
     conn: &Connection,
@@ -51,10 +51,37 @@ fn save_result(conn: &Connection, saved: Saved) -> Result<SaveResult> {
         Saved::Inserted(item) => (SaveOutcome::Inserted, item),
         Saved::Existing(item) => (SaveOutcome::AlreadySaved, item),
         Saved::Restored(item) => (SaveOutcome::Restored, item),
+        Saved::Completed(item) => (SaveOutcome::Completed, item),
     };
     Ok(SaveResult {
         outcome,
         item: item_view(conn, item)?,
+    })
+}
+
+/// The candidate is the query itself, not a longer word containing it.
+fn is_the_query(kind: QueryKind, query: &str, candidate: &Candidate) -> bool {
+    let entry = &candidate.entry;
+    match kind {
+        QueryKind::Chinese => entry.simplified == query || entry.traditional == query,
+        QueryKind::Pinyin => {
+            let toneless = |pinyin: &str| -> String {
+                vocab_db::reading_key(pinyin)
+                    .chars()
+                    .filter(|c| !c.is_ascii_digit())
+                    .collect()
+            };
+            toneless(&entry.pinyin) == toneless(query)
+        }
+        QueryKind::English => {
+            vocab_search::english_has_lemma(query, std::slice::from_ref(candidate))
+        }
+    }
+}
+
+fn take(limit: Option<u32>, default: usize) -> usize {
+    limit.map_or(default, |limit| {
+        usize::try_from(limit).unwrap_or(usize::MAX)
     })
 }
 
@@ -65,14 +92,16 @@ impl Shouci {
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::Unavailable`] until the dictionaries are loaded.
+    /// [`crate::ErrorKind::Unavailable`] until the dictionaries are loaded;
+    /// [`crate::ErrorKind::Invalid`] for a query over
+    /// [`crate::MAX_QUERY_CHARS`].
     pub fn search_dictionary(
         &self,
         query: &str,
         kind: Option<QueryKind>,
-        limit: Option<usize>,
+        limit: Option<u32>,
     ) -> Result<DictionaryResults> {
-        let query = query.trim();
+        let query = check_query(query)?;
         let guessed = vocab_search::detect(query);
         if query.is_empty() {
             return Ok(DictionaryResults {
@@ -90,37 +119,44 @@ impl Shouci {
             let found = loaded.search.search_auto(query)?;
             (found.candidates, found.kind, found.guessed)
         };
-        let total = candidates.len();
-        candidates.truncate(limit.unwrap_or(DEFAULT_LIMIT));
+        let total = count(candidates.len());
+        candidates.truncate(take(limit, take(Some(DEFAULT_LIMIT), 0)));
         Ok(DictionaryResults {
             query: query.to_owned(),
             kind,
             guessed,
             total,
-            candidates: views(&*self.db()?, candidates)?,
+            candidates: views(&*self.read()?, candidates)?,
         })
     }
 
     /// Searches saved words: Hanzi, pinyin (tones optional), or English in
     /// definitions and notes. An empty query lists every word the filter
-    /// allows, newest first.
+    /// allows, newest first. `limit` caps the words returned; `total` says
+    /// how many matched.
     ///
     /// # Errors
     ///
-    /// Storage errors.
+    /// [`crate::ErrorKind::Invalid`] for a query over
+    /// [`crate::MAX_QUERY_CHARS`]; storage errors.
     pub fn search_library(
         &self,
         query: &str,
         filter: &LibraryFilter,
         kind: Option<QueryKind>,
+        limit: Option<u32>,
     ) -> Result<LibraryResults> {
-        let conn = self.db()?;
+        let query = check_query(query)?;
+        let conn = self.read()?;
         let items = vocab_db::list_items(&conn, filter)?;
-        let query = query.trim();
+        let limit = take(limit, usize::MAX);
         if query.is_empty() {
+            let total = count(items.len());
+            let items: Vec<VocabItem> = items.into_iter().take(limit).collect();
             return Ok(LibraryResults {
                 query: String::new(),
                 kind: None,
+                total,
                 items: item_views(&conn, items)?,
             });
         }
@@ -140,20 +176,24 @@ impl Shouci {
             .map(|hit| hit.kind)
             .or(kind)
             .or_else(|| Some(vocab_search::detect(query)));
-        let mut slots: Vec<Option<vocab_core::VocabItem>> = items.into_iter().map(Some).collect();
+        let total = count(hits.len());
+        let mut slots: Vec<Option<VocabItem>> = items.into_iter().map(Some).collect();
         let matched = hits
             .iter()
+            .take(limit)
             .filter_map(|hit| slots.get_mut(hit.index).and_then(Option::take))
             .collect();
         Ok(LibraryResults {
             query: query.to_owned(),
             kind,
+            total,
             items: item_views(&conn, matched)?,
         })
     }
 
     /// Saves a dictionary result as it is. Saving a word that is already
-    /// saved changes nothing; saving one from the trash brings it back.
+    /// saved changes nothing; saving one from the trash brings it back; a
+    /// placeholder saved without a reading is completed.
     ///
     /// # Errors
     ///
@@ -186,31 +226,46 @@ impl Shouci {
 
     /// Adds a word from one line of input, without a picker:
     ///
-    /// - exactly one strong dictionary match → saved, confirmed;
-    /// - no match at all → the text is saved as typed, needing review;
+    /// - exactly one result that is the query itself (the same characters,
+    ///   the same reading ignoring tones, or a gloss that is exactly the
+    ///   English) → saved, confirmed, however many longer words also match;
+    /// - otherwise exactly one strong dictionary match → saved, confirmed;
+    /// - no match at all → the text is saved as typed, needing review (a
+    ///   later save of the same characters with a reading completes it);
     /// - several strong matches → nothing is saved; the candidates come back
     ///   to choose from.
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::Invalid`] for empty input;
+    /// [`crate::ErrorKind::Invalid`] for empty or overlong input;
     /// [`crate::ErrorKind::Unavailable`] until dictionaries are loaded.
     pub fn quick_add(&self, query: &str, kind: Option<QueryKind>) -> Result<QuickAdd> {
-        let query = query.trim();
+        let query = check_query(query)?;
         if query.is_empty() {
             return Err(Error::invalid("type a word to add"));
         }
         let loaded = self.loaded()?;
-        let ranked = match kind {
-            Some(kind) => loaded.search.search(kind, query)?,
-            None => loaded.search.search_auto(query)?.candidates,
+        let (ranked, read_as) = if let Some(kind) = kind {
+            (loaded.search.search(kind, query)?, kind)
+        } else {
+            let found = loaded.search.search_auto(query)?;
+            (found.candidates, found.kind)
         };
         let strong: Vec<&Candidate> = ranked
             .iter()
             .filter(|candidate| !candidate.diagnostic.is_inferred)
             .collect();
-        if let [only] = strong.as_slice() {
-            let view = CandidateView::new((*only).clone(), None);
+        let exact: Vec<&Candidate> = strong
+            .iter()
+            .copied()
+            .filter(|candidate| is_the_query(read_as, query, candidate))
+            .collect();
+        let pick = match (exact.as_slice(), strong.as_slice()) {
+            ([only], _) | ([], [only]) => Some(*only),
+            _ => None,
+        };
+        if let Some(only) = pick {
+            let view = CandidateView::new(only.clone(), None);
             return Ok(QuickAdd::Saved(Box::new(self.save_candidate(&view)?)));
         }
         if ranked.is_empty() {
@@ -230,9 +285,9 @@ impl Shouci {
             return Ok(QuickAdd::Saved(Box::new(save_result(&conn, saved)?)));
         }
         let mut ranked = ranked;
-        ranked.truncate(DEFAULT_LIMIT);
+        ranked.truncate(take(Some(DEFAULT_LIMIT), 0));
         Ok(QuickAdd::Ambiguous {
-            candidates: views(&*self.db()?, ranked)?,
+            candidates: views(&*self.read()?, ranked)?,
         })
     }
 
@@ -305,7 +360,13 @@ impl Shouci {
             for collection in &word.collections {
                 vocab_db::add_to_collection(tx, id, collection)?;
             }
-            save_result(tx, saved)
+            // Tags change the word's revision; report it as stored.
+            let item = vocab_db::require_item(tx, id)?;
+            let outcome = save_result(tx, saved)?.outcome;
+            Ok(SaveResult {
+                outcome,
+                item: item_view(tx, item)?,
+            })
         })
     }
 }

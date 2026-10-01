@@ -1,20 +1,29 @@
 //! The `pleco-utf8-text/v1` line grammar, separate from what the lines mean.
 //!
-//! - records: `headword \t pinyin \t definition`;
-//! - `[Name]` lines start a category for the records after them;
-//! - `%` lines are comments; blank lines are ignored.
+//! As Pleco's manual defines it
+//! (<https://android.pleco.com/manual/240/flash.html#textformat>):
+//!
+//! - a record is `characters <tab> pinyin <tab> definition`; pinyin and
+//!   definition may be left out;
+//! - characters are `simplified` or `simplified[traditional]`;
+//! - a line starting with `//` begins a category.
+//!
+//! Also read, never written: the Shouci proof of concept's `[Category]` lines
+//! and `%` comment lines.
 
-use vocab_core::connector::{Issue, Severity};
+use vocab_core::connector::{Issue, line_number};
 use vocab_core::{Result, VocabError};
 
 /// One record line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRecord {
-    pub line: usize,
+    pub line: u32,
     pub raw: String,
-    pub headword: String,
-    pub pinyin: String,
-    /// `None` when the line has no definition field at all.
+    /// As written: `学校` or `学校[學校]`.
+    pub characters: String,
+    /// `None` when left out or blank.
+    pub pinyin: Option<String>,
+    /// `None` when left out or blank.
     pub definition: Option<String>,
     pub category: Option<String>,
 }
@@ -25,20 +34,14 @@ pub struct ParsedFile {
     pub issues: Vec<Issue>,
 }
 
-impl ParsedFile {
-    #[must_use]
-    pub fn has_errors(&self) -> bool {
-        self.issues
-            .iter()
-            .any(|issue| issue.severity == Severity::Error)
-    }
-}
-
 /// One record line to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportRow {
-    pub headword: String,
+    pub simplified: String,
+    /// Written as `simplified[traditional]` when it differs.
+    pub traditional: String,
     pub pinyin: String,
+    /// Empty: Pleco fills in its own.
     pub definition: String,
     pub category: Option<String>,
 }
@@ -48,16 +51,15 @@ pub struct Utf8TextV1;
 
 impl Utf8TextV1 {
     pub const KEY: &'static str = "pleco-utf8-text/v1";
-    const COMMENT: char = '%';
-    const SEPARATOR: char = '\t';
 
-    /// Reads every line. Lines that cannot be records become issues with
-    /// their 1-based line number.
+    /// Reads every line. A record without characters is an error issue with
+    /// its 1-based line number.
     ///
     /// # Errors
     ///
     /// Only when the bytes are not UTF-8.
     pub fn parse(self, bytes: &[u8]) -> Result<ParsedFile> {
+        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
         let text = std::str::from_utf8(bytes).map_err(|err| {
             VocabError::format(format!(
                 "file is not valid UTF-8 (expected {}): {err}",
@@ -67,45 +69,32 @@ impl Utf8TextV1 {
         let mut parsed = ParsedFile::default();
         let mut category: Option<String> = None;
         for (index, raw) in text.lines().enumerate() {
-            let line = index + 1;
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
+            let line = line_number(index);
+            // Only the line ending and outer spaces go; tabs are separators.
+            let raw = raw.trim_end_matches(['\r', '\n']);
+            if raw.trim().is_empty() || raw.trim_start().starts_with('%') {
                 continue;
             }
-            if trimmed.starts_with(Self::COMMENT) {
-                parsed
-                    .issues
-                    .push(issue(line, Severity::Info, "comment line"));
-                continue;
-            }
-            if let Some(name) = category_header(trimmed) {
+            if let Some(name) = category_line(raw) {
                 category = Some(name);
                 continue;
             }
-            let fields: Vec<&str> = trimmed.split(Self::SEPARATOR).collect();
-            if fields.len() < 2 {
-                parsed.issues.push(issue(
-                    line,
-                    Severity::Error,
-                    "record has no pinyin or definition fields",
-                ));
+            let mut fields = raw.split('\t');
+            let characters = fields.next().unwrap_or_default().trim().to_owned();
+            let pinyin = fields.next().map(str::trim).filter(|v| !v.is_empty());
+            let rest: Vec<&str> = fields.collect();
+            let definition = Some(rest.join("\t").trim().to_owned()).filter(|v| !v.is_empty());
+            if characters.is_empty() {
+                parsed
+                    .issues
+                    .push(Issue::error(line, "record has no characters"));
                 continue;
             }
-            let definition = if fields.len() == 2 {
-                parsed.issues.push(issue(
-                    line,
-                    Severity::Warning,
-                    "record has no definition field",
-                ));
-                None
-            } else {
-                Some(fields[2..].join("\t").trim().to_owned())
-            };
             parsed.records.push(ParsedRecord {
                 line,
-                raw: trimmed.to_owned(),
-                headword: fields[0].trim().to_owned(),
-                pinyin: fields[1].trim().to_owned(),
+                raw: raw.to_owned(),
+                characters,
+                pinyin: pinyin.map(str::to_owned),
                 definition,
                 category: category.clone(),
             });
@@ -113,7 +102,7 @@ impl Utf8TextV1 {
         Ok(parsed)
     }
 
-    /// Writes rows in order, starting a `[category]` line whenever the
+    /// Writes rows in order, starting a `//Category` line whenever the
     /// category changes.
     #[must_use]
     pub fn serialize(self, rows: &[ExportRow]) -> Vec<u8> {
@@ -122,36 +111,50 @@ impl Utf8TextV1 {
         for row in rows {
             if row.category.as_deref() != active {
                 if let Some(category) = row.category.as_deref() {
-                    out.push('[');
+                    out.push_str("//");
                     out.push_str(&one_line(category));
-                    out.push_str("]\n");
+                    out.push('\n');
                 }
                 active = row.category.as_deref();
             }
-            out.push_str(&one_line(&row.headword));
-            out.push(Self::SEPARATOR);
-            out.push_str(&one_line(&row.pinyin));
-            out.push(Self::SEPARATOR);
-            out.push_str(&one_line(&row.definition));
+            out.push_str(&one_line(&row.simplified));
+            let traditional = one_line(&row.traditional);
+            if !traditional.is_empty() && traditional != one_line(&row.simplified) {
+                out.push('[');
+                out.push_str(&traditional);
+                out.push(']');
+            }
+            let pinyin = one_line(&row.pinyin);
+            let definition = one_line(&row.definition);
+            if !pinyin.is_empty() || !definition.is_empty() {
+                out.push('\t');
+                out.push_str(&pinyin);
+            }
+            if !definition.is_empty() {
+                out.push('\t');
+                out.push_str(&definition);
+            }
             out.push('\n');
         }
         out.into_bytes()
     }
 }
 
-fn issue(line: usize, severity: Severity, message: &str) -> Issue {
-    Issue {
-        line,
-        severity,
-        message: message.to_owned(),
-    }
-}
-
+/// Tabs and line breaks would split a field; they become spaces.
 fn one_line(value: &str) -> String {
-    value.replace(['\r', '\n', '\t'], " ")
+    value.replace(['\r', '\n', '\t'], " ").trim().to_owned()
 }
 
-fn category_header(line: &str) -> Option<String> {
-    let name = line.strip_prefix('[')?.strip_suffix(']')?.trim();
+/// `//Name`, or the proof of concept's `[Name]` (on a line with no tabs).
+fn category_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let name = if let Some(name) = trimmed.strip_prefix("//") {
+        name
+    } else if !trimmed.contains('\t') {
+        trimmed.strip_prefix('[')?.strip_suffix(']')?
+    } else {
+        return None;
+    };
+    let name = name.trim();
     (!name.is_empty()).then(|| name.to_owned())
 }

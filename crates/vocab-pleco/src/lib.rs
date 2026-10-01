@@ -1,11 +1,13 @@
 //! Pleco as a [`Connector`]: UTF-8 flashcard text files
 //! (`pleco-utf8-text/v1`), never `.pqb`.
 //!
-//! - A `[Category]` line becomes a collection.
-//! - A headword written `简体[繁體]` carries its traditional form.
-//! - A blank definition means "use Pleco's dictionary": it is omitted on
-//!   import, and on export a definition identical to the dictionary's is
-//!   left blank so Pleco shows its own.
+//! - A `//Category` line becomes a collection.
+//! - Characters written `简体[繁體]` carry their traditional form; exports
+//!   write it the same way.
+//! - Pleco fills in what a card leaves out, and always uses a definition it
+//!   is given. So a missing definition is omitted on import, and on export a
+//!   definition identical to the dictionary's is left out so Pleco shows its
+//!   own.
 
 mod codec;
 
@@ -13,8 +15,8 @@ pub use codec::{ExportRow, ParsedFile, ParsedRecord, Utf8TextV1};
 
 use vocab_core::Result;
 use vocab_core::connector::{
-    Connector, ConnectorInfo, ExchangeRecord, ExportRecord, Field, Issue, ParsedRecords, Severity,
-    WriteOptions, Written,
+    Connector, ConnectorInfo, ExchangeRecord, ExportRecord, Field, ParsedRecords, WriteOptions,
+    Written,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -22,55 +24,36 @@ pub struct Pleco;
 
 impl Connector for Pleco {
     fn info(&self) -> ConnectorInfo {
-        ConnectorInfo {
-            id: "pleco",
-            name: "Pleco",
-            format: Utf8TextV1::KEY,
-            extensions: &["txt"],
-            can_import: true,
-            can_export: true,
-        }
+        ConnectorInfo::new("pleco", "Pleco", Utf8TextV1::KEY)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<ParsedRecords> {
         let parsed = Utf8TextV1.parse(bytes)?;
-        let mut out = ParsedRecords {
-            records: Vec::with_capacity(parsed.records.len()),
-            issues: parsed.issues,
-        };
+        let mut records = Vec::with_capacity(parsed.records.len());
         for record in parsed.records {
-            let (simplified, traditional) = split_headword(&record.headword);
-            if simplified.is_empty() {
-                out.issues.push(Issue {
-                    line: record.line,
-                    severity: Severity::Error,
-                    message: "record has no headword".to_owned(),
-                });
-                continue;
-            }
+            let (simplified, traditional) = split_headword(&record.characters);
             let mut exchange = ExchangeRecord::new(record.line, record.raw, simplified);
             if let Some(traditional) = traditional {
                 exchange.traditional = Field::Present(traditional);
             }
-            exchange.pinyin = Field::Present(record.pinyin);
-            exchange.definition = match record.definition {
-                Some(definition) if !definition.is_empty() => Field::Present(definition),
-                _ => Field::Omitted,
-            };
+            if let Some(pinyin) = record.pinyin {
+                exchange.pinyin = Field::Present(pinyin);
+            }
+            if let Some(definition) = record.definition {
+                exchange.definition = Field::Present(definition);
+            }
             if let Some(category) = record.category {
                 exchange.collections = Field::Present(vec![category]);
             }
-            out.records.push(exchange);
+            records.push(exchange);
         }
-        out.issues.sort_by_key(|issue| issue.line);
-        Ok(out)
+        Ok(ParsedRecords::new(records, parsed.issues))
     }
 
     fn write(&self, records: &[ExportRecord], options: &WriteOptions) -> Result<Written> {
         let mut rows: Vec<(usize, ExportRow)> = Vec::with_capacity(records.len());
-        let mut blank_definitions = 0usize;
+        let mut left_out = 0usize;
         let mut notes_dropped = 0usize;
-        let mut traditional_dropped = 0usize;
         let mut extra_collections: Vec<String> = Vec::new();
         for (order, record) in records.iter().enumerate() {
             let category = if let Some(collection) = &options.collection {
@@ -88,7 +71,7 @@ impl Connector for Pleco {
                 names.into_iter().next()
             };
             let definition = if record.definition_is_dictionary_default {
-                blank_definitions += 1;
+                left_out += 1;
                 String::new()
             } else {
                 record.definition.clone()
@@ -96,13 +79,11 @@ impl Connector for Pleco {
             if !record.notes.trim().is_empty() {
                 notes_dropped += 1;
             }
-            if record.traditional != record.simplified {
-                traditional_dropped += 1;
-            }
             rows.push((
                 order,
                 ExportRow {
-                    headword: record.simplified.clone(),
+                    simplified: record.simplified.clone(),
+                    traditional: record.traditional.clone(),
                     pinyin: record.pinyin.clone(),
                     definition,
                     category,
@@ -116,14 +97,9 @@ impl Connector for Pleco {
         });
         let rows: Vec<ExportRow> = rows.into_iter().map(|(_, row)| row).collect();
         let mut notes = Vec::new();
-        if blank_definitions > 0 {
+        if left_out > 0 {
             notes.push(format!(
-                "{blank_definitions} definitions left blank so Pleco shows its own"
-            ));
-        }
-        if traditional_dropped > 0 {
-            notes.push(format!(
-                "{traditional_dropped} traditional forms not written (Pleco shows its own)"
+                "{left_out} definitions left out so Pleco shows its own"
             ));
         }
         if notes_dropped > 0 {
@@ -133,14 +109,12 @@ impl Connector for Pleco {
         }
         if !extra_collections.is_empty() {
             notes.push(format!(
-                "only the first collection is written for: {}",
+                "Pleco files hold one category per word; only the first collection is \
+                 written for: {}",
                 extra_collections.join("; ")
             ));
         }
-        Ok(Written {
-            bytes: Utf8TextV1.serialize(&rows),
-            notes,
-        })
+        Ok(Written::new(Utf8TextV1.serialize(&rows), notes))
     }
 }
 

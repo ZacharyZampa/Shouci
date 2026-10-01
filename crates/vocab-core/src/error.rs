@@ -109,8 +109,21 @@ impl From<&str> for VocabError {
 
 #[cfg(feature = "sqlite")]
 impl From<rusqlite::Error> for VocabError {
+    /// A busy or locked database (another process is writing and did not
+    /// finish within the busy timeout) is [`ErrorKind::Unavailable`]: worth
+    /// retrying. Everything else is [`ErrorKind::Storage`].
     fn from(value: rusqlite::Error) -> Self {
-        Self::storage(format!("database error: {value}"))
+        let busy = matches!(
+            value.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        );
+        if busy {
+            Self::unavailable(format!(
+                "the library is busy in another Shouci window or process; try again ({value})"
+            ))
+        } else {
+            Self::storage(format!("database error: {value}"))
+        }
     }
 }
 

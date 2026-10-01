@@ -1,0 +1,5 @@
+% exported by the Shouci proof of concept
+[Greetings]
+你好	ni3 hao3	hello
+
+% trailing comment

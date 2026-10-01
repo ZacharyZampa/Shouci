@@ -13,7 +13,7 @@ mod ranker;
 
 pub use library::{LibraryDoc, LibraryHit, match_library};
 pub use probes::{SearchProbe, load_search_probes};
-pub use query::{QueryKind, detect, looks_like_multisyllable_pinyin};
+pub use query::{QueryKind, detect, looks_like_pinyin};
 use ranker::Ranker;
 pub use ranker::{DeterministicRanker, english_has_lemma};
 
@@ -88,10 +88,11 @@ impl<P: DictionaryProvider> SearchService<P> {
     /// Searches without a mode: tries the [`detect`]ed kind first, then the
     /// others, and returns the first that finds anything.
     ///
-    /// One exception: English hits that don't contain the query as a word
-    /// (names like "Jintian Uprising" for `jintian`) don't stop letters that
-    /// split into pinyin syllables from being tried as pinyin. They are kept
-    /// as a last resort.
+    /// One exception: when the letters also spell pinyin, English hits that
+    /// don't contain the query as a whole gloss ("wok" for `wo`, "Jintian
+    /// Uprising" for `jintian`) don't stop it being tried as pinyin; they are
+    /// kept as a last resort. A real English word still wins: `can` finds
+    /// "can".
     ///
     /// # Errors
     ///
@@ -112,7 +113,7 @@ impl<P: DictionaryProvider> SearchService<P> {
             match self.search(kind, query) {
                 Ok(ranked) if !ranked.is_empty() => {
                     if kind == QueryKind::English
-                        && looks_like_multisyllable_pinyin(query)
+                        && looks_like_pinyin(query)
                         && !english_has_lemma(query, &ranked)
                     {
                         weak_english.get_or_insert(ranked);

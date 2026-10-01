@@ -17,7 +17,7 @@ pub use items::{
     NewItem, Saved, find_by_identity, get_item, insert_item, list_items, purge_item, reading_key,
     require_item, save_item, set_archived, set_source, set_trashed, set_verification, update_item,
 };
-pub use legacy::{LegacyReport, import_poc_database};
+pub use legacy::{IMPORTED_SETTING as LEGACY_IMPORTED_SETTING, LegacyReport, import_poc_database};
 pub use migrate::SCHEMA_VERSION;
 pub use organize::{
     NameCount, add_tag, add_to_collection, collection_from_tag, collections, collections_by_item,
@@ -53,9 +53,21 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Returns an error if the file cannot be opened, is a database this build
 /// cannot use, or a migration fails.
 pub fn open(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)
-        .map_err(|err| VocabError::storage(format!("cannot open {}: {err}", path.display())))?;
-    configure(conn)
+    // Setting up a database (switching it to WAL, migrating) can report
+    // "busy" at once, without waiting, when another process is setting it up
+    // at the same moment. Those races last milliseconds, so retry briefly.
+    let mut attempt = 0;
+    loop {
+        let conn = Connection::open(path)
+            .map_err(|err| VocabError::storage(format!("cannot open {}: {err}", path.display())))?;
+        match configure(conn) {
+            Err(err) if err.kind() == vocab_core::ErrorKind::Unavailable && attempt < 50 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// A private in-memory `user.db`, for tests and previews.
@@ -78,22 +90,28 @@ fn configure(mut conn: Connection) -> Result<Connection> {
 
 /// Runs `work` in one transaction: all of it lands, or none of it does.
 ///
+/// The transaction takes the write lock up front (IMMEDIATE). A deferred
+/// transaction that reads, then writes after another process committed,
+/// fails at once without waiting; this one waits up to the busy timeout.
+///
 /// # Errors
 ///
 /// Returns `work`'s error (after rolling back), or an error if the
-/// transaction cannot begin or commit.
+/// transaction cannot begin or commit; a busy database is
+/// [`vocab_core::ErrorKind::Unavailable`].
 pub fn with_tx<T>(
     conn: &mut Connection,
     work: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
 ) -> Result<T> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let value = work(&tx)?;
     tx.commit()?;
     Ok(value)
 }
 
-/// Changes whenever another connection (another process) commits to this
-/// database. Poll it to notice edits made elsewhere.
+/// Changes whenever another connection commits to this database: another
+/// process, or another connection in this one. A connection never sees its
+/// own commits here, so poll on a different connection than the writer.
 ///
 /// # Errors
 ///

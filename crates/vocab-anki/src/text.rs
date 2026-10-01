@@ -70,6 +70,7 @@ impl AnkiTextV1 {
     ///
     /// Fails only when the file is not UTF-8, or when a declared separator is not tab.
     pub fn parse(self, bytes: &[u8]) -> Result<ParsedNotes> {
+        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
         let text = std::str::from_utf8(bytes).map_err(|err| {
             VocabError::format(format!("file is not valid UTF-8 (expected {KEY}): {err}"))
         })?;
@@ -147,16 +148,18 @@ impl AnkiTextV1 {
     /// # Errors
     ///
     /// Returns an error if the deck name contains a newline.
-    pub fn write(self, notes: &[AnkiNote], deck: &str) -> Result<Vec<u8>> {
-        if deck.contains(['\n', '\r']) {
+    pub fn write(self, notes: &[AnkiNote], deck: Option<&str>) -> Result<Vec<u8>> {
+        if deck.is_some_and(|deck| deck.contains(['\n', '\r'])) {
             return Err(VocabError::invalid("deck name cannot contain a newline"));
         }
         let mut out = String::new();
         out.push_str("#separator:tab\n");
         out.push_str("#html:false\n");
-        out.push_str("#deck:");
-        out.push_str(deck);
-        out.push('\n');
+        if let Some(deck) = deck {
+            out.push_str("#deck:");
+            out.push_str(deck);
+            out.push('\n');
+        }
         out.push_str("#columns:Headword\tTraditional\tPinyin\tDefinition\tNotes\tTags\n");
         out.push_str("#tags column:6\n");
         for note in notes {

@@ -44,6 +44,9 @@ impl Config {
     /// With no `SHOUCI_HOME`, the proof of concept's directory is checked
     /// for words to bring over.
     #[must_use]
+    ///
+    /// `~` and relative paths in the variables are resolved (against the
+    /// home and current directories).
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
         let home = var("HOME");
@@ -57,11 +60,11 @@ impl Config {
                     "shouci",
                 )
             },
-            PathBuf::from,
+            |dir| resolve(&dir, home.as_deref()),
         );
         let mut config = Self::in_dir(data_dir);
         if let Some(dir) = var("SHOUCI_DICTIONARIES") {
-            config.dictionaries_dir = PathBuf::from(dir);
+            config.dictionaries_dir = resolve(&dir, home.as_deref());
         }
         if explicit.is_none() {
             config.legacy_dir = Some(platform_dir(
@@ -77,6 +80,17 @@ impl Config {
     #[must_use]
     pub fn user_db_path(&self) -> PathBuf {
         self.data_dir.join("user.db")
+    }
+}
+
+/// A directory from the environment: `~` expanded, relative made absolute.
+fn resolve(dir: &str, home: Option<&str>) -> PathBuf {
+    let path =
+        expand_tilde_in(Path::new(dir), home.map(Path::new)).unwrap_or_else(|_| PathBuf::from(dir));
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or(path.clone(), |cwd| cwd.join(&path))
     }
 }
 
@@ -157,6 +171,15 @@ mod tests {
         let config = Config::in_dir("/data");
         assert_eq!(config.user_db_path(), Path::new("/data/user.db"));
         assert_eq!(config.dictionaries_dir, Path::new("/data/dictionaries"));
+    }
+
+    #[test]
+    fn environment_paths_are_resolved() {
+        assert_eq!(
+            super::resolve("~/shouci", Some("/Users/me")),
+            Path::new("/Users/me/shouci")
+        );
+        assert!(super::resolve("relative/dir", None).is_absolute());
     }
 
     #[test]

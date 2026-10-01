@@ -38,6 +38,8 @@ pub struct ItemView {
     pub modified_at: String,
     pub archived_at: Option<String>,
     pub deleted_at: Option<String>,
+    /// Increases with every change; tells a UI its copy is out of date.
+    pub rev: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +47,8 @@ pub struct SourceView {
     pub kind: SourceKind,
     /// Dictionary or connector id.
     pub id: Option<String>,
+    /// Dictionary version, or the connector's file format.
+    pub version: Option<String>,
     pub import_origin: Option<String>,
 }
 
@@ -69,6 +73,7 @@ impl ItemView {
             source: SourceView {
                 kind: item.source.kind,
                 id: item.source.id,
+                version: item.source.version,
                 import_origin: item.source.import_origin,
             },
             tags,
@@ -78,6 +83,7 @@ impl ItemView {
             modified_at: item.modified_at,
             archived_at: item.archived_at,
             deleted_at: item.deleted_at,
+            rev: item.rev,
         }
     }
 }
@@ -146,7 +152,7 @@ pub struct DictionaryResults {
     /// The first guess; differs from `kind` when the search fell through.
     pub guessed: QueryKind,
     /// Matches before `limit` was applied.
-    pub total: usize,
+    pub total: u32,
     pub candidates: Vec<CandidateView>,
 }
 
@@ -156,6 +162,8 @@ pub struct LibraryResults {
     /// How the best match read the query; `None` for an empty query, which
     /// lists everything the filter allows.
     pub kind: Option<QueryKind>,
+    /// Matches before `limit` was applied.
+    pub total: u32,
     pub items: Vec<ItemView>,
 }
 
@@ -166,6 +174,9 @@ pub enum SaveOutcome {
     AlreadySaved,
     /// It was in the trash and is back.
     Restored,
+    /// A word saved earlier without a reading (no dictionary match at the
+    /// time) was filled in.
+    Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +231,8 @@ pub enum BulkAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BulkResult {
-    pub changed: usize,
+    /// Distinct words the action was applied to.
+    pub changed: u32,
 }
 
 /// A tag or a collection.
@@ -250,9 +262,12 @@ pub enum DictionaryStatus {
         dictionary: Option<String>,
     },
     Ready {
-        enabled: usize,
-        /// Worth telling the user once: a monthly refresh that failed.
+        enabled: u32,
+        /// Worth telling the user once: a monthly refresh that failed, a
+        /// file that would not open.
         notes: Vec<String>,
+        /// A download or rebuild is running in the background; search works.
+        updating: Option<LoadingStage>,
     },
     Failed {
         message: String,
@@ -283,7 +298,7 @@ pub struct DictionaryView {
     pub entries: u64,
     pub enabled: bool,
     /// 0 is searched first. `None` when disabled.
-    pub priority: Option<usize>,
+    pub priority: Option<u32>,
 }
 
 /// One entry of one dictionary, shown beside a saved word.
@@ -296,8 +311,8 @@ pub struct DictionaryEntryView {
     pub pinyin_display: String,
     pub glosses: Vec<String>,
     pub definition_display: String,
-    /// Same reading as the saved word.
-    pub same_reading: bool,
+    /// This entry is the saved word (same reading and traditional form).
+    pub same_word: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,19 +325,22 @@ pub struct ConnectorView {
     pub can_export: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LegacyImport {
-    pub items_added: usize,
-    pub items_already_saved: usize,
-    pub runs_added: usize,
+    pub items_added: u32,
+    pub items_already_saved: u32,
+    pub runs_added: u32,
+    /// Rows that could not come over, with why.
+    pub skipped: Vec<String>,
 }
 
 impl From<vocab_db::LegacyReport> for LegacyImport {
     fn from(value: vocab_db::LegacyReport) -> Self {
         Self {
-            items_added: value.items_added,
-            items_already_saved: value.items_already_saved,
-            runs_added: value.runs_added,
+            items_added: crate::count(value.items_added),
+            items_already_saved: crate::count(value.items_already_saved),
+            runs_added: crate::count(value.runs_added),
+            skipped: value.skipped,
         }
     }
 }

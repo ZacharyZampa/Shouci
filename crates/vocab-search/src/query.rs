@@ -85,10 +85,10 @@ pub(crate) fn is_han(c: char) -> bool {
     (0x3400..=0x4dbf).contains(&n) || (0x4e00..=0x9fff).contains(&n)
 }
 
-/// Letters only, and they split into two or more pinyin syllables:
-/// `jingzi`, `nihao`, but not `school` or `can`.
+/// Letters only, and they spell pinyin syllables: `wo`, `jingzi`, `nihao`,
+/// `can`, but not `school` or `a`.
 #[must_use]
-pub fn looks_like_multisyllable_pinyin(query: &str) -> bool {
+pub fn looks_like_pinyin(query: &str) -> bool {
     let q = query.trim();
     if q.is_empty()
         || !q
@@ -97,14 +97,12 @@ pub fn looks_like_multisyllable_pinyin(query: &str) -> bool {
     {
         return false;
     }
-    segment(normalize(q).as_str())
-        .iter()
-        .any(|variant| variant.split_whitespace().count() >= 2)
+    !segment(normalize(q).as_str()).is_empty()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryKind, detect, looks_like_multisyllable_pinyin};
+    use super::{QueryKind, detect, looks_like_pinyin};
 
     #[test]
     fn detects_common_queries() {
@@ -117,12 +115,12 @@ mod tests {
     }
 
     #[test]
-    fn untoned_multisyllable_pinyin_is_detected() {
-        for yes in ["jingzi", "nihao", "xuexiao"] {
-            assert!(looks_like_multisyllable_pinyin(yes), "{yes}");
+    fn untoned_pinyin_is_detected() {
+        for yes in ["jingzi", "nihao", "xuexiao", "wo", "shi", "can"] {
+            assert!(looks_like_pinyin(yes), "{yes}");
         }
-        for no in ["school", "hello", "can", "cat", ""] {
-            assert!(!looks_like_multisyllable_pinyin(no), "{no}");
+        for no in ["school", "hello", "cat", "a", ""] {
+            assert!(!looks_like_pinyin(no), "{no}");
         }
     }
 }

@@ -159,7 +159,7 @@ fn the_library_is_searched_by_hanzi_pinyin_or_english() {
     }
     let search = |query: &str| -> Vec<String> {
         shouci
-            .search_library(query, &active(), None)
+            .search_library(query, &active(), None, None)
             .unwrap()
             .items
             .into_iter()
@@ -172,7 +172,10 @@ fn the_library_is_searched_by_hanzi_pinyin_or_english() {
     assert_eq!(search("rice"), vec!["米饭"]);
     assert_eq!(search("").len(), 3, "empty lists everything");
     assert_eq!(
-        shouci.search_library("rice", &active(), None).unwrap().kind,
+        shouci
+            .search_library("rice", &active(), None, None)
+            .unwrap()
+            .kind,
         Some(QueryKind::English)
     );
 }
@@ -345,7 +348,7 @@ fn dictionaries_can_be_enabled_ordered_and_viewed_side_by_side() {
     // When the saved word is viewed in the other dictionary
     let alt = shouci.lookup_in(id, "alt").unwrap();
     assert_eq!(alt[0].glosses, vec!["educational institution"]);
-    assert!(alt[0].same_reading);
+    assert!(alt[0].same_word);
     // Then the saved word is unchanged
     assert_eq!(shouci.item(id).unwrap().definition, "school");
 
@@ -407,7 +410,7 @@ fn import_export_new_then_merge_back() {
     let summary = shouci.apply_import(&plan).unwrap();
     assert_eq!(summary.inserted, 2);
     let rice = shouci
-        .search_library("米饭", &active(), None)
+        .search_library("米饭", &active(), None, None)
         .unwrap()
         .items
         .remove(0);
@@ -657,11 +660,167 @@ fn loading_reports_problems_without_failing() {
     // When dictionaries load
     shouci.load_dictionaries().unwrap();
     // Then search works and the problem is a note, not an error
-    let DictionaryStatus::Ready { enabled, notes } = shouci.dictionary_status() else {
+    let DictionaryStatus::Ready { enabled, notes, .. } = shouci.dictionary_status() else {
         panic!("expected ready: {:?}", shouci.dictionary_status());
     };
     assert_eq!(enabled, 1);
     assert!(notes[0].contains("broken.db"), "{notes:?}");
     let json = serde_json::to_value(shouci.dictionary_status()).unwrap();
     assert_eq!(json["state"], "ready");
+}
+
+// --- Review regressions ---------------------------------------------------
+
+#[test]
+fn this_process_s_own_saves_change_the_data_version() {
+    let shouci = sandbox();
+    let before = shouci.data_version().unwrap();
+    saved(shouci.quick_add("学校", None).unwrap());
+    assert_ne!(shouci.data_version().unwrap(), before);
+}
+
+#[test]
+fn proper_nouns_never_hide_common_words() {
+    let shouci = empty_sandbox();
+    install_dictionary(
+        &shouci.config().dictionaries_dir,
+        "cc-cedict",
+        "白 白 [Bai2] /surname Bai/\n白 白 [bai2] /white/\n",
+    )
+    .unwrap();
+    shouci.load_dictionaries().unwrap();
+    let found = shouci.search_dictionary("白", None, None).unwrap();
+    let readings: Vec<&str> = found.candidates.iter().map(|c| c.pinyin.as_str()).collect();
+    assert!(
+        readings.contains(&"Bai2") && readings.contains(&"bai2"),
+        "{readings:?}"
+    );
+}
+
+#[test]
+fn a_single_untoned_syllable_finds_its_word() {
+    let shouci = empty_sandbox();
+    install_dictionary(
+        &shouci.config().dictionaries_dir,
+        "cc-cedict",
+        "我 我 [wo3] /I; me; my/\n炒鍋 炒锅 [chao3 guo1] /wok/\n",
+    )
+    .unwrap();
+    shouci.load_dictionaries().unwrap();
+    let found = shouci.search_dictionary("wo", None, None).unwrap();
+    assert_eq!(found.kind, QueryKind::Pinyin);
+    assert_eq!(found.candidates[0].simplified, "我");
+}
+
+#[test]
+fn queries_and_results_are_bounded() {
+    let shouci = sandbox();
+    let long = "x".repeat(shouci_core::MAX_QUERY_CHARS + 1);
+    assert_eq!(
+        shouci
+            .search_dictionary(&long, None, None)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Invalid
+    );
+    for word in ["学校", "旅行", "米饭"] {
+        saved(shouci.quick_add(word, None).unwrap());
+    }
+    let page = shouci.search_library("", &active(), None, Some(2)).unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.total, 3);
+}
+
+#[test]
+fn repeated_ids_in_a_bulk_action_count_once() {
+    let shouci = sandbox();
+    let id = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let result = shouci.bulk(&[id, id], &BulkAction::Trash).unwrap();
+    assert_eq!(result.changed, 1);
+    assert_eq!(
+        shouci.bulk(&[id, id], &BulkAction::Purge).unwrap().changed,
+        1
+    );
+}
+
+#[test]
+fn the_dictionary_entry_for_a_word_is_matched_by_its_traditional_form() {
+    let shouci = empty_sandbox();
+    install_dictionary(
+        &shouci.config().dictionaries_dir,
+        "cc-cedict",
+        "面 面 [mian4] /face; side/\n麵 面 [mian4] /noodles/\n",
+    )
+    .unwrap();
+    shouci.load_dictionaries().unwrap();
+    let noodles = shouci
+        .search_dictionary("noodles", None, None)
+        .unwrap()
+        .candidates
+        .remove(0);
+    let id = shouci.save_candidate(&noodles).unwrap().item.id;
+    let entries = shouci.lookup_in(id, "cc-cedict").unwrap();
+    let matching: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.same_word)
+        .map(|entry| entry.traditional.as_str())
+        .collect();
+    assert_eq!(matching, vec!["麵"]);
+    let adopted = shouci.use_definition(id, "cc-cedict").unwrap();
+    assert_eq!(adopted.definition, "noodles");
+}
+
+#[test]
+fn a_word_captured_offline_is_completed_later() {
+    // Captured with no dictionary: saved as typed, needing review.
+    let shouci = empty_sandbox();
+    let placeholder = shouci
+        .add_manual(&ManualWord {
+            simplified: "学校".to_owned(),
+            ..ManualWord::default()
+        })
+        .unwrap();
+    assert_eq!(placeholder.item.verification, Verification::NeedsReview);
+    // Later, with a dictionary, saving the word fills the same entry in.
+    install_dictionary(
+        &shouci.config().dictionaries_dir,
+        "cc-cedict",
+        shouci_core::testing::SAMPLE_DICTIONARY,
+    )
+    .unwrap();
+    shouci.load_dictionaries().unwrap();
+    let result = saved(shouci.quick_add("学校", None).unwrap());
+    assert_eq!(result.outcome, SaveOutcome::Completed);
+    assert_eq!(result.item.id, placeholder.item.id);
+    assert_eq!(result.item.traditional, "學校");
+    assert_eq!(result.item.verification, Verification::Confirmed);
+    assert_eq!(shouci.list_items(&active()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_missing_import_file_is_not_found() {
+    let shouci = sandbox();
+    let err = shouci
+        .preview_import(
+            Path::new("/nonexistent/shouci/in.txt"),
+            "pleco",
+            ImportPolicy::Skip,
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+}
+
+#[test]
+fn quick_add_saves_the_exact_word_even_when_longer_words_match() {
+    let shouci = empty_sandbox();
+    install_dictionary(
+        &shouci.config().dictionaries_dir,
+        "cc-cedict",
+        "媽媽 妈妈 [ma1 ma5] /mama; mommy/\n媽媽的 妈妈的 [ma1 ma5 de5] /(slang) damn it/\n",
+    )
+    .unwrap();
+    shouci.load_dictionaries().unwrap();
+    let result = saved(shouci.quick_add("妈妈", None).unwrap());
+    assert_eq!(result.item.simplified, "妈妈");
 }

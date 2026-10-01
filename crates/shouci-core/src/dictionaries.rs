@@ -1,9 +1,22 @@
 //! Which dictionaries are loaded, enabled, and in what order; looking a saved
 //! word up in any of them.
+//!
+//! Loading keeps search available whenever it can be:
+//! 1. dictionaries already on disk open first (Ready at once);
+//! 2. missing built-ins are then downloaded and built, and stale ones
+//!    refreshed, while the status reports what is happening (`Ready` with
+//!    `updating` set, or `Loading` when nothing could open yet);
+//! 3. the set is reopened and swapped in.
+//!
+//! One load runs at a time. Changing which dictionaries are enabled during a
+//! load is applied when the load finishes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use vocab_core::{ItemPatch, ItemSource, Result, SourceKind, VocabError};
+use vocab_core::{
+    DictionaryEntry, ItemPatch, ItemSource, Result, SourceKind, VocabError, VocabItem,
+};
 use vocab_dictionary::catalog::{self, dictionary_path};
 use vocab_dictionary::{
     DictionaryInfo, DictionaryProvider, DictionarySet, Ensured, FetchStage, SqliteDictionary,
@@ -13,25 +26,31 @@ use vocab_search::{DeterministicRanker, SearchService};
 
 use crate::dto::{DictionaryEntryView, DictionaryStatus, DictionaryView, ItemView, LoadingStage};
 use crate::library::item_view;
-use crate::{Error, Shouci};
+use crate::{Error, Shouci, count};
 
 /// Setting: enabled dictionary ids, comma-separated, highest priority first.
 const ENABLED_KEY: &str = "dictionaries.enabled";
 
 pub(crate) enum DictState {
     NotLoaded,
+    /// Nothing can be searched yet.
     Loading {
         stage: LoadingStage,
         dictionary: Option<String>,
     },
-    Ready(Arc<Loaded>),
+    Ready {
+        loaded: Arc<Loaded>,
+        /// A download or rebuild is running in the background.
+        updating: Option<(LoadingStage, String)>,
+        /// Worth telling the user once.
+        notes: Vec<String>,
+    },
     Failed(String),
 }
 
 pub(crate) struct Loaded {
     pub search: SearchService<DictionarySet>,
     pub enabled: Vec<String>,
-    pub notes: Vec<String>,
 }
 
 impl Loaded {
@@ -40,29 +59,105 @@ impl Loaded {
     }
 }
 
+/// Loads in progress and preference changes that arrived during one.
+#[derive(Default)]
+pub(crate) struct LoadControl {
+    running: std::sync::Mutex<()>,
+    reload_after: AtomicBool,
+}
+
 impl Shouci {
-    /// Makes dictionaries ready for search: downloads and builds missing
-    /// built-in ones (when the config allows), refreshes stale ones, then
-    /// opens the enabled set. Blocks; frontends call it off the UI thread
-    /// and watch [`Shouci::dictionary_status`] meanwhile.
+    /// Makes dictionaries ready for search. Dictionaries on disk open first;
+    /// then missing built-ins are downloaded and built (when the config
+    /// allows) and stale ones refreshed, and the set is swapped in. Blocks
+    /// for as long as that takes: call it off the UI thread and watch
+    /// [`Shouci::dictionary_status`]. Search works as soon as the status is
+    /// `Ready`, even while `updating`.
     ///
     /// # Errors
     ///
     /// [`crate::ErrorKind::Unavailable`] when no dictionary can be opened
     /// (the first download failed, say). The status then holds the message.
     pub fn load_dictionaries(&self) -> Result<()> {
-        self.set_loading(LoadingStage::Checking, None);
-        let result = self.build_state(true);
-        match result {
-            Ok(loaded) => {
-                self.set_state(DictState::Ready(Arc::new(loaded)));
+        let _running = self
+            .load
+            .running
+            .lock()
+            .map_err(|_| Error::new("dictionary loading failed earlier"))?;
+        self.load.reload_after.store(false, Ordering::SeqCst);
+        let mut notes = Vec::new();
+        if !self.is_ready() {
+            self.set_loading(LoadingStage::Checking, None);
+            // Whatever is already on disk can be searched while the rest
+            // downloads.
+            if let Ok((loaded, problems)) = self.open_installed() {
+                self.set_ready(loaded, problems);
+            }
+        }
+        let mut fetch_errors = Vec::new();
+        if self.config.fetch_dictionaries {
+            for spec in catalog::builtin() {
+                let mut progress = |stage: FetchStage| {
+                    let stage = match stage {
+                        FetchStage::Waiting => LoadingStage::Waiting,
+                        FetchStage::Downloading => LoadingStage::Downloading,
+                        FetchStage::Building => LoadingStage::Building,
+                    };
+                    self.report(stage, spec.name);
+                };
+                match (spec.ensure)(
+                    &dictionary_path(&self.config.dictionaries_dir, spec.id),
+                    &mut progress,
+                ) {
+                    Ok(Ensured::RefreshFailed(err)) => notes.push(format!(
+                        "{} could not be updated this month, so the previous copy is in use \
+                         ({err}).",
+                        spec.name
+                    )),
+                    Ok(Ensured::Current | Ensured::Built | Ensured::Refreshed) => {}
+                    Err(err) => fetch_errors.push(format!("{}: {err}", spec.name)),
+                }
+            }
+        }
+        if !self.is_ready() {
+            self.set_loading(LoadingStage::Opening, None);
+        }
+        let result = self.open_installed().map_err(|err| {
+            if fetch_errors.is_empty() {
+                err
+            } else {
+                Error::unavailable(format!(
+                    "no dictionary is installed: {}. The first launch downloads one and needs \
+                     an internet connection.",
+                    fetch_errors.join("; ")
+                ))
+            }
+        });
+        let outcome = match result {
+            Ok((loaded, problems)) => {
+                notes.extend(problems);
+                notes.extend(
+                    fetch_errors
+                        .iter()
+                        .map(|err| format!("Could not download {err}")),
+                );
+                self.set_ready(loaded, notes);
+                Ok(())
+            }
+            Err(err) if self.is_ready() => {
+                // Keep searching the copy already open; say why it is old.
+                self.add_note(format!("Dictionaries could not be reopened: {err}"));
                 Ok(())
             }
             Err(err) => {
                 self.set_state(DictState::Failed(err.message().to_owned()));
                 Err(err)
             }
+        };
+        if self.load.reload_after.swap(false, Ordering::SeqCst) {
+            self.reopen_keeping_notes();
         }
+        outcome
     }
 
     #[must_use]
@@ -73,9 +168,14 @@ impl Shouci {
                 stage: *stage,
                 dictionary: dictionary.clone(),
             },
-            Ok(DictState::Ready(loaded)) => DictionaryStatus::Ready {
-                enabled: loaded.enabled.len(),
-                notes: loaded.notes.clone(),
+            Ok(DictState::Ready {
+                loaded,
+                updating,
+                notes,
+            }) => DictionaryStatus::Ready {
+                enabled: count(loaded.enabled.len()),
+                notes: notes.clone(),
+                updating: updating.as_ref().map(|(stage, _)| *stage),
             },
             Ok(DictState::Failed(message)) => DictionaryStatus::Failed {
                 message: message.clone(),
@@ -98,7 +198,7 @@ impl Shouci {
         let mut views: Vec<DictionaryView> = installed
             .into_iter()
             .map(|info| {
-                let priority = enabled.iter().position(|id| *id == info.id);
+                let priority = enabled.iter().position(|id| *id == info.id).map(count);
                 DictionaryView {
                     enabled: priority.is_some(),
                     priority,
@@ -110,56 +210,64 @@ impl Shouci {
                 }
             })
             .collect();
-        views.sort_by_key(|view| (view.priority.unwrap_or(usize::MAX), view.id.clone()));
+        views.sort_by_key(|view| (view.priority.unwrap_or(u32::MAX), view.id.clone()));
         Ok(views)
     }
 
     /// Chooses which dictionaries search uses, highest priority first, and
-    /// reloads them (without downloading).
+    /// reopens them (without downloading). Repeated ids count once. During a
+    /// load, the change applies when the load finishes.
     ///
     /// # Errors
     ///
     /// [`crate::ErrorKind::Invalid`] for an empty list or an unknown id.
     pub fn set_enabled_dictionaries(&self, ids: &[String]) -> Result<Vec<DictionaryView>> {
-        if ids.is_empty() {
+        let mut unique: Vec<&str> = Vec::new();
+        for id in ids {
+            let id = id.trim();
+            if !id.is_empty() && !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        if unique.is_empty() {
             return Err(Error::invalid("enable at least one dictionary"));
         }
         let installed = catalog::installed(&self.config.dictionaries_dir)?.dictionaries;
-        for id in ids {
-            if !installed.iter().any(|info| &info.id == id) {
+        for id in &unique {
+            if !installed.iter().any(|info| info.id == *id) {
                 return Err(Error::invalid(format!("no dictionary '{id}' is installed")));
             }
         }
-        vocab_db::set_setting(&*self.db()?, ENABLED_KEY, &ids.join(","))?;
-        if matches!(
-            self.dictionaries.read().as_deref(),
-            Ok(DictState::Ready(_) | DictState::Failed(_))
-        ) {
-            match self.build_state(false) {
-                Ok(loaded) => self.set_state(DictState::Ready(Arc::new(loaded))),
-                Err(err) => self.set_state(DictState::Failed(err.message().to_owned())),
+        vocab_db::set_setting(&*self.db()?, ENABLED_KEY, &unique.join(","))?;
+        match self.load.running.try_lock() {
+            Ok(_running) => {
+                if self.is_ready() {
+                    self.reopen_keeping_notes();
+                }
             }
+            Err(_) => self.load.reload_after.store(true, Ordering::SeqCst),
         }
         self.dictionaries()
     }
 
     /// A saved word as `dictionary` has it: every entry with its characters,
-    /// same-reading entries first. Any installed dictionary works, enabled
-    /// or not; the saved word itself never changes.
+    /// the ones matching the saved word first. Any installed dictionary
+    /// works, enabled or not; the saved word itself never changes.
     ///
     /// # Errors
     ///
     /// [`crate::ErrorKind::NotFound`] for an unknown word or dictionary.
     pub fn lookup_in(&self, item_id: i64, dictionary: &str) -> Result<Vec<DictionaryEntryView>> {
-        let item = vocab_db::require_item(&*self.db()?, item_id)?;
-        let key = vocab_db::reading_key(&item.pinyin);
-        let mut entries: Vec<DictionaryEntryView> = self
-            .with_dictionary(dictionary, |dict| {
-                dict.entries_by_headword(&item.simplified)
-            })?
+        let item = vocab_db::require_item(&*self.read()?, item_id)?;
+        let entries = self.with_dictionary(dictionary, |dict| {
+            dict.entries_by_headword(&item.simplified)
+        })?;
+        let same = same_word(&item, &entries);
+        let mut views: Vec<DictionaryEntryView> = entries
             .into_iter()
-            .map(|entry| DictionaryEntryView {
-                same_reading: vocab_db::reading_key(&entry.pinyin) == key,
+            .enumerate()
+            .map(|(index, entry)| DictionaryEntryView {
+                same_word: same.contains(&index),
                 pinyin_display: tone_marks(&entry.pinyin),
                 definition_display: vocab_dictionary::display_definition(&entry.glosses.join("; ")),
                 dictionary: entry.source.0,
@@ -169,29 +277,25 @@ impl Shouci {
                 glosses: entry.glosses,
             })
             .collect();
-        entries.sort_by_key(|entry| !entry.same_reading);
-        Ok(entries)
+        views.sort_by_key(|view| !view.same_word);
+        Ok(views)
     }
 
-    /// Replaces a saved word's definition with `dictionary`'s for the same
-    /// characters and reading.
+    /// Replaces a saved word's definition with `dictionary`'s entry for the
+    /// same word (characters and reading).
     ///
     /// # Errors
     ///
-    /// [`crate::ErrorKind::NotFound`] when the dictionary has no entry with
-    /// that reading; [`crate::ErrorKind::Conflict`] when it has several.
+    /// [`crate::ErrorKind::NotFound`] when the dictionary has no such entry;
+    /// [`crate::ErrorKind::Conflict`] when it has several.
     pub fn use_definition(&self, item_id: i64, dictionary: &str) -> Result<ItemView> {
-        let item = vocab_db::require_item(&*self.db()?, item_id)?;
-        let key = vocab_db::reading_key(&item.pinyin);
-        let matches: Vec<_> = self
-            .with_dictionary(dictionary, |dict| {
-                dict.entries_by_headword(&item.simplified)
-            })?
-            .into_iter()
-            .filter(|entry| vocab_db::reading_key(&entry.pinyin) == key)
-            .collect();
-        let entry = match matches.as_slice() {
-            [entry] => entry,
+        let item = vocab_db::require_item(&*self.read()?, item_id)?;
+        let entries = self.with_dictionary(dictionary, |dict| {
+            dict.entries_by_headword(&item.simplified)
+        })?;
+        let same = same_word(&item, &entries);
+        let entry = match same.as_slice() {
+            [index] => &entries[*index],
             [] => {
                 return Err(Error::not_found(format!(
                     "{dictionary} has no entry for {} [{}]",
@@ -201,38 +305,40 @@ impl Shouci {
             _ => {
                 return Err(Error::conflict(format!(
                     "{dictionary} has {} entries for {} [{}]; edit the definition instead",
-                    matches.len(),
+                    same.len(),
                     item.simplified,
                     item.pinyin
                 )));
             }
         };
-        let conn = self.db()?;
-        vocab_db::update_item(
-            &conn,
-            item_id,
-            &ItemPatch {
-                definition: Some(entry.glosses.join("; ")),
-                ..ItemPatch::default()
-            },
-        )?;
-        vocab_db::set_source(
-            &conn,
-            item_id,
-            &ItemSource {
-                kind: SourceKind::Dictionary,
-                id: Some(entry.source.0.clone()),
-                version: Some(entry.source_version.0.clone()),
-                import_origin: None,
-            },
-        )?;
-        item_view(&conn, vocab_db::require_item(&conn, item_id)?)
+        let mut conn = self.db()?;
+        vocab_db::with_tx(&mut conn, |tx| {
+            vocab_db::update_item(
+                tx,
+                item_id,
+                &ItemPatch {
+                    definition: Some(entry.glosses.join("; ")),
+                    ..ItemPatch::default()
+                },
+            )?;
+            vocab_db::set_source(
+                tx,
+                item_id,
+                &ItemSource {
+                    kind: SourceKind::Dictionary,
+                    id: Some(entry.source.0.clone()),
+                    version: Some(entry.source_version.0.clone()),
+                    import_origin: None,
+                },
+            )?;
+            item_view(tx, vocab_db::require_item(tx, item_id)?)
+        })
     }
 
     /// The loaded dictionaries, or why there are none.
     pub(crate) fn loaded(&self) -> Result<Arc<Loaded>> {
         match self.dictionaries.read().as_deref() {
-            Ok(DictState::Ready(loaded)) => Ok(Arc::clone(loaded)),
+            Ok(DictState::Ready { loaded, .. }) => Ok(Arc::clone(loaded)),
             Ok(DictState::Loading { .. }) => Err(Error::unavailable(
                 "the dictionary is still loading; try again in a moment",
             )),
@@ -250,6 +356,13 @@ impl Shouci {
         self.loaded().ok()
     }
 
+    fn is_ready(&self) -> bool {
+        matches!(
+            self.dictionaries.read().as_deref(),
+            Ok(DictState::Ready { .. })
+        )
+    }
+
     fn set_state(&self, state: DictState) {
         if let Ok(mut current) = self.dictionaries.write() {
             *current = state;
@@ -263,17 +376,73 @@ impl Shouci {
         });
     }
 
+    fn set_ready(&self, loaded: Loaded, notes: Vec<String>) {
+        self.set_state(DictState::Ready {
+            loaded: Arc::new(loaded),
+            updating: None,
+            notes,
+        });
+    }
+
+    /// Progress from a download: in the background when search already
+    /// works, in the foreground otherwise.
+    fn report(&self, stage: LoadingStage, dictionary: &str) {
+        if let Ok(mut state) = self.dictionaries.write() {
+            match &mut *state {
+                DictState::Ready { updating, .. } => {
+                    *updating = Some((stage, dictionary.to_owned()));
+                }
+                other => {
+                    *other = DictState::Loading {
+                        stage,
+                        dictionary: Some(dictionary.to_owned()),
+                    };
+                }
+            }
+        }
+    }
+
+    fn add_note(&self, note: String) {
+        if let Ok(mut state) = self.dictionaries.write() {
+            if let DictState::Ready {
+                updating, notes, ..
+            } = &mut *state
+            {
+                notes.push(note);
+                *updating = None;
+            }
+        }
+    }
+
+    fn current_notes(&self) -> Vec<String> {
+        match self.dictionaries.read().as_deref() {
+            Ok(DictState::Ready { notes, .. }) => notes.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Reopens the set (preferences changed), keeping the current notes.
+    fn reopen_keeping_notes(&self) {
+        let notes = self.current_notes();
+        match self.open_installed() {
+            Ok((loaded, _)) => self.set_ready(loaded, notes),
+            Err(err) => self.set_state(DictState::Failed(err.message().to_owned())),
+        }
+    }
+
     fn enabled_ids(&self, installed: &[DictionaryInfo]) -> Result<Vec<String>> {
-        let saved = vocab_db::get_setting(&*self.db()?, ENABLED_KEY)?;
-        let mut ids: Vec<String> = match saved {
-            Some(list) => list
-                .split(',')
-                .map(str::trim)
-                .filter(|id| installed.iter().any(|info| info.id == *id))
-                .map(str::to_owned)
-                .collect(),
-            None => Vec::new(),
-        };
+        let saved = vocab_db::get_setting(&*self.read()?, ENABLED_KEY)?;
+        let mut ids: Vec<String> = Vec::new();
+        for id in saved
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+        {
+            if installed.iter().any(|info| info.id == id) && !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_owned());
+            }
+        }
         if ids.is_empty() {
             // Default: built-ins first, then the rest by id.
             let builtin = |id: &str| catalog::builtin().iter().position(|spec| spec.id == id);
@@ -284,58 +453,27 @@ impl Shouci {
         Ok(ids)
     }
 
-    fn build_state(&self, fetch: bool) -> Result<Loaded> {
+    /// Opens the enabled, installed dictionaries, with notes about files
+    /// that could not be opened.
+    fn open_installed(&self) -> Result<(Loaded, Vec<String>)> {
         let dir = &self.config.dictionaries_dir;
-        let mut fetch_errors = Vec::new();
-        let mut notes = Vec::new();
-        if fetch && self.config.fetch_dictionaries {
-            for spec in catalog::builtin() {
-                let mut progress = |stage: FetchStage| {
-                    let stage = match stage {
-                        FetchStage::Waiting => LoadingStage::Waiting,
-                        FetchStage::Downloading => LoadingStage::Downloading,
-                        FetchStage::Building => LoadingStage::Building,
-                    };
-                    self.set_loading(stage, Some(spec.name));
-                };
-                match (spec.ensure)(&dictionary_path(dir, spec.id), &mut progress) {
-                    Ok(Ensured::RefreshFailed(err)) => notes.push(format!(
-                        "{} could not be updated this month, so the previous copy is in use \
-                         ({err}).",
-                        spec.name
-                    )),
-                    Ok(Ensured::Current | Ensured::Built | Ensured::Refreshed) => {}
-                    Err(err) => fetch_errors.push(format!("{}: {err}", spec.name)),
-                }
-            }
-        }
-        self.set_loading(LoadingStage::Opening, None);
         let found = catalog::installed(dir)?;
-        notes.extend(
-            found
-                .problems
-                .iter()
-                .map(|problem| format!("A dictionary file could not be opened: {problem}")),
-        );
+        let notes: Vec<String> = found
+            .problems
+            .iter()
+            .map(|problem| format!("A dictionary file could not be opened: {problem}"))
+            .collect();
         if found.dictionaries.is_empty() {
-            let mut why = fetch_errors;
-            why.extend(found.problems.clone());
-            let detail = if why.is_empty() {
+            let detail = if found.problems.is_empty() {
                 format!("none in {}", dir.display())
             } else {
-                why.join("; ")
+                found.problems.join("; ")
             };
             return Err(Error::unavailable(format!(
                 "no dictionary is installed ({detail}). The first launch downloads one and \
                  needs an internet connection."
             )));
         }
-        // Another dictionary works, but say what didn't.
-        notes.extend(
-            fetch_errors
-                .into_iter()
-                .map(|err| format!("Could not download {err}")),
-        );
         let enabled = self.enabled_ids(&found.dictionaries)?;
         let members = enabled
             .iter()
@@ -344,11 +482,13 @@ impl Shouci {
             .collect();
         let set = DictionarySet::open(members)?;
         let ranker = DeterministicRanker::new(set.priority());
-        Ok(Loaded {
-            search: SearchService::new(set, ranker),
-            enabled,
+        Ok((
+            Loaded {
+                search: SearchService::new(set, ranker),
+                enabled,
+            },
             notes,
-        })
+        ))
     }
 
     fn with_dictionary<T>(
@@ -372,4 +512,23 @@ impl Shouci {
             .ok_or_else(|| VocabError::not_found(format!("dictionary '{id}' has no file")))?;
         query(&SqliteDictionary::open(path)?)
     }
+}
+
+/// Indexes of the entries that are the saved word: same reading and same
+/// traditional form; or, when no entry has its traditional form (a word
+/// saved without one), the same reading alone.
+fn same_word(item: &VocabItem, entries: &[DictionaryEntry]) -> Vec<usize> {
+    let key = vocab_db::reading_key(&item.pinyin);
+    let reading: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| vocab_db::reading_key(&entry.pinyin) == key)
+        .map(|(index, _)| index)
+        .collect();
+    let exact: Vec<usize> = reading
+        .iter()
+        .copied()
+        .filter(|&index| entries[index].traditional == item.traditional)
+        .collect();
+    if exact.is_empty() { reading } else { exact }
 }

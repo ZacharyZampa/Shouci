@@ -167,6 +167,10 @@ pub struct VocabItem {
     pub source: ItemSource,
     pub created_at: String,
     pub modified_at: String,
+    /// Increases with every change to the word, its tags, or its
+    /// collections. Compare it to tell whether a word changed since it was
+    /// read.
+    pub rev: i64,
 }
 
 impl VocabItem {
@@ -239,13 +243,17 @@ impl FromStr for LibraryView {
 }
 
 /// Narrows a library listing, search, or export. Every condition must hold.
+/// Every field is optional in JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct LibraryFilter {
     pub view: LibraryView,
     pub verification: Option<Verification>,
     /// Items carrying every one of these tags.
-    #[cfg_attr(feature = "serde", serde(default))]
     pub tags: Vec<String>,
     pub collection: Option<String>,
 }
@@ -268,6 +276,7 @@ mod tests {
             source: ItemSource::manual(),
             created_at: String::new(),
             modified_at: String::new(),
+            rev: 1,
         }
     }
 

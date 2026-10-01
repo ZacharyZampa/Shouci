@@ -35,13 +35,13 @@ use vocab_core::{Result, VocabError};
 pub struct TransferSummary {
     pub connector_id: String,
     pub path: String,
-    pub inserted: usize,
-    pub updated: usize,
-    pub skipped: usize,
-    pub dropped: usize,
+    pub inserted: u32,
+    pub updated: u32,
+    pub skipped: u32,
+    pub dropped: u32,
     /// Imported but marked needs review.
-    pub unresolved: usize,
-    pub written: usize,
+    pub unresolved: u32,
+    pub written: u32,
     /// The import was refused because of error lines; nothing was imported.
     pub refused: bool,
     pub notes: Vec<String>,
@@ -56,6 +56,17 @@ pub fn content_hash(bytes: &[u8]) -> String {
 
 pub(crate) fn reading_key(pinyin: &str) -> String {
     vocab_db::reading_key(pinyin)
+}
+
+/// A count for the API (counts never come near `u32::MAX`).
+pub(crate) fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Files from Windows editors often start with a UTF-8 byte-order mark;
+/// connectors never see it.
+pub(crate) fn strip_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
 }
 
 /// Writes next to the target, then renames over it: a reader never sees half

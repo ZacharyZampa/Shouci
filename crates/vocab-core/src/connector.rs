@@ -6,14 +6,21 @@
 //! that depends on `vocab-core` alone, plus one registration line in
 //! `shouci-core`.
 //!
+//! The engine hands [`Connector::parse`] text-ready bytes: a UTF-8 byte-order
+//! mark is already removed. Line endings may still be `\r\n`; use
+//! [`str::lines`].
+//!
+//! Every type here is `#[non_exhaustive]` so fields can be added without
+//! breaking connectors: build them with their constructors, then set fields.
+//!
 //! The contract is file-based on purpose. A live connector (an API, a sync
 //! service) would be a different trait.
 
 use crate::Result;
 
 /// A field a record may or may not carry. `Omitted` means "this file says
-/// nothing about it", which is different from an empty value: an omitted
-/// field never overwrites saved data or counts as a conflict.
+/// nothing about it". Blank text means the same thing: a file cannot clear a
+/// saved definition by leaving a cell empty. Use [`Field::text`] to read text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Field<T> {
     Present(T),
@@ -45,6 +52,12 @@ impl Field<String> {
     }
 }
 
+/// A 1-based line number from a 0-based index.
+#[must_use]
+pub fn line_number(index: usize) -> u32 {
+    u32::try_from(index + 1).unwrap_or(u32::MAX)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "serde",
@@ -73,18 +86,42 @@ impl Severity {
 /// Something noteworthy about one line of a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct Issue {
     /// 1-based.
-    pub line: usize,
+    pub line: u32,
     pub severity: Severity,
     pub message: String,
 }
 
+impl Issue {
+    pub fn new(line: u32, severity: Severity, message: impl Into<String>) -> Self {
+        Self {
+            line,
+            severity,
+            message: message.into(),
+        }
+    }
+
+    pub fn info(line: u32, message: impl Into<String>) -> Self {
+        Self::new(line, Severity::Info, message)
+    }
+
+    pub fn warning(line: u32, message: impl Into<String>) -> Self {
+        Self::new(line, Severity::Warning, message)
+    }
+
+    pub fn error(line: u32, message: impl Into<String>) -> Self {
+        Self::new(line, Severity::Error, message)
+    }
+}
+
 /// One word read from a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExchangeRecord {
     /// 1-based line in the file.
-    pub line: usize,
+    pub line: u32,
     /// The line as written, for audit and error messages.
     pub raw: String,
     /// The word as the file writes it; usually simplified.
@@ -93,15 +130,18 @@ pub struct ExchangeRecord {
     pub pinyin: Field<String>,
     pub definition: Field<String>,
     pub notes: Field<String>,
+    /// Tags the word has in the file. The engine only ever adds tags.
     pub tags: Field<Vec<String>>,
-    /// Pleco categories, an Anki deck.
+    /// Pleco categories, an Anki deck. The engine only ever adds
+    /// collections: formats keep one per word, so a file never says a word
+    /// left one.
     pub collections: Field<Vec<String>>,
 }
 
 impl ExchangeRecord {
     /// A record with every optional field omitted.
     #[must_use]
-    pub fn new(line: usize, raw: impl Into<String>, headword: impl Into<String>) -> Self {
+    pub fn new(line: u32, raw: impl Into<String>, headword: impl Into<String>) -> Self {
         Self {
             line,
             raw: raw.into(),
@@ -119,12 +159,18 @@ impl ExchangeRecord {
 /// Everything read from one file. Lines that could not be read become
 /// [`Issue`]s, never silent drops.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ParsedRecords {
     pub records: Vec<ExchangeRecord>,
     pub issues: Vec<Issue>,
 }
 
 impl ParsedRecords {
+    #[must_use]
+    pub fn new(records: Vec<ExchangeRecord>, issues: Vec<Issue>) -> Self {
+        Self { records, issues }
+    }
+
     #[must_use]
     pub fn has_errors(&self) -> bool {
         self.issues
@@ -135,9 +181,11 @@ impl ParsedRecords {
 
 /// One saved word on its way out.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExportRecord {
     pub simplified: String,
     pub traditional: String,
+    /// CC-CEDICT numbered pinyin, when known.
     pub pinyin: String,
     pub definition: String,
     pub notes: String,
@@ -148,22 +196,54 @@ pub struct ExportRecord {
     pub collections: Vec<String>,
 }
 
+impl ExportRecord {
+    #[must_use]
+    pub fn new(
+        simplified: impl Into<String>,
+        traditional: impl Into<String>,
+        pinyin: impl Into<String>,
+        definition: impl Into<String>,
+    ) -> Self {
+        Self {
+            simplified: simplified.into(),
+            traditional: traditional.into(),
+            pinyin: pinyin.into(),
+            definition: definition.into(),
+            notes: String::new(),
+            definition_is_dictionary_default: false,
+            tags: Vec::new(),
+            collections: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct WriteOptions {
     /// Set when the export is exactly one collection.
     pub collection: Option<String>,
-    /// Anki deck name; defaults to the collection, then "Shouci".
+    /// Anki deck name. Without it (and without a collection), no deck is
+    /// written and Anki asks.
     pub deck: Option<String>,
 }
 
 /// The bytes to write, plus notes on what the format could not carry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Written {
     pub bytes: Vec<u8>,
     pub notes: Vec<String>,
 }
 
+impl Written {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>, notes: Vec<String>) -> Self {
+        Self { bytes, notes }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnectorInfo {
     /// The destination key, stable across format versions: `pleco`.
     /// "Export only new words" is tracked per id.
@@ -174,6 +254,27 @@ pub struct ConnectorInfo {
     pub extensions: &'static [&'static str],
     pub can_import: bool,
     pub can_export: bool,
+}
+
+impl ConnectorInfo {
+    /// A connector that imports and exports `.txt` files.
+    #[must_use]
+    pub fn new(id: &'static str, name: &'static str, format: &'static str) -> Self {
+        Self {
+            id,
+            name,
+            format,
+            extensions: &["txt"],
+            can_import: true,
+            can_export: true,
+        }
+    }
+
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: &'static [&'static str]) -> Self {
+        self.extensions = extensions;
+        self
+    }
 }
 
 pub trait Connector: Send + Sync {
@@ -187,7 +288,8 @@ pub trait Connector: Send + Sync {
     /// UTF-8, wrong separator).
     fn parse(&self, bytes: &[u8]) -> Result<ParsedRecords>;
 
-    /// Writes records in the order given.
+    /// Writes records. A format may group them (Pleco writes each category
+    /// once).
     ///
     /// # Errors
     ///
@@ -197,7 +299,7 @@ pub trait Connector: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExchangeRecord, Field};
+    use super::{ExchangeRecord, Field, line_number};
 
     #[test]
     fn new_records_omit_everything_optional() {
@@ -211,5 +313,10 @@ mod tests {
         assert_eq!(Field::Present("  ".to_owned()).text(), None);
         assert_eq!(Field::Present(" hi ".to_owned()).text(), Some("hi"));
         assert_eq!(Field::<String>::Omitted.text(), None);
+    }
+
+    #[test]
+    fn line_numbers_are_one_based() {
+        assert_eq!(line_number(0), 1);
     }
 }
