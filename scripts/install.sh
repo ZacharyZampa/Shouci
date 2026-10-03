@@ -1,131 +1,134 @@
 #!/usr/bin/env bash
-# Build and install the `shouci` CLI, `shouci-tui`, and Shouci on macOS.
+# Build and install Shouci for Mac from this checkout.
 #
-#   scripts/install.sh              install
-#   scripts/install.sh --status     show install state
-#   scripts/install.sh --uninstall  stop Shouci and remove leftover agent
+#   scripts/install.sh              install, or update after `git pull`
+#   scripts/install.sh --status     show what is installed and where
+#   scripts/install.sh --uninstall  remove the app (your words stay)
+#
+# The CLI and TUI are moving onto the new core and are not built here yet.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OLD_AGENT_LABEL="com.plecocompanion.agent"
-BIN_DIR="${HOME}/.local/bin"
-APP_SUPPORT="${HOME}/Library/Application Support/pleco-companion"
-OLD_AGENT_PLIST="${HOME}/Library/LaunchAgents/${OLD_AGENT_LABEL}.plist"
-CLI_BIN="${BIN_DIR}/shouci"
-TUI_BIN="${BIN_DIR}/shouci-tui"
 MACAPP="${HOME}/Applications/Shouci.app"
-CARGO_BIN="${HOME}/.cargo/bin"
-DICT="${APP_SUPPORT}/dictionary.db"
+# Where the app keeps its data; overridable the same way the app's is.
+DATA_DIR="${SHOUCI_HOME:-${HOME}/Library/Application Support/Shouci}"
+DICTIONARIES="${SHOUCI_DICTIONARIES:-${DATA_DIR}/dictionaries}"
+LOGIN_AGENT="${HOME}/Library/LaunchAgents/com.zacharyzampa.shouci.plist"
+OLD_AGENT_LABEL="com.plecocompanion.agent"
+OLD_AGENT_PLIST="${HOME}/Library/LaunchAgents/${OLD_AGENT_LABEL}.plist"
+OLD_DATA="${HOME}/Library/Application Support/pleco-companion"
 
 platform_check() {
-  local os
-  os="$(uname -s)"
-  if [ "${os}" != "Darwin" ]; then
-    echo "error: this script is macOS-only (Shouci uses AppKit)" >&2
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "error: Shouci for Mac needs macOS 14 or later" >&2
     exit 1
   fi
 }
 
-source_db() {
-  local cand
-  for cand in "${ROOT}/data/dictionary/dictionary.db" \
-    "${ROOT}/data/dictionary/sources/dictionary.db"; do
-    if [ -f "${cand}" ]; then
-      printf '%s' "${cand}"
-      return 0
-    fi
-  done
-  return 1
+prerequisites() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: Rust is not installed. Install it from https://rustup.rs, then run this again." >&2
+    exit 1
+  fi
+  if ! xcodebuild -version >/dev/null 2>&1; then
+    echo "error: Xcode is needed (free from the App Store; the Command Line Tools alone are not enough)." >&2
+    echo "       After installing it, run:" >&2
+    echo "         sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
+    exit 1
+  fi
+}
+
+quit_shouci() {
+  if pgrep -x Shouci >/dev/null 2>&1; then
+    echo "==> quitting the running Shouci"
+    pkill -x Shouci || true
+    for _ in $(seq 1 20); do
+      pgrep -x Shouci >/dev/null 2>&1 || break
+      sleep 0.25
+    done
+  fi
 }
 
 remove_legacy_agent() {
   launchctl bootout "gui/$(id -u)/${OLD_AGENT_LABEL}" >/dev/null 2>&1 || true
   pkill -x vocab-agent 2>/dev/null || true
-  rm -f "${OLD_AGENT_PLIST}" "${BIN_DIR}/vocab-agent" "${CARGO_BIN}/vocab-agent"
+  rm -f "${OLD_AGENT_PLIST}" "${HOME}/.local/bin/vocab-agent" "${HOME}/.cargo/bin/vocab-agent"
 }
 
 status() {
   if [ -d "${MACAPP}" ]; then
-    echo "menubar: ${MACAPP} installed"
+    local version
+    version="$(defaults read "${MACAPP}/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "?")"
+    echo "app:          ${MACAPP} (version ${version})"
   else
-    echo "menubar: not installed"
+    echo "app:          not installed"
   fi
   if pgrep -x Shouci >/dev/null 2>&1; then
-    echo "menubar: running (pid $(pgrep -x Shouci | tr '\n' ' '))"
+    echo "running:      yes (pid $(pgrep -x Shouci | tr '\n' ' '))"
   else
-    echo "menubar: not running"
+    echo "running:      no"
   fi
-  if [ -x "${CLI_BIN}" ]; then
-    echo "cli: ${CLI_BIN}"
+  if [ -f "${DATA_DIR}/user.db" ]; then
+    echo "your words:   ${DATA_DIR}/user.db"
   else
-    echo "cli: not installed"
+    echo "your words:   none yet (created on first launch)"
   fi
-  if [ -x "${TUI_BIN}" ]; then
-    echo "tui: ${TUI_BIN}"
+  if [ -f "${DICTIONARIES}/cc-cedict.db" ]; then
+    echo "dictionary:   ${DICTIONARIES}/cc-cedict.db"
   else
-    echo "tui: not installed"
+    echo "dictionary:   not built yet (downloaded on install or first launch)"
   fi
-  if pgrep -x vocab-agent >/dev/null 2>&1 || [ -f "${OLD_AGENT_PLIST}" ]; then
-    echo "legacy agent: still present — run --uninstall or reinstall to remove"
+  if [ -f "${LOGIN_AGENT}" ]; then
+    echo "at login:     opens Shouci"
+  fi
+  if [ -f "${OLD_DATA}/user.db" ]; then
+    echo "older words:  ${OLD_DATA}/user.db (copied into the new library on first launch; left in place)"
   fi
 }
 
 do_uninstall() {
-  echo "==> removing leftover capture agent"
-  remove_legacy_agent
-  echo "removing menu-bar app"
-  pkill -x Shouci 2>/dev/null || true
+  quit_shouci
+  echo "==> removing ${MACAPP}"
   rm -rf "${MACAPP}"
-  echo "removing PATH symlinks"
-  for bin in shouci shouci-tui; do
-    rm -f "${CARGO_BIN}/${bin}"
-  done
-  echo "note: left ${BIN_DIR} binaries and ${APP_SUPPORT} data in place; delete them manually if desired."
-  echo "done."
+  rm -f "${LOGIN_AGENT}"
+  remove_legacy_agent
+  echo
+  echo "Shouci is removed. Your words and dictionary are still in:"
+  echo "  ${DATA_DIR}"
+  echo "Delete that folder to remove them too."
 }
 
 do_install() {
-  echo "==> dictionary (CC-CEDICT + frequency + HSK)"
-  cargo run -p vocab-dictionary --example ensure -- "${ROOT}/data/dictionary/dictionary.db"
+  prerequisites
 
-  echo "==> building release binaries"
-  cargo build --release -p shouci-cli -p shouci-tui -p shouci-mac
+  echo "==> dictionary (CC-CEDICT with word frequency and HSK levels)"
+  mkdir -p "${DICTIONARIES}"
+  (cd "${ROOT}" && cargo run -q --release -p vocab-dictionary --example ensure -- \
+    "${DICTIONARIES}/cc-cedict.db")
 
-  local dict
-  dict="$(source_db)" || {
-    echo "error: dictionary ingest did not produce data/dictionary/dictionary.db" >&2
-    exit 1
-  }
+  echo "==> building Shouci (Apple silicon and Intel; the first build takes a few minutes)"
+  local stage
+  stage="$(mktemp -d)"
+  trap 'rm -rf "${stage}"' RETURN
+  "${ROOT}/macos/scripts/package.sh" "${stage}/Shouci.app"
 
-  mkdir -p "${BIN_DIR}" "${APP_SUPPORT}"
-
-  echo "==> installing binaries to ${BIN_DIR}"
-  install -m 0755 "${ROOT}/target/release/shouci" "${CLI_BIN}"
-  install -m 0755 "${ROOT}/target/release/shouci-tui" "${TUI_BIN}"
-
-  echo "==> linking binaries onto PATH (${CARGO_BIN})"
-  mkdir -p "${CARGO_BIN}"
-  for bin in shouci shouci-tui; do
-    ln -sfn "${BIN_DIR}/${bin}" "${CARGO_BIN}/${bin}"
-  done
-
-  echo "==> installing dictionary to ${DICT}"
-  install -m 0644 "${dict}" "${DICT}"
-
-  echo "==> packaging menu-bar app to ${MACAPP}"
-  "${ROOT}/crates/shouci-mac/package.sh" "${MACAPP}"
-  echo "note: if Shouci was running it was replaced on disk; relaunch it from ${MACAPP}"
-
-  echo "==> removing leftover capture agent"
+  quit_shouci
+  echo "==> installing to ${MACAPP}"
+  mkdir -p "$(dirname "${MACAPP}")"
+  rm -rf "${MACAPP}"
+  ditto "${stage}/Shouci.app" "${MACAPP}"
   remove_legacy_agent
 
+  echo "==> starting Shouci"
+  open "${MACAPP}"
+
   echo
-  echo "done."
+  echo "Done. Look for 文 in the menu bar."
   echo
-  echo "quick:   press ctrl+opt+v anywhere (Shouci)"
-  echo "list:    ${CLI_BIN} list"
-  echo "tui:     ${TUI_BIN}"
-  echo "remove:  ${0} --uninstall"
+  echo "  Quick search:  Control-Option-V from any app (change it in Settings)"
+  echo "  Your library:  Command-O in quick search, or open Shouci from Spotlight"
+  echo "  Update later:  git pull && ${0}"
+  echo "  Remove:        ${0} --uninstall"
 }
 
 platform_check

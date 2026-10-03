@@ -1,91 +1,159 @@
 # Shouci (收词)
 
-Keyboard-first macOS tools for collecting Chinese vocabulary.
+Collect Chinese vocabulary without leaving what you're doing. Press a
+shortcut, type English, pinyin, or characters, pick the word, press Return.
+Later, study the words in Pleco or Anki.
 
-Fully free and open source. With a promise of no user info collection.
+Free and open source (MIT). Your words stay on your Mac: Shouci has no
+account and goes online only to download its dictionary.
 
-Want to help? [CONTRIBUTING.md](CONTRIBUTING.md). Architecture: [DEV.md](DEV.md).
-
-Two databases: read-only `dictionary.db`, writable `user.db`.
-
-## Screenshots
-
-### Menu Bar
-<img width="404" height="390" alt="Mac Menu Bar" src="https://github.com/user-attachments/assets/99d94816-abf5-4eda-96c9-aa80fdaac3dc" />
-
-
-### TUI
-<img width="1053" height="866" alt="TUI Saved List" src="https://github.com/user-attachments/assets/7092da99-9401-4afc-a540-722a333b5952" />
-<img width="1063" height="867" alt="TUI Search" src="https://github.com/user-attachments/assets/fa5752dd-e011-4687-b0dc-afbdd452afcc" />
-
-
+Want to help? [CONTRIBUTING.md](CONTRIBUTING.md). How it's built:
+[DEV.md](DEV.md) and [macos/README.md](macos/README.md).
 
 ## Install (macOS)
 
-Needs a Rust toolchain and network on first dictionary fetch. Shouci is
-unsigned — if Gatekeeper blocks it, right-click → Open.
+You need:
+
+- macOS 14 or later
+- **Xcode**, free from the App Store. The Command Line Tools alone are not
+  enough. After installing it, run once:
+  `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
+- **Rust**, from [rustup.rs](https://rustup.rs)
+- An internet connection the first time, to download the dictionary
+
+Then:
 
 ```sh
-./scripts/install.sh              # fetches CC-CEDICT + frequency + HSK, then CLI/TUI/Shouci
-./scripts/install.sh --status
-./scripts/install.sh --uninstall
+git clone https://github.com/ZacharyZampa/Shouci.git
+cd Shouci
+./scripts/install.sh
 ```
 
-Binaries go to `~/.local/bin` (symlinked on `~/.cargo/bin`). Dictionary and
-`user.db` live in `~/Library/Application Support/pleco-companion/`.
+This downloads and builds the dictionary, builds Shouci for Apple silicon and
+Intel, installs it to `~/Applications/Shouci.app`, and starts it. Look for
+**文** in the menu bar.
 
-| App | How |
+Shouci is built on your Mac and signed to run locally, so Gatekeeper doesn't
+ask about it. (There is no paid Apple developer account behind it, so a copy
+downloaded from elsewhere is blocked the first time: allow it in System
+Settings › Privacy & Security › Open Anyway.)
+
+| | |
 | --- | --- |
-| Shouci | **Ctrl+Opt+V** or left-click 文. Right-click 文 for Settings / Quit |
-| TUI | `shouci-tui` |
-| CLI | `vocab search` / `add` / `list` / `import` / `export` |
+| Update | `git pull && ./scripts/install.sh` |
+| See what's installed | `./scripts/install.sh --status` |
+| Uninstall | `./scripts/install.sh --uninstall` (your words stay; see below) |
 
-## Daily use
+**Coming from the proof of concept?** On first launch Shouci copies your
+words from `~/Library/Application Support/pleco-companion/` into its new
+library. The old folder is left as it was.
 
-**Shouci** — type English, pinyin, or Chinese; live hits; **Enter** saves,
-**Esc** dismisses. Right-click a row to save, mark needs-review, archive, or
-delete. Settings: rebind the hotkey, Open at Login.
+## Using Shouci
 
-**TUI** — `F1` saved list, `F2` search (`Shift+Tab` toggles). Search: type to
-search, `Tab` cycles pinyin/english/chinese, **Enter** saves, **Esc** clears
-(quits when empty), `PgUp`/`PgDn` scroll detail. Saved: `Tab` filters status,
-`Ctrl+R` reloads, `d` deletes the selection. `Ctrl+Q` quits.
+### Quick search
 
-**CLI**
+Press **Control-Option-V** anywhere (or click 文). The app you were in stays
+in front; Shouci gets out of the way when you're done.
+
+- Type **English** (`to travel`), **pinyin** (`lvxing`, `lǚ xíng`, `lv3xing2`),
+  or **characters** (`旅行`). Shouci works out which; the chip beside the
+  field shows how it read your search, and its menu changes it.
+- **↑ ↓** choose, **Return** saves, **⌘Z** takes the save back, **Esc**
+  closes. **⌘O** opens your library.
+- Words you already have are marked **Saved**.
+- No dictionary entry? Save the characters as **needs review** and fill in
+  the reading and meaning later. Shouci also shows the dictionary words found
+  inside what you typed (`蚌埠住了` → 蚌埠, 住, 了).
+
+### Your library
+
+Open it with **⌘O** in quick search, right-click 文 › Open Shouci, or open
+Shouci from Spotlight. While it's open, Shouci has a Dock icon and menus.
+
+- Browse **All Vocabulary**, **Needs Review**, **Recently Added**,
+  **Archived**, and the **Trash**, or a collection or tag.
+- Search the toolbar field to find saved words and **add** new ones from the
+  dictionary.
+- Select a word to see your entry next to the dictionary's; **Edit** (or
+  Return, or double-click) changes it. **Add Word** (⌘N) adds one by hand.
+- Select several words (⌘-click, ⇧-click) to tag them, add them to a
+  collection, mark them for review, archive them, export them, or move them
+  to the Trash.
+
+### Pleco and Anki
+
+Shouci moves words in and out as plain-text files.
+
+- **Import** (⇧⌘I): export from Pleco (Import/Export › Export Cards) or Anki
+  (File › Export › Notes in Plain Text), then choose the file. Shouci detects
+  the format and shows what each line would do before anything changes. For
+  words you already have, choose Skip, Merge, or Overwrite.
+- **Export** (⇧⌘E): choose Pleco or Anki and which words (new since the last
+  export, everything, the selection, or the current view). The file goes to
+  Downloads unless you choose another place. Then import it in Anki (File ›
+  Import) or Pleco (Import/Export › Import Cards).
+
+Shouci never writes over a file it imported from.
+
+### Settings
+
+Right-click 文 › Settings, or ⌘, in Shouci.
+
+- **General:** the shortcut, showing 文 in the menu bar, what quick search
+  does after a save, tone marks or tone numbers, traditional characters in
+  lists, and opening at login.
+- **Dictionaries:** which dictionaries search uses, and checking for a new
+  one.
+- **Data:** where your words are kept, import and export, and bringing words
+  over from an older library.
+
+## Where your data is
+
+| What | Where |
+| --- | --- |
+| Your words | `~/Library/Application Support/Shouci/user.db` |
+| The dictionary | `~/Library/Application Support/Shouci/dictionaries/` |
+| Open at login | `~/Library/LaunchAgents/com.zacharyzampa.shouci.plist` (only if turned on) |
+
+Uninstalling removes the app and the login item; delete
+`~/Library/Application Support/Shouci` to remove your words too. Shouci logs
+errors to the system log and never logs what you search.
+
+## The dictionary
+
+[CC-CEDICT](https://www.mdbg.net/chinese/dictionary?page=cc-cedict)
+(CC BY-SA 4.0), with OpenSubtitles word frequency and HSK 3.0 levels. Shouci
+checks for a new version once a month; if the download fails, it keeps the
+copy it has.
+
+Results come in a fixed order, so the same search always gives the same list:
+how well the word matches (an exact meaning first, then a meaning that starts
+with your words, then the rest), then how early that meaning comes in the
+entry, then how common the word is.
+
+To rebuild it from scratch:
 
 ```sh
-vocab search auto jingzi
-vocab search english school --format json --limit 5
-vocab search pinyin "lǚ xíng"
-vocab add 学校 --mode chinese
-vocab list --status needs_review
-vocab delete 学校
-vocab delete 12
-vocab import fixtures/pleco/v1/valid/categories.txt
-vocab export /tmp/pleco-export.txt
+cargo run --release -p vocab-dictionary --example ensure -- --force \
+  ~/Library/Application\ Support/Shouci/dictionaries/cc-cedict.db
 ```
 
-`vocab add`: one strong match → save confirmed; none → save `needs_review`;
-several → save nothing and list candidates.
+## CLI and TUI
 
-## Dictionary
+The command-line tool (`shouci`) and the terminal UI (`shouci-tui`) are
+moving onto the new core and are not built from this branch yet. The proof-of-
+concept versions are on `main`.
 
-If `dictionary.db` is missing, the apps download CC-CEDICT, OpenSubtitles
-frequency, and HSK 3.0 on first launch (needs network). After that they
-refresh when the calendar month changes; a failed refresh keeps the current
-file. Same first fetch runs from `./scripts/install.sh`. CC-CEDICT is
-CC BY-SA 4.0 ([MDBG](https://www.mdbg.net/chinese/dictionary?page=cc-cedict)).
-Force a rebuild with
-`cargo run -p vocab-dictionary --example ensure -- --force`.
+<img width="1053" height="866" alt="TUI Saved List" src="https://github.com/user-attachments/assets/7092da99-9401-4afc-a540-722a333b5952" />
 
-Search ranks match quality first, then frequency, then HSK, then entry id.
-Same query always yields the same order.
+## Build and test
 
-Dictionary path if `--dictionary` is omitted: `VOCAB_DICTIONARY` →
-`data/dictionary/dictionary.db` (current directory or parents) → app-data
-`dictionary.db`.
+```sh
+./scripts/check.sh                       # Rust: format, lint, all tests
+macos/scripts/build-core.sh              # the Rust core for the Mac app
+open macos/Shouci.xcodeproj              # the Mac app in Xcode
+swift test --package-path macos/ShouciCore
+```
 
-## Build & test
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for issues, PRs, and test rules.
-
+More in [CONTRIBUTING.md](CONTRIBUTING.md) and
+[macos/README.md](macos/README.md).
