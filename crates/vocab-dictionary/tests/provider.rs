@@ -63,7 +63,7 @@ fn metadata_records_source_sha256() {
 fn english_search_returns_ranked_candidates() {
     let svc = service();
     let ranked = svc.search_english("cat").expect("search");
-    assert!(!ranked.is_empty());
+    assert_ne!(ranked, []);
     assert!(ranked[0].entry.simplified == "猫" || ranked[0].entry.simplified == "猫咪");
     assert!(ranked.iter().any(|c| c.entry.simplified == "猫"));
     assert!(ranked.iter().any(|c| c.entry.simplified == "猫咪"));

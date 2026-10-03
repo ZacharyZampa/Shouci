@@ -539,6 +539,6 @@ mod tests {
         let made = collection_from_tag(&conn, "lesson 1").unwrap();
         assert_eq!(made.count, 2);
         assert_eq!(collections(&conn).unwrap().len(), 1);
-        assert!(tags(&conn).unwrap().is_empty());
+        assert_eq!(tags(&conn).unwrap(), []);
     }
 }

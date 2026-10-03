@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn missing_directory_has_no_dictionaries() {
         let found = installed(std::path::Path::new("/nonexistent/shouci/dictionaries")).unwrap();
-        assert!(found.dictionaries.is_empty());
-        assert!(found.problems.is_empty());
+        assert_eq!(found.dictionaries, []);
+        assert_eq!(found.problems, [] as [String; 0]);
     }
 }

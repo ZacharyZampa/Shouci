@@ -46,7 +46,7 @@ fn tone_marked_pinyin_is_searched_as_pinyin() {
 #[test]
 fn nothing_found_reports_the_guess() {
     let found = service().search_auto("zzzqqq").unwrap();
-    assert!(found.candidates.is_empty());
+    assert_eq!(found.candidates, []);
     assert_eq!(found.kind, found.guessed);
 }
 

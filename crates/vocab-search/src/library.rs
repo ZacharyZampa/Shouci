@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn forced_kind_is_the_only_one_tried() {
-        assert!(heads("ma", Some(QueryKind::English)).is_empty());
+        assert_eq!(heads("ma", Some(QueryKind::English)), [] as [&str; 0]);
         assert_eq!(
             heads("school", Some(QueryKind::English)),
             vec!["学校", "学生"]
@@ -302,6 +302,6 @@ mod tests {
 
     #[test]
     fn blank_query_matches_nothing() {
-        assert!(heads("  ", None).is_empty());
+        assert_eq!(heads("  ", None), [] as [&str; 0]);
     }
 }

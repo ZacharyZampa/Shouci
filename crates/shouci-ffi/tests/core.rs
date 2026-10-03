@@ -60,7 +60,7 @@ fn kind(err: &ShouciError) -> ErrorKind {
 fn the_config_comes_back_as_given() {
     let lib = library();
     assert_eq!(lib.core.config(), config(&lib.dir));
-    assert!(!default_config().data_dir.is_empty());
+    assert_ne!(default_config().data_dir, "");
 }
 
 #[test]

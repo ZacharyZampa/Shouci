@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn empty_and_unsegmentable_input_returns_nothing() {
-        assert!(segment("   ").is_empty());
+        assert_eq!(segment("   "), [] as [String; 0]);
         assert_eq!(segment("qqqq"), Vec::<String>::new(), "no valid syllables");
     }
 

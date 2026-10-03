@@ -143,7 +143,7 @@ fn skip_leaves_saved_words_alone_and_reports_differences() {
     assert_eq!(summary.inserted, 1);
     assert_eq!(summary.skipped, 1);
     assert_eq!(find(&conn, "你好").definition, "hi there");
-    assert!(item_collections(&conn, id).unwrap().is_empty());
+    assert_eq!(item_collections(&conn, id).unwrap(), [] as [String; 0]);
     assert!(
         summary.notes.iter().any(|note| note.contains("kept")),
         "{:?}",
@@ -271,7 +271,7 @@ fn error_lines_refuse_the_import_unless_forced() {
     assert!(plan.refused);
     let summary = apply_import(&mut conn, &plan, &content_hash(text.as_bytes())).unwrap();
     assert!(summary.refused);
-    assert!(all(&conn).is_empty());
+    assert_eq!(all(&conn), []);
 
     let forced = plan_import(
         &conn,
@@ -432,7 +432,7 @@ fn needs_review_and_trash_stay_home() {
         &ExportRequest::default(),
     )
     .unwrap();
-    assert!(plan.item_ids.is_empty());
+    assert_eq!(plan.item_ids, []);
     assert_eq!(plan.left_out_needs_review, 1);
     let with_review = ExportRequest {
         include_needs_review: true,

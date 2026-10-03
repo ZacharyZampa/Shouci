@@ -83,7 +83,7 @@ fn quick_add_never_guesses_between_strong_matches() {
         heads.contains(&"旅途") && heads.contains(&"旅行"),
         "{heads:?}"
     );
-    assert!(shouci.list_items(&active()).unwrap().is_empty());
+    assert_eq!(shouci.list_items(&active()).unwrap(), []);
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn searching_before_the_dictionary_loads_says_so() {
         DictionaryStatus::Failed { .. }
     ));
     // The library itself works without a dictionary.
-    assert!(shouci.list_items(&active()).unwrap().is_empty());
+    assert_eq!(shouci.list_items(&active()).unwrap(), []);
 }
 
 // --- Manage ---------------------------------------------------------------
@@ -281,7 +281,7 @@ fn delete_moves_to_the_trash_then_purge_removes_for_good() {
     let shouci = sandbox();
     let id = saved(shouci.quick_add("学校", None).unwrap()).item.id;
     shouci.bulk(&[id], &BulkAction::Trash).unwrap();
-    assert!(heads(&shouci, &active()).is_empty());
+    assert_eq!(heads(&shouci, &active()), [] as [String; 0]);
     assert_eq!(heads(&shouci, &view(LibraryView::Trash)), vec!["学校"]);
     shouci.bulk(&[id], &BulkAction::Restore).unwrap();
     assert_eq!(heads(&shouci, &active()), vec!["学校"]);
@@ -295,7 +295,7 @@ fn archive_keeps_a_word_out_of_the_way() {
     let shouci = sandbox();
     let id = saved(shouci.quick_add("学校", None).unwrap()).item.id;
     shouci.bulk(&[id], &BulkAction::Archive).unwrap();
-    assert!(heads(&shouci, &active()).is_empty());
+    assert_eq!(heads(&shouci, &active()), [] as [String; 0]);
     assert_eq!(heads(&shouci, &view(LibraryView::Archived)), vec!["学校"]);
     assert_eq!(heads(&shouci, &view(LibraryView::All)), vec!["学校"]);
 }
@@ -347,7 +347,7 @@ fn collections_organize_words() {
         .unwrap();
     let made = shouci.collection_from_tag("week 2").unwrap();
     assert_eq!(made.count, 1);
-    assert!(shouci.tags().unwrap().is_empty());
+    assert_eq!(shouci.tags().unwrap(), []);
 }
 
 #[test]
@@ -400,12 +400,12 @@ fn dictionaries_can_be_enabled_ordered_and_viewed_side_by_side() {
         .unwrap();
     let found = shouci.search_dictionary("学生", None, None).unwrap();
     assert_eq!(found.candidates[0].dictionary, "alt");
-    assert!(
+    assert_eq!(
         shouci
             .search_dictionary("旅行", None, None)
             .unwrap()
-            .candidates
-            .is_empty()
+            .candidates,
+        []
     );
     // and a disabled dictionary can still be viewed
     assert_eq!(
@@ -472,7 +472,7 @@ fn import_export_new_then_merge_back() {
     let again = shouci
         .preview_export(&out, "pleco", &ExportRequest::default())
         .unwrap();
-    assert!(again.item_ids.is_empty());
+    assert_eq!(again.item_ids, [] as [i64; 0]);
 
     // Merging the exported file back changes nothing
     let merge = shouci
@@ -547,7 +547,7 @@ fn a_file_changed_after_the_preview_is_not_imported() {
     std::fs::write(&source, "学校\txue2 xiao4\tschool\n").unwrap();
     let err = shouci.apply_import(&plan).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Conflict);
-    assert!(shouci.list_items(&active()).unwrap().is_empty());
+    assert_eq!(shouci.list_items(&active()).unwrap(), []);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -628,7 +628,7 @@ fn proof_of_concept_words_come_over_on_first_open() {
     drop(shouci);
     // Opening again does not import again.
     let reopened = Shouci::open(config).unwrap();
-    assert!(reopened.startup_notes().is_empty());
+    assert_eq!(reopened.startup_notes(), [] as [String; 0]);
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(legacy);
 }
