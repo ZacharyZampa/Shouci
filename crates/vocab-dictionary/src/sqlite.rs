@@ -21,6 +21,46 @@ use crate::{
 
 const MAX_RETRIEVAL: usize = 2000;
 const BIND_CHUNK: usize = 400;
+/// Longest word looked for inside a Chinese query that is not a word.
+const MAX_CONTAINED_CHARS: usize = 8;
+
+/// Words so common in glosses that they find nothing by themselves: nearly
+/// every verb is written `to …`.
+const FILLER_WORDS: &[&str] = &["a", "an", "the", "to", "of"];
+
+/// A gloss that points at another entry instead of giving a meaning:
+/// `see 大夫[dai4 fu5]`, `variant of 着[zhe5]`, `used in 葡萄[pu2 tao5]`.
+#[must_use]
+pub fn is_cross_reference(gloss_lower: &str) -> bool {
+    const POINTERS: &[&str] = &[
+        "see ",
+        "variant of ",
+        "old variant of ",
+        "archaic variant of ",
+        "japanese variant of ",
+        "erhua variant of ",
+        "used in ",
+        "also written ",
+        "same as ",
+        "abbr. for ",
+        "abbr. of ",
+    ];
+    let gloss = gloss_lower.trim_start();
+    POINTERS.iter().any(|pointer| gloss.starts_with(pointer))
+}
+
+/// The words of an English query that say what it means: `to travel` is
+/// `travel`. A query of nothing but filler (`to`, `the`) keeps its words.
+#[must_use]
+pub fn english_terms(query: &str) -> Vec<String> {
+    let all = tokens(query);
+    let content: Vec<String> = all
+        .iter()
+        .filter(|token| !FILLER_WORDS.contains(&token.as_str()))
+        .cloned()
+        .collect();
+    if content.is_empty() { all } else { content }
+}
 
 /// Keep every exact-token/phrase gloss id, then fill with prefix/trigram
 /// hits up to [`MAX_RETRIEVAL`]. Truncating a mixed set by gloss id was
@@ -368,6 +408,47 @@ impl SqliteDictionary {
         Ok(out)
     }
 
+    /// The [`MAX_RETRIEVAL`] glosses most likely to define `query`, when
+    /// more match than that: glosses that start with it (or with `to` and
+    /// it), then the rest, cross-references last. Keeping the first ones by
+    /// id instead dropped the answer for a word as common as `see`.
+    fn most_promising(&self, ids: BTreeSet<i64>, query: &str) -> Result<BTreeSet<i64>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| VocabError::new("dictionary connection poisoned"))?;
+        let verb = format!("to {query}");
+        let mut scored: Vec<(u8, i64)> = Vec::with_capacity(ids.len());
+        let ids: Vec<i64> = ids.into_iter().collect();
+        for chunk in ids.chunks(BIND_CHUNK) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT gloss_id, gloss FROM dictionary_glosses WHERE gloss_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, gloss) = row?;
+                let gloss = gloss.to_lowercase();
+                let starts = gloss.starts_with(query) || gloss.starts_with(&verb);
+                let score: u8 = match (is_cross_reference(&gloss), starts) {
+                    (false, true) => 0,
+                    (false, false) => 1,
+                    (true, _) => 2,
+                };
+                scored.push((score, id));
+            }
+        }
+        scored.sort_unstable();
+        Ok(scored
+            .into_iter()
+            .take(MAX_RETRIEVAL)
+            .map(|(_, id)| id)
+            .collect())
+    }
+
     fn select_by_gloss_ids(
         &self,
         gloss_ids: &BTreeSet<i64>,
@@ -413,6 +494,71 @@ impl SqliteDictionary {
         Ok(candidates)
     }
 
+    /// Dictionary words inside `text`, covering all of it: every word of two
+    /// or more characters (`蚌埠` in `蚌埠住了`), then the single characters
+    /// none of those cover (`住`, `了`).
+    fn contained_words(&self, text: &str) -> Result<Vec<Candidate>> {
+        let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if chars.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let longest = MAX_CONTAINED_CHARS.min(chars.len() - 1);
+        let words: BTreeSet<String> = (2..=longest)
+            .flat_map(|len| chars.windows(len).map(|w| w.iter().collect::<String>()))
+            .collect();
+        let mut found = self.entries_with_headwords(&words)?;
+        let mut covered = vec![false; chars.len()];
+        for cand in &found {
+            for form in [&cand.entry.simplified, &cand.entry.traditional] {
+                let word: Vec<char> = form.chars().collect();
+                for start in 0..chars.len().saturating_sub(word.len() - 1) {
+                    if chars[start..start + word.len()] == word[..] {
+                        covered[start..start + word.len()].fill(true);
+                    }
+                }
+            }
+        }
+        let rest: BTreeSet<String> = chars
+            .iter()
+            .zip(&covered)
+            .filter(|(_, covered)| !**covered)
+            .map(|(c, _)| c.to_string())
+            .collect();
+        let known: BTreeSet<i64> = found.iter().map(|c| c.entry.entry_id).collect();
+        found.extend(
+            self.entries_with_headwords(&rest)?
+                .into_iter()
+                .filter(|cand| !known.contains(&cand.entry.entry_id)),
+        );
+        Ok(found)
+    }
+
+    fn entries_with_headwords(&self, words: &BTreeSet<String>) -> Result<Vec<Candidate>> {
+        let mut found = Vec::new();
+        let mut seen = BTreeSet::new();
+        let words: Vec<&String> = words.iter().collect();
+        for chunk in words.chunks(BIND_CHUNK / 2) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let params: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|w| (*w).clone().into()).collect();
+            let clauses = vec![
+                (format!("simplified IN ({placeholders})"), params.clone()),
+                (format!("traditional IN ({placeholders})"), params),
+            ];
+            for cand in self.select_entries_where(
+                &clauses,
+                MatchBasis::ContainedWord,
+                true,
+                ClauseJoin::Or,
+            )? {
+                if seen.insert(cand.entry.entry_id) {
+                    found.push(cand);
+                }
+            }
+        }
+        Ok(found)
+    }
+
     fn select_entries_where(
         &self,
         clauses: &[(String, Vec<rusqlite::types::Value>)],
@@ -440,6 +586,11 @@ impl DictionaryProvider for SqliteDictionary {
             return Ok(Vec::new());
         }
         let lowercase = query.to_lowercase();
+        // Exact: glosses with every word of the query (and the phrase
+        // itself). Extra, filled up to the cap: glosses with some of the
+        // words, or words starting with them. Matching any word was exact
+        // before, and `to` alone matches most verbs: the real answers were
+        // cut off before ranking.
         let mut exact_ids = BTreeSet::new();
         let mut extra_ids = BTreeSet::new();
         {
@@ -447,19 +598,28 @@ impl DictionaryProvider for SqliteDictionary {
                 .conn
                 .lock()
                 .map_err(|_| VocabError::new("dictionary connection poisoned"))?;
-            let tokens = tokens(&lowercase);
-            if !tokens.is_empty() {
-                let any = tokens
+            let terms = english_terms(&lowercase);
+            if !terms.is_empty() {
+                let quoted: Vec<String> = terms.iter().map(|term| fts_quote(term)).collect();
+                fts_match_ids(
+                    &conn,
+                    "english_fts_token",
+                    &quoted.join(" AND "),
+                    &mut exact_ids,
+                )?;
+                if terms.len() > 1 {
+                    fts_match_ids(
+                        &conn,
+                        "english_fts_token",
+                        &quoted.join(" OR "),
+                        &mut extra_ids,
+                    )?;
+                }
+                let prefix = terms
                     .iter()
-                    .map(|token| fts_quote(token))
+                    .map(|term| fts_term_prefix(term))
                     .collect::<Vec<_>>()
                     .join(" OR ");
-                let prefix = tokens
-                    .iter()
-                    .map(|t| fts_term_prefix(t))
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                fts_match_ids(&conn, "english_fts_token", &any, &mut exact_ids)?;
                 fts_match_ids(&conn, "english_fts_token", &prefix, &mut extra_ids)?;
             }
             if lowercase.chars().count() >= 3 {
@@ -476,6 +636,9 @@ impl DictionaryProvider for SqliteDictionary {
                     &mut extra_ids,
                 )?;
             }
+        }
+        if exact_ids.len() > MAX_RETRIEVAL {
+            exact_ids = self.most_promising(exact_ids, &lowercase)?;
         }
         self.select_by_gloss_ids(
             &prefer_exact_gloss_ids(exact_ids, extra_ids),
@@ -566,6 +729,16 @@ impl DictionaryProvider for SqliteDictionary {
         )? {
             if known.insert(cand.entry.entry_id) {
                 merged.push(cand);
+            }
+        }
+        let is_word = merged
+            .iter()
+            .any(|c| c.entry.simplified == text || c.entry.traditional == text);
+        if !is_word {
+            for cand in self.contained_words(text)? {
+                if known.insert(cand.entry.entry_id) {
+                    merged.push(cand);
+                }
             }
         }
         Ok(merged)

@@ -6,8 +6,8 @@ use std::path::Path;
 use shouci_core::testing::{empty_sandbox, install_dictionary, sandbox, scratch_dir};
 use shouci_core::{
     BulkAction, Config, DictionaryStatus, ErrorKind, ExportRequest, ExportScope, ImportAction,
-    ImportPolicy, ItemPatch, LibraryFilter, LibraryView, Lifecycle, ManualWord, QueryKind,
-    QuickAdd, SaveOutcome, Shouci, SourceKind, Verification,
+    ImportPolicy, ItemPatch, LibraryFilter, LibraryView, Lifecycle, ManualWord, MatchBasis,
+    QueryKind, QuickAdd, SaveOutcome, Shouci, SourceKind, Verification,
 };
 
 fn saved(found: QuickAdd) -> shouci_core::SaveResult {
@@ -93,6 +93,48 @@ fn quick_add_keeps_unknown_text_for_review() {
     assert_eq!(result.item.verification, Verification::NeedsReview);
     assert_eq!(result.item.simplified, "zzzqqq");
     assert_eq!(result.item.definition, "", "no invented definition");
+}
+
+#[test]
+fn text_that_is_not_a_word_shows_the_words_inside_it_but_is_kept_as_typed() {
+    let shouci = sandbox();
+    let found = shouci.search_dictionary("学校教师", None, None).unwrap();
+    let parts: Vec<&str> = found
+        .candidates
+        .iter()
+        .map(|c| c.simplified.as_str())
+        .collect();
+    assert_eq!(parts, ["学校", "教师"]);
+    assert!(
+        found
+            .candidates
+            .iter()
+            .all(|c| c.inferred && c.basis == MatchBasis::ContainedWord)
+    );
+    let sample = shouci.search_dictionary("猫喝水", None, None).unwrap();
+    let parts: Vec<&str> = sample
+        .candidates
+        .iter()
+        .map(|c| c.simplified.as_str())
+        .collect();
+    assert_eq!(parts, ["猫", "喝水"], "the parts, in reading order");
+
+    let picked = shouci.save_candidate(&found.candidates[0]).unwrap();
+    assert_eq!(picked.item.simplified, "学校");
+    assert_eq!(
+        picked.item.verification,
+        Verification::Confirmed,
+        "a word picked from inside the query is that word"
+    );
+    shouci.bulk(&[picked.item.id], &BulkAction::Trash).unwrap();
+    shouci.bulk(&[picked.item.id], &BulkAction::Purge).unwrap();
+
+    let result = saved(shouci.quick_add("学校教师", None).unwrap());
+    assert_eq!(
+        result.item.simplified, "学校教师",
+        "saved as typed, not as one of its parts"
+    );
+    assert_eq!(result.item.verification, Verification::NeedsReview);
 }
 
 #[test]

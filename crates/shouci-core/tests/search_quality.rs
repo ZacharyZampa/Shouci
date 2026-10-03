@@ -98,3 +98,54 @@ fn top1000_pinyin_and_hanzi_surface_with_automatic_search() {
 fn top50_surface_when_the_kind_is_given() {
     run(50, true, true);
 }
+
+/// Verbs are searched the way the dictionary writes them: every probe word
+/// with a `to <english>` sense surfaces for `to <english>`. (Retrieval used
+/// to keep the first 2000 glosses with any word of the query, and `to`
+/// alone filled them.)
+#[test]
+fn verbs_surface_when_searched_with_to() {
+    let shouci = shouci();
+    let mut checked = 0usize;
+    let mut misses = Vec::new();
+    for probe in load_search_probes() {
+        let Ok(entry) =
+            shouci.search_dictionary(&probe.simplified, Some(QueryKind::Chinese), Some(5))
+        else {
+            continue;
+        };
+        let verb = format!("to {}", probe.english.to_lowercase());
+        let is_verb = entry.candidates.iter().any(|c| {
+            c.simplified == probe.simplified && c.glosses.iter().any(|g| g.to_lowercase() == verb)
+        });
+        if !is_verb {
+            continue;
+        }
+        checked += 1;
+        let found = shouci
+            .search_dictionary(&verb, None, Some(POPOVER))
+            .expect("search");
+        if !found
+            .candidates
+            .iter()
+            .any(|c| c.simplified == probe.simplified)
+        {
+            let heads: Vec<&str> = found
+                .candidates
+                .iter()
+                .map(|c| c.simplified.as_str())
+                .collect();
+            misses.push(format!(
+                "{verb:?} expected {} in {heads:?}",
+                probe.simplified
+            ));
+        }
+    }
+    assert!(checked > 100, "only {checked} verb probes");
+    assert!(
+        misses.is_empty(),
+        "{} / {checked} missed:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
+}

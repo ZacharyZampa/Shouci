@@ -44,8 +44,8 @@ impl std::str::FromStr for QueryKind {
 /// The first guess for a query:
 ///
 /// - Chinese characters alone → [`QueryKind::Chinese`];
-/// - Chinese mixed with letters (`猫māo`), or letters with tone digits
-///   (`lv3`) → [`QueryKind::Pinyin`];
+/// - Chinese mixed with letters (`猫māo`), letters with tone digits
+///   (`lv3`), or letters with tone marks (`lǚ xíng`) → [`QueryKind::Pinyin`];
 /// - anything else → [`QueryKind::English`]. Untoned pinyin (`nihao`) is
 ///   indistinguishable from English here; searches fall through to pinyin.
 #[must_use]
@@ -54,7 +54,12 @@ pub fn detect(query: &str) -> QueryKind {
     let mut has_other_alpha = false;
     let mut has_digit = false;
     let mut has_latin = false;
+    let mut has_tone_mark = false;
     for c in query.chars() {
+        if "āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜĀÁǍÀĒÉĚÈĪÍǏÌŌÓǑÒŪÚǓÙǕǗǙǛ".contains(c)
+        {
+            has_tone_mark = true;
+        }
         if c.is_ascii_digit() {
             has_digit = true;
         } else if c.is_ascii_alphabetic() {
@@ -72,7 +77,7 @@ pub fn detect(query: &str) -> QueryKind {
         } else {
             QueryKind::Chinese
         }
-    } else if has_digit && has_latin {
+    } else if (has_digit && has_latin) || has_tone_mark {
         QueryKind::Pinyin
     } else {
         QueryKind::English
@@ -112,6 +117,8 @@ mod tests {
         assert_eq!(detect("to travel"), QueryKind::English);
         assert_eq!(detect("nihao"), QueryKind::English);
         assert_eq!(detect("猫māo"), QueryKind::Pinyin);
+        assert_eq!(detect("lǚ xíng"), QueryKind::Pinyin);
+        assert_eq!(detect("xué xiào"), QueryKind::Pinyin);
     }
 
     #[test]

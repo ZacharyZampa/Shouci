@@ -30,5 +30,6 @@ pub(crate) use ingest::{VALUE_FREQUENCY_RANK, VALUE_HSK_RANK};
 pub use provider::{Candidate, CandidateDiagnostic, DictionaryProvider};
 pub use set::DictionarySet;
 pub use sqlite::{
-    BuildStats, SqliteDictionary, build_dictionary_db, build_dictionary_db_with_layers, sha256_hex,
+    BuildStats, SqliteDictionary, build_dictionary_db, build_dictionary_db_with_layers,
+    english_terms, is_cross_reference, sha256_hex,
 };

@@ -37,6 +37,13 @@ fn chinese_is_looked_up_directly() {
 }
 
 #[test]
+fn tone_marked_pinyin_is_searched_as_pinyin() {
+    let found = service().search_auto("lǚ xíng").unwrap();
+    assert_eq!(found.kind, QueryKind::Pinyin);
+    assert_eq!(found.candidates[0].entry.simplified, "旅行");
+}
+
+#[test]
 fn nothing_found_reports_the_guess() {
     let found = service().search_auto("zzzqqq").unwrap();
     assert!(found.candidates.is_empty());

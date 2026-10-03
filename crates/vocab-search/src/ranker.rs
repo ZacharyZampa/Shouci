@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
+use vocab_core::MatchBasis;
 use vocab_core::SourceId;
-use vocab_dictionary::Candidate;
+use vocab_dictionary::{Candidate, english_terms, is_cross_reference};
 use vocab_pinyin::{NormalizedPinyin, normalize, segment};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,54 +116,76 @@ impl DeterministicRanker {
     fn english_key(&self, query: &str, cand: &Candidate) -> RankKey {
         let gloss = cand.entry.glosses.join(" ").to_lowercase();
         let query = query.trim().to_lowercase();
-        let query_tokens = tokens(&query);
+        let terms = english_terms(&query);
         let gloss_tokens = tokens(&gloss);
-
-        let coverage = if query_tokens.is_empty() {
-            0
-        } else {
-            let unique: BTreeSet<&str> = query_tokens.iter().map(String::as_str).collect();
-            let matched = unique
+        // One gloss can hold several senses: `to visit; to call on`. A
+        // pointer to another entry (`see 大夫[dai4 fu5]`) is not one.
+        let senses: Vec<String> = cand
+            .entry
+            .glosses
+            .iter()
+            .flat_map(|g| g.split(';'))
+            .map(|g| sense_core(&g.to_lowercase()))
+            .filter(|sense| !sense.is_empty() && !is_cross_reference(sense))
+            .collect();
+        // A verb's sense is written `to travel`; it starts with `travel` too.
+        let readings = || {
+            senses
                 .iter()
-                .filter(|t| gloss_tokens.iter().any(|g| g == *t))
-                .count();
-            matched * 100 / unique.len()
+                .flat_map(|sense| [Some(sense.as_str()), sense.strip_prefix("to ")])
+                .flatten()
         };
 
-        let gloss_word_prefix = !query.is_empty()
-            && cand.entry.glosses.iter().any(|g| {
-                let gl = g.to_lowercase();
-                gl == query
-                    || gl.starts_with(&format!("{query} "))
-                    || gl.starts_with(&format!("{query};"))
-                    || gl.starts_with(&format!("{query}("))
-            });
+        let matched = terms
+            .iter()
+            .filter(|term| gloss_tokens.iter().any(|g| g == *term))
+            .count();
+        let prefixed = terms
+            .iter()
+            .filter(|term| gloss_tokens.iter().any(|g| g.starts_with(term.as_str())))
+            .count();
+        let coverage = if terms.is_empty() {
+            0
+        } else {
+            matched * 100 / terms.len()
+        };
+        // Senses come most important first: among words that all have the
+        // query as a sense, the one whose first sense it is leads. A rare
+        // word gives up a place or two, so it does not lead a common word
+        // for having fewer senses.
+        let sense_position = senses
+            .iter()
+            .position(|sense| is_exact_sense(sense, &query))
+            .unwrap_or(0);
+        let rarity = match cand.entry.frequency_rank {
+            Some(rank) if rank <= 10_000 => 0,
+            Some(rank) if rank <= 50_000 => 1,
+            Some(_) => 2,
+            // No frequency at all: rare in modern Chinese.
+            None => 5,
+        };
 
         RankKey {
             exact_single_gloss: !query.is_empty()
-                && cand
-                    .entry
-                    .glosses
-                    .iter()
-                    .any(|g| is_exact_definition(&g.to_lowercase(), &query)),
-            gloss_prefix: !query.is_empty()
-                && cand
-                    .entry
-                    .glosses
-                    .iter()
-                    .any(|g| g.to_lowercase().starts_with(&query)),
-            gloss_word_prefix,
+                && senses.iter().any(|sense| is_exact_sense(sense, &query)),
+            gloss_prefix: !query.is_empty() && readings().any(|r| r.starts_with(&query)),
+            gloss_word_prefix: !query.is_empty()
+                && readings().any(|r| {
+                    r == query
+                        || r.starts_with(&format!("{query} "))
+                        || r.starts_with(&format!("{query};"))
+                        || r.starts_with(&format!("{query}("))
+                }),
             exact_phrase: !query.is_empty() && gloss.contains(&query),
-            exact_token: query_tokens
-                .iter()
-                .any(|t| gloss_tokens.iter().any(|g| g == t)),
-            prefix: query_tokens
-                .iter()
-                .any(|t| gloss_tokens.iter().any(|g| !g.eq(t) && g.starts_with(t))),
+            // Every word of the query, then every word at least as a prefix
+            // (`trav` in `travel`); a gloss sharing only some words ranks by
+            // how many.
+            exact_token: !terms.is_empty() && matched == terms.len(),
+            prefix: !terms.is_empty() && prefixed == terms.len(),
             undersized: false,
             pinyin_sequence: 0,
             token_coverage: coverage,
-            span: 0,
+            span: sense_position + rarity,
             exact_simplified: false,
             exact_traditional: false,
             tail: self.tail(cand),
@@ -203,6 +226,24 @@ impl DeterministicRanker {
 
     fn chinese_key(&self, query: &str, cand: &Candidate) -> RankKey {
         let query = query.trim();
+        // Below every real match: entries with all of the query's characters,
+        // then the words found inside it in reading order, the longer word
+        // first where two start together.
+        let (coverage, span) = match cand.diagnostic.basis {
+            MatchBasis::CharacterFallback => (1, 0),
+            MatchBasis::ContainedWord => {
+                let entry = &cand.entry;
+                let at = query
+                    .find(entry.simplified.as_str())
+                    .or_else(|| query.find(entry.traditional.as_str()))
+                    .map_or(usize::MAX / 64, |byte| query[..byte].chars().count());
+                (
+                    0,
+                    at * 32 + 32_usize.saturating_sub(entry.simplified.chars().count()),
+                )
+            }
+            _ => (0, 0),
+        };
         RankKey {
             exact_single_gloss: false,
             gloss_prefix: false,
@@ -210,10 +251,10 @@ impl DeterministicRanker {
             exact_phrase: false,
             exact_token: false,
             prefix: !query.is_empty() && cand.entry.simplified.starts_with(query),
-            undersized: false,
+            undersized: cand.diagnostic.is_inferred,
             pinyin_sequence: 0,
-            token_coverage: 0,
-            span: 0,
+            token_coverage: coverage,
+            span,
             exact_simplified: !query.is_empty() && cand.entry.simplified == query,
             exact_traditional: !query.is_empty() && cand.entry.traditional == query,
             tail: self.tail(cand),
@@ -282,14 +323,31 @@ pub fn english_has_lemma(query: &str, candidates: &[Candidate]) -> bool {
 }
 
 fn is_exact_definition(gloss_lower: &str, query_lower: &str) -> bool {
-    if query_lower.is_empty() {
-        return false;
+    is_exact_sense(&sense_core(gloss_lower), query_lower)
+}
+
+fn is_exact_sense(sense: &str, query_lower: &str) -> bool {
+    !query_lower.is_empty()
+        && (sense == query_lower
+            || sense
+                .strip_prefix("to ")
+                .is_some_and(|rest| rest == query_lower))
+}
+
+/// A lowercased gloss as a sense: classifier notes, a clarifying note
+/// (`hot (of weather)`), surrounding space, and closing punctuation
+/// (`what?`) are not part of the meaning. Register notes (`(slang)`,
+/// `(dialect)`) stay, so those senses rank below the plain word.
+fn sense_core(gloss_lower: &str) -> String {
+    let mut sense = strip_classifier_notes(gloss_lower);
+    for clarifier in [" (of ", " (e.g. ", " (esp. "] {
+        if let Some(start) = sense.find(clarifier) {
+            if let Some(end) = sense[start..].find(')') {
+                sense.replace_range(start..=start + end, "");
+            }
+        }
     }
-    let core = strip_classifier_notes(gloss_lower);
-    core == query_lower
-        || core
-            .strip_prefix("to ")
-            .is_some_and(|rest| rest == query_lower)
+    sense.trim_end_matches(['?', '!', '.']).trim().to_owned()
 }
 
 fn strip_classifier_notes(gloss: &str) -> String {
@@ -424,6 +482,193 @@ mod tests {
 
     fn ranker() -> DeterministicRanker {
         DeterministicRanker::default()
+    }
+
+    #[test]
+    fn english_filler_words_do_not_outrank_the_meaning() {
+        // 也 has `to` (and `too`, which starts with `to`) and is far more
+        // common; only 旅行社 is about travelling.
+        let also = cand(
+            1,
+            "也",
+            "也",
+            "ye3",
+            &["also", "too", "(used after a verb) to emphasize"],
+            Some(25),
+            "src",
+        );
+        let agency = cand(
+            2,
+            "旅行社",
+            "旅行社",
+            "lu:3 xing2 she4",
+            &["travel agency"],
+            Some(22_700),
+            "src",
+        );
+        let ranked = ranker().rank_english("to travel", vec![also, agency]);
+        assert_eq!(ranked[0].entry.simplified, "旅行社");
+    }
+
+    #[test]
+    fn english_verb_sense_starts_with_the_bare_word() {
+        // 旅行's sense is written `to travel`; it is as much a `travel`
+        // sense as 旅游's bare `travel`, and 旅行 is the more common word.
+        let tourism = cand(
+            1,
+            "旅游",
+            "旅遊",
+            "lu:3 you2",
+            &["trip", "travel", "to travel"],
+            Some(5893),
+            "src",
+        );
+        let travel = cand(
+            2,
+            "旅行",
+            "旅行",
+            "lu:3 xing2",
+            &["to travel", "journey"],
+            Some(1483),
+            "src",
+        );
+        let ranked = ranker().rank_english("travel", vec![tourism, travel]);
+        assert_eq!(ranked[0].entry.simplified, "旅行");
+    }
+
+    #[test]
+    fn english_first_sense_beats_a_later_one() {
+        // Senses are listed most important first.
+        let tour = cand(
+            1,
+            "参观",
+            "參觀",
+            "can1 guan1",
+            &["to look around", "to tour", "to visit"],
+            Some(100),
+            "src",
+        );
+        let visit = cand(
+            2,
+            "访问",
+            "訪問",
+            "fang3 wen4",
+            &["to visit", "to call on"],
+            Some(900),
+            "src",
+        );
+        let ranked = ranker().rank_english("visit", vec![tour, visit]);
+        assert_eq!(ranked[0].entry.simplified, "访问");
+    }
+
+    #[test]
+    fn english_question_mark_is_not_part_of_the_sense() {
+        let what = cand(
+            1,
+            "什么",
+            "什麼",
+            "shen2 me5",
+            &["what?", "something"],
+            Some(40),
+            "src",
+        );
+        let whatever = cand(
+            2,
+            "无论",
+            "無論",
+            "wu2 lun4",
+            &["no matter what"],
+            Some(900),
+            "src",
+        );
+        let ranked = ranker().rank_english("what", vec![whatever, what.clone()]);
+        assert_eq!(ranked[0].entry.simplified, "什么");
+        assert!(english_has_lemma("what", &[what]));
+    }
+
+    #[test]
+    fn english_one_gloss_can_hold_several_senses() {
+        // CC-CEDICT writes 访问's first gloss as one string.
+        let visit = cand(
+            1,
+            "访问",
+            "訪問",
+            "fang3 wen4",
+            &["to visit; to call on (a person or place)"],
+            Some(4125),
+            "src",
+        );
+        let stroll = cand(
+            2,
+            "逛",
+            "逛",
+            "guang4",
+            &["to stroll", "to visit"],
+            Some(3000),
+            "src",
+        );
+        let ranked = ranker().rank_english("visit", vec![stroll, visit]);
+        assert_eq!(ranked[0].entry.simplified, "访问");
+    }
+
+    #[test]
+    fn english_a_pointer_to_another_entry_is_not_a_sense() {
+        // `see 大夫` starts with the word `see`, but means nothing by itself.
+        let pointer = cand(
+            1,
+            "大",
+            "大",
+            "dai4",
+            &["see 大夫[dai4 fu5]"],
+            Some(10),
+            "src",
+        );
+        let seeing = cand(
+            2,
+            "眼见为实",
+            "眼見為實",
+            "yan3 jian4 wei2 shi2",
+            &["seeing is believing"],
+            Some(40_000),
+            "src",
+        );
+        let ranked = ranker().rank_english("see", vec![pointer, seeing]);
+        assert_eq!(ranked[0].entry.simplified, "眼见为实");
+    }
+
+    #[test]
+    fn english_clarifying_note_is_part_of_the_sense() {
+        // `hot (of weather)` is the plain meaning, so the common word is not
+        // beaten by a rare one that happens to say just `hot`.
+        let rare = cand(1, "暍", "暍", "he4", &["hot"], Some(40_000), "src");
+        let hot = cand(
+            2,
+            "热",
+            "熱",
+            "re4",
+            &["to warm up", "hot (of weather)"],
+            Some(500),
+            "src",
+        );
+        let ranked = ranker().rank_english("hot", vec![rare, hot]);
+        assert_eq!(ranked[0].entry.simplified, "热");
+    }
+
+    #[test]
+    fn english_a_word_with_no_frequency_does_not_lead() {
+        // 叕 has the sense first, but no frequency at all; 缺少 is common.
+        let rare = cand(1, "叕", "叕", "zhuo2", &["to lack"], None, "src");
+        let common = cand(
+            2,
+            "缺少",
+            "缺少",
+            "que1 shao3",
+            &["lack", "shortage of", "to lack"],
+            Some(2500),
+            "src",
+        );
+        let ranked = ranker().rank_english("to lack", vec![rare, common]);
+        assert_eq!(ranked[0].entry.simplified, "缺少");
     }
 
     #[test]

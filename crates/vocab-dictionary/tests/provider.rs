@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use vocab_core::MatchBasis;
@@ -191,6 +192,89 @@ fn chinese_single_char_prefixes_and_fallback_stay_distinct() {
         .expect("prefix matches present");
     assert_eq!(prefix_clean.diagnostic.basis, MatchBasis::Simplified);
     assert!(!prefix_clean.diagnostic.is_inferred);
+}
+
+#[test]
+fn every_word_of_an_english_query_is_retrieved_before_any_word() {
+    // More `to …` glosses than retrieval keeps, all listed before 旅行. A
+    // gloss with every word of the query must not be cut off by the ones
+    // that only share `to`.
+    let mut text = String::new();
+    for n in 0..2_500 {
+        writeln!(text, "字{n} 字{n} [zi4] /to do thing {n}/").expect("write");
+    }
+    text.push_str("旅行 旅行 [lu:3 xing2] /to travel/journey/\n");
+    let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+    build_dictionary_db(&mut conn, &CedictSource::default(), text.as_bytes()).expect("build");
+    let dict = SqliteDictionary::from_connection(conn).expect("open");
+    let found = dict.search_english("to travel").expect("search");
+    assert!(
+        found.iter().any(|c| c.entry.simplified == "旅行"),
+        "旅行 was cut off by {} entries that only share `to`",
+        found.len()
+    );
+}
+
+#[test]
+fn a_common_word_keeps_its_definitions_when_pointers_fill_the_cap() {
+    // Thousands of `see …` pointers share the word `see`; the entry that
+    // means it must survive the cap.
+    let mut text = String::new();
+    for n in 0..2_500 {
+        writeln!(text, "字{n} 字{n} [zi4] /see 词{n}[ci2]/").expect("write");
+    }
+    text.push_str("看見 看见 [kan4 jian4] /to see/to catch sight of/\n");
+    let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+    build_dictionary_db(&mut conn, &CedictSource::default(), text.as_bytes()).expect("build");
+    let dict = SqliteDictionary::from_connection(conn).expect("open");
+    let found = dict.search_english("see").expect("search");
+    assert!(
+        found.iter().any(|c| c.entry.simplified == "看见"),
+        "看见 was cut off by {} pointer entries",
+        found.len()
+    );
+}
+
+#[test]
+fn words_inside_a_chinese_query_that_is_not_a_word() {
+    let svc = service();
+    let found = svc.lookup_chinese("学校教师").expect("search");
+    let parts: Vec<&str> = found
+        .iter()
+        .filter(|c| c.diagnostic.basis == MatchBasis::ContainedWord)
+        .map(|c| c.entry.simplified.as_str())
+        .collect();
+    assert_eq!(parts, ["学校", "教师"], "longest first, in reading order");
+    assert!(
+        found.iter().all(|c| c.diagnostic.is_inferred),
+        "none of them is the query"
+    );
+
+    let characters = svc.lookup_chinese("猫水").expect("search");
+    let parts: Vec<&str> = characters
+        .iter()
+        .map(|c| c.entry.simplified.as_str())
+        .collect();
+    assert_eq!(
+        parts,
+        ["猫", "水"],
+        "single characters when no longer word fits"
+    );
+
+    let mixed = svc.lookup_chinese("猫喝水").expect("search");
+    let parts: Vec<&str> = mixed.iter().map(|c| c.entry.simplified.as_str()).collect();
+    assert!(
+        parts.contains(&"喝水") && parts.contains(&"猫"),
+        "{parts:?}"
+    );
+    assert!(!parts.contains(&"水"), "水 is covered by 喝水: {parts:?}");
+
+    let word = svc.lookup_chinese("学校").expect("search");
+    assert!(
+        word.iter()
+            .all(|c| c.diagnostic.basis != MatchBasis::ContainedWord),
+        "a word is not broken into parts"
+    );
 }
 
 #[test]

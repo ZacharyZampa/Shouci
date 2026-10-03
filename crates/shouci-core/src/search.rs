@@ -1,7 +1,9 @@
 //! Searching the dictionaries and the library, and saving words.
 
 use rusqlite::Connection;
-use vocab_core::{ItemSource, LibraryFilter, Result, SourceKind, Verification, VocabItem};
+use vocab_core::{
+    ItemSource, LibraryFilter, MatchBasis, Result, SourceKind, Verification, VocabItem,
+};
 use vocab_db::{NewItem, Saved};
 use vocab_dictionary::Candidate;
 use vocab_search::{LibraryDoc, QueryKind, match_library};
@@ -208,7 +210,10 @@ impl Shouci {
                 pinyin: candidate.pinyin.clone(),
                 definition: candidate.definition(),
                 notes: String::new(),
-                verification: if candidate.inferred {
+                // A word picked from the ones inside the query is that
+                // word, as the dictionary has it.
+                verification: if candidate.inferred && candidate.basis != MatchBasis::ContainedWord
+                {
                     Verification::NeedsReview
                 } else {
                     Verification::Confirmed
@@ -268,7 +273,11 @@ impl Shouci {
             let view = CandidateView::new(only.clone(), None);
             return Ok(QuickAdd::Saved(Box::new(self.save_candidate(&view)?)));
         }
-        if ranked.is_empty() {
+        // Words found inside the text are not the text: it is kept as typed.
+        if ranked
+            .iter()
+            .all(|candidate| candidate.diagnostic.basis == MatchBasis::ContainedWord)
+        {
             let conn = self.db()?;
             let saved = vocab_db::save_item(
                 &conn,

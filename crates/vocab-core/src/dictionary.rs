@@ -62,5 +62,9 @@ pub enum MatchBasis {
     EnglishGloss,
     Pinyin,
     Simplified,
+    /// The entry has every character of the query, but is another word.
     CharacterFallback,
+    /// A dictionary word found inside the query (`蚌埠` in `蚌埠住了`); the
+    /// query itself is not a word.
+    ContainedWord,
 }
