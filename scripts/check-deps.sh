@@ -3,7 +3,7 @@
 #
 #   - connectors (vocab-pleco, vocab-anki) depend on vocab-core only, so a
 #     new format never sees storage;
-#   - frontends (shouci-cli, shouci-tui, shouci-mac, shouci-ffi) depend on
+#   - frontends (shouci-cli, shouci-tui, shouci-ffi) depend on
 #     shouci-core only, so every UI is a projection of the same core.
 set -euo pipefail
 
@@ -39,7 +39,7 @@ check() {
 for connector in vocab-pleco vocab-anki; do
   check "${connector}" "vocab-core"
 done
-for frontend in shouci-cli shouci-tui shouci-mac shouci-ffi; do
+for frontend in shouci-cli shouci-tui shouci-ffi; do
   check "${frontend}" "shouci-core"
 done
 

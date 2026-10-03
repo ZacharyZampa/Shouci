@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "ShouciCore"
+ffi_module_name = "ShouciFFI"
+ffi_module_filename = "ShouciFFI"

@@ -1,0 +1,7 @@
+/build/
+xcuserdata/
+/ShouciCore/.build/
+/ShouciCore/.swiftpm/
+# Made by scripts/build-core.sh
+/ShouciCore/ShouciFFI.xcframework/
+/ShouciCore/Sources/ShouciCore/ShouciCore.swift

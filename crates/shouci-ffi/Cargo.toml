@@ -1,0 +1,31 @@
+[package]
+name = "shouci-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# `staticlib` is what the Mac app links; `cdylib` is what uniffi-bindgen
+# reads the interface from; `lib` is for the tests.
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+# The bindings generator: `cargo run -p shouci-ffi --features bindgen --bin
+# uniffi-bindgen`. Kept out of normal builds (it pulls in a CLI).
+bindgen = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+shouci-core = { path = "../shouci-core" }
+uniffi = "0.32"
+
+[dev-dependencies]
+shouci-core = { path = "../shouci-core", features = ["test-support"] }
+
+[lints]
+workspace = true

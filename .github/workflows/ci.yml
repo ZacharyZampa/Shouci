@@ -35,3 +35,10 @@ jobs:
 
       - name: Check
         run: ./scripts/check.sh
+
+      - name: Mac app
+        run: |
+          macos/scripts/build-core.sh
+          swift test --package-path macos/ShouciCore
+          xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci -configuration Debug \
+            -derivedDataPath macos/build/DerivedData -quiet build
