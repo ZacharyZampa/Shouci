@@ -92,6 +92,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         libraryModel.focusSearch()
     }
 
+    /// The standard About panel, with who made Shouci and how to support it.
+    @objc func showAbout(_ sender: Any?) {
+        NSApp.activate()
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: Self.credits()])
+    }
+
+    private static func credits() -> NSAttributedString {
+        let centered = NSMutableParagraphStyle()
+        centered.alignment = .center
+        let plain: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: centered,
+        ]
+        func link(_ title: String, _ url: String) -> NSAttributedString {
+            var attributes = plain
+            attributes[.link] = URL(string: url)
+            return NSAttributedString(string: title, attributes: attributes)
+        }
+        let text = NSMutableAttributedString(string: "Made by Zachary Zampa\n", attributes: plain)
+        text.append(link("Portfolio", "https://zacharyzampa.github.io/ZampaPortfolio"))
+        text.append(NSAttributedString(string: "  ·  ", attributes: plain))
+        text.append(link("Buy me a coffee", "https://buymeacoffee.com/zacharyzampa"))
+        return text
+    }
+
     /// Registers `binding` and keeps it; a message for people when it fails
     /// (the previous shortcut stays).
     private func setShortcut(_ binding: HotKeyBinding) -> String? {
@@ -157,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func mainMenu() -> NSMenu {
         let main = NSMenu()
         let appMenu = NSMenu(title: "Shouci")
-        appMenu.addItem(item("About Shouci", #selector(NSApplication.orderFrontStandardAboutPanel(_:))))
+        appMenu.addItem(item("About Shouci", #selector(showAbout(_:)), target: self))
         appMenu.addItem(.separator())
         appMenu.addItem(item("Settings…", #selector(showSettings(_:)), key: ",", target: self))
         appMenu.addItem(.separator())

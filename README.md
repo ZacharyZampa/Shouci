@@ -7,6 +7,10 @@ Later, study the words in Pleco or Anki.
 Free and open source (MIT). Your words stay on your Mac: Shouci has no
 account and goes online only to download its dictionary.
 
+Shouci is free. If it helps you, you can buy me a coffee:
+
+<a href="https://buymeacoffee.com/zacharyzampa"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="40"></a>
+
 Want to help? [CONTRIBUTING.md](CONTRIBUTING.md). How it's built:
 [DEV.md](DEV.md) and [macos/README.md](macos/README.md).
 
