@@ -30,7 +30,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use vocab_core::{Result, VocabError};
 
-/// What a transfer did, for people and for `--format json`.
+/// What a transfer did, for people and for `shouci --json`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TransferSummary {
     pub connector_id: String,

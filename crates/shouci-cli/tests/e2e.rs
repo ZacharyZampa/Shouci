@@ -1,168 +1,391 @@
-//! Process-level checks of the `shouci` binary.
+//! The `shouci` binary, run as people and scripts run it, against a scratch
+//! library holding the sample dictionary (学校, 你好, 猫, 旅行, 米饭, …).
 //!
-//! Add a search case by appending a row. Add a save/import flow as a named
-//! test that calls [`run`]. Requires `dictionary.db` (see README).
+//! Add a flow as a named test that drives a [`Library`].
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output};
 
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+use serde_json::Value;
+use shouci_core::testing::{SAMPLE_DICTIONARY, install_dictionary, scratch_dir};
 
-fn dictionary() -> PathBuf {
-    if let Ok(db) = std::env::var("VOCAB_DICTIONARY") {
-        if !db.is_empty() {
-            let path = PathBuf::from(db);
-            if path.is_file() {
-                return path;
-            }
-        }
-    }
-    let repo =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/dictionary/dictionary.db");
-    if repo.is_file() {
-        return repo;
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let installed =
-            PathBuf::from(home).join("Library/Application Support/pleco-companion/dictionary.db");
-        if installed.is_file() {
-            return installed;
-        }
-    }
-    panic!("e2e tests need dictionary.db — ingest it first (see README Dictionary)");
+/// A data directory for one test, removed when it ends.
+struct Library {
+    dir: PathBuf,
 }
 
-fn fixture_path(rel: &str) -> PathBuf {
+impl Library {
+    fn new() -> Self {
+        let dir = scratch_dir("cli");
+        install_dictionary(&dir.join("dictionaries"), "cc-cedict", SAMPLE_DICTIONARY)
+            .expect("install the sample dictionary");
+        Self { dir }
+    }
+
+    fn output(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_shouci"))
+            .env("SHOUCI_HOME", &self.dir)
+            .env_remove("SHOUCI_DICTIONARIES")
+            .args(args)
+            .output()
+            .expect("run shouci")
+    }
+
+    /// Stdout of a command that must succeed.
+    fn run(&self, args: &[&str]) -> String {
+        let output = self.output(args);
+        let (stdout, stderr) = texts(&output);
+        assert!(
+            output.status.success(),
+            "shouci {args:?} failed ({:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status.code()
+        );
+        stdout
+    }
+
+    /// Stdout and stderr of a command that must fail.
+    fn fail(&self, args: &[&str]) -> (String, String) {
+        let output = self.output(args);
+        let (stdout, stderr) = texts(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "shouci {args:?} should fail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        (stdout, stderr)
+    }
+
+    /// A successful command's `--json` result.
+    fn json(&self, args: &[&str]) -> Value {
+        let mut args = args.to_vec();
+        args.insert(0, "--json");
+        let stdout = self.run(&args);
+        serde_json::from_str(&stdout).unwrap_or_else(|err| panic!("{err}: {stdout}"))
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn texts(output: &Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn path(path: &Path) -> &str {
+    path.to_str().expect("UTF-8 path")
+}
+
+fn fixture(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures")
         .join(rel)
 }
 
-fn temp_user_db() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "shouci-e2e-{}-{}-{}",
-        std::process::id(),
-        nanos,
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir.join("user.db")
-}
-
-fn run(user_db: Option<&Path>, args: &[&str]) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shouci"));
-    cmd.arg("--dictionary").arg(dictionary());
-    if let Some(path) = user_db {
-        cmd.arg("--user-db").arg(path);
-    }
-    let output = cmd.args(args).output().expect("spawn shouci");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
-        "shouci {args:?} failed {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status.code()
-    );
-    stdout
-}
-
-fn has_headword(stdout: &str, simplified: &str) {
-    assert!(
-        stdout.lines().any(|line| line.contains(simplified)),
-        "expected {simplified:?} in:\n{stdout}"
-    );
-}
-
 #[test]
-fn search_examples_surface_expected_headwords() {
-    for (mode, query, headword) in [
-        ("auto", "jingzi", "镜子"),
-        ("english", "school", "学校"),
-        ("pinyin", "nihao", "你好"),
-        ("chinese", "旅行", "旅行"),
+fn search_reads_characters_pinyin_and_english() {
+    let library = Library::new();
+    for (query, headword) in [
+        ("school", "学校 / 學校 [xué xiào]  school"),
+        ("nihao", "你好 [nǐ hǎo]"),
+        ("lǚ xíng", "旅行 [lǚ xíng]"),
+        ("旅行", "旅行 [lǚ xíng]  to travel; travel"),
     ] {
-        let stdout = run(None, &["search", mode, query, "--limit", "10"]);
-        has_headword(&stdout, headword);
+        let stdout = library.run(&["search", query]);
+        assert!(
+            stdout.starts_with(&format!("  1  {headword}")),
+            "{query}: {stdout}"
+        );
     }
+    // Words after the first are part of the query
+    assert!(library.run(&["search", "to", "travel"]).contains("旅行"));
+    // and --as reads it one way only
+    let json = library.json(&["search", "mao", "--as", "english"]);
+    assert_eq!(json["kind"], "english");
+    assert_eq!(json["candidates"], Value::Array(Vec::new()));
 }
 
 #[test]
-fn add_unique_chinese_then_list_and_refuse_duplicate() {
-    let user_db = temp_user_db();
-    let saved = run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
+fn search_json_is_the_cores_results() {
+    let library = Library::new();
+    let json = library.json(&["search", "school"]);
+    assert_eq!(json["query"], "school");
+    assert_eq!(json["kind"], "english");
+    let first = &json["candidates"][0];
+    assert_eq!(first["simplified"], "学校");
+    assert_eq!(first["pinyin"], "xue2 xiao4");
+    assert_eq!(first["pinyin_display"], "xué xiào");
+    assert_eq!(first["saved"], Value::Null);
+}
+
+#[test]
+fn add_saves_once_and_search_marks_it() {
+    let library = Library::new();
+    let saved = library.run(&["add", "学校"]);
+    assert_eq!(saved.trim(), "saved 学校 / 學校 [xué xiào]  school");
     assert!(
-        saved.starts_with("saved:") && saved.contains("学校"),
-        "{saved}"
+        library
+            .run(&["add", "xuexiao"])
+            .starts_with("already saved: 学校")
     );
-
-    has_headword(&run(Some(&user_db), &["list"]), "学校");
-
-    let again = run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
-    assert!(again.starts_with("already saved:"), "{again}");
-}
-
-#[test]
-fn add_then_delete_by_headword() {
-    let user_db = temp_user_db();
-    run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
-    let deleted = run(Some(&user_db), &["delete", "学校"]);
     assert!(
-        deleted.starts_with("deleted:") && deleted.contains("学校"),
-        "{deleted}"
+        library
+            .run(&["list"])
+            .contains("学校 / 學校 [xué xiào]  school")
     );
-    let listed = run(Some(&user_db), &["list"]);
-    assert!(listed.contains("no saved items"), "{listed}");
-}
-
-#[test]
-fn add_then_delete_by_id() {
-    let user_db = temp_user_db();
-    run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
-    let listed = run(Some(&user_db), &["list"]);
-    let id = listed.split_whitespace().next().expect("item id");
-    let deleted = run(Some(&user_db), &["delete", id]);
     assert!(
-        deleted.starts_with("deleted:") && deleted.contains(id),
-        "{deleted}"
+        library
+            .run(&["search", "school"])
+            .contains("school  · saved")
     );
-    assert!(run(Some(&user_db), &["list"]).contains("no saved items"));
 }
 
 #[test]
-fn add_unknown_word_saves_needs_review() {
-    let user_db = temp_user_db();
-    let stdout = run(Some(&user_db), &["add", "zzzqqqnotaword"]);
-    assert!(stdout.contains("needs_review"), "{stdout}");
+fn add_saves_nothing_when_several_words_match() {
+    let library = Library::new();
+    let (stdout, _) = library.fail(&["add", "lv3"]);
+    assert!(stdout.starts_with("several words match"), "{stdout}");
+    assert!(
+        stdout.contains("旅行") && stdout.contains("旅途"),
+        "{stdout}"
+    );
+    assert_eq!(library.run(&["list"]).trim(), "no saved words");
+    // A result can be picked by its number in `shouci search`
+    let second = library
+        .run(&["search", "lv3"])
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    let picked = library.run(&["add", "lv3", "--pick", "2"]);
+    assert!(
+        second.contains(picked.trim().trim_start_matches("saved ")),
+        "{second} / {picked}"
+    );
+    library.fail(&["add", "lv3", "--pick", "9"]);
 }
 
 #[test]
-fn import_pleco_fixture_then_list() {
-    let user_db = temp_user_db();
-    let fixture = fixture_path("pleco/v1/valid/basic-flashcards.txt");
-    let imported = run(
-        Some(&user_db),
-        &["import", fixture.to_str().expect("utf8 path")],
+fn unknown_characters_are_kept_to_fill_in_later() {
+    let library = Library::new();
+    let search = library.run(&["search", "蚌埠住了"]);
+    assert!(
+        search.starts_with("no dictionary entry for 蚌埠住了"),
+        "{search}"
     );
-    assert!(imported.contains("imported"), "{imported}");
-    has_headword(&run(Some(&user_db), &["list"]), "你好");
+    let saved = library.run(&["add", "蚌埠住了"]);
+    assert!(saved.contains("to fill in later"), "{saved}");
+    assert!(
+        library
+            .run(&["list", "--needs-review"])
+            .contains("蚌埠住了")
+    );
 }
 
 #[test]
-fn export_after_add_writes_pleco_text() {
-    let user_db = temp_user_db();
-    run(Some(&user_db), &["add", "学校", "--mode", "chinese"]);
-    let out = user_db.parent().expect("temp dir").join("export.txt");
-    let exported = run(
-        Some(&user_db),
-        &["export", out.to_str().expect("utf8 path")],
+fn a_word_typed_in_by_hand() {
+    let library = Library::new();
+    library.run(&[
+        "add",
+        "加油",
+        "--pinyin",
+        "jia1 you2",
+        "--definition",
+        "come on!",
+        "--tag",
+        "cheers",
+        "--collection",
+        "Sports",
+    ]);
+    let shown = library.run(&["show", "加油"]);
+    assert!(shown.starts_with("加油 [jiā yóu]\ncome on!\n"), "{shown}");
+    assert!(shown.contains("tags: cheers"), "{shown}");
+    assert!(shown.contains("collections: Sports"), "{shown}");
+    assert!(shown.contains("by hand"), "{shown}");
+    // Looked-up words take tags too
+    library.run(&["add", "米饭", "--tag", "food"]);
+    assert_eq!(library.json(&["show", "米饭"])["item"]["tags"][0], "food");
+}
+
+#[test]
+fn show_puts_the_dictionary_beside_the_word() {
+    let library = Library::new();
+    library.run(&["add", "学校"]);
+    let json = library.json(&["show", "學校"]);
+    assert_eq!(json["item"]["simplified"], "学校");
+    assert_eq!(json["dictionaries"][0]["id"], "cc-cedict");
+    assert_eq!(json["dictionaries"][0]["entries"][0]["same_word"], true);
+    assert!(
+        library
+            .run(&["show", "学校"])
+            .contains(":\n  学校 / 學校 [xué xiào]  school")
     );
-    assert!(exported.contains("exported"), "{exported}");
-    let text = std::fs::read_to_string(&out).expect("export file");
-    assert!(text.contains("学校"), "{text}");
+}
+
+#[test]
+fn edit_changes_a_word() {
+    let library = Library::new();
+    library.run(&["add", "学校"]);
+    let changed = library.run(&["edit", "学校", "--notes", "near home", "--needs-review"]);
+    assert!(changed.contains("needs review"), "{changed}");
+    let shown = library.run(&["show", "学校"]);
+    assert!(shown.contains("notes: near home"), "{shown}");
+    // Nothing to change is a usage error
+    assert_eq!(library.output(&["edit", "学校"]).status.code(), Some(2));
+}
+
+#[test]
+fn trash_restore_and_purge() {
+    let library = Library::new();
+    library.run(&["add", "学校"]);
+    library.run(&["add", "米饭"]);
+    let moved = library.run(&["delete", "学校", "米饭"]);
+    assert!(
+        moved.starts_with("moved 学校 and 米饭 to the trash"),
+        "{moved}"
+    );
+    assert_eq!(library.run(&["list"]).trim(), "no saved words");
+    assert!(
+        library
+            .run(&["list", "--view", "trash"])
+            .contains("in the trash")
+    );
+
+    assert!(
+        library
+            .run(&["restore", "学校"])
+            .contains("brought 学校 back")
+    );
+    library.fail(&["purge", "学校"]);
+    let gone = library.run(&["purge", "米饭"]);
+    assert_eq!(gone.trim(), "deleted 米饭 for good");
+    library.run(&["delete", "学校"]);
+    assert_eq!(library.json(&["purge", "--all"])["changed"], 1);
+    assert_eq!(
+        library.run(&["list", "--view", "all"]).trim(),
+        "no saved words"
+    );
+}
+
+#[test]
+fn archive_keeps_words_out_of_the_way() {
+    let library = Library::new();
+    library.run(&["add", "学校"]);
+    library.run(&["archive", "学校"]);
+    assert_eq!(library.run(&["list"]).trim(), "no saved words");
+    assert!(
+        library
+            .run(&["list", "--view", "archived"])
+            .contains("archived")
+    );
+    library.run(&["unarchive", "学校"]);
+    assert!(library.run(&["list"]).contains("学校"));
+}
+
+#[test]
+fn tags_and_collections() {
+    let library = Library::new();
+    library.run(&["add", "学校"]);
+    library.run(&["add", "米饭"]);
+    library.run(&["tags", "add", "hsk1", "学校", "米饭"]);
+    assert_eq!(library.run(&["tags"]).trim(), "hsk1  (2)");
+    library.run(&["tags", "remove", "hsk1", "米饭"]);
+    let tagged = library.run(&["list", "--tag", "hsk1"]);
+    assert!(
+        tagged.contains("学校") && !tagged.contains("米饭"),
+        "{tagged}"
+    );
+    library.run(&["tags", "rename", "hsk1", "first"]);
+    assert_eq!(library.json(&["tags"])[0]["name"], "first");
+
+    library.run(&["collections", "add", "Food", "米饭"]);
+    assert_eq!(library.run(&["collections"]).trim(), "Food  (1)");
+    assert!(
+        library
+            .run(&["list", "--collection", "Food"])
+            .contains("米饭")
+    );
+    library.run(&["collections", "delete", "Food"]);
+    assert_eq!(library.run(&["collections"]).trim(), "no collections");
+    assert!(library.run(&["list"]).contains("米饭"), "its words stay");
+}
+
+#[test]
+fn import_then_export_only_what_is_new() {
+    let library = Library::new();
+    let pleco = fixture("pleco/v1/valid/basic-flashcards.txt");
+    let preview = library.run(&["import", path(&pleco), "--dry-run"]);
+    assert!(preview.contains("would add 2 words"), "{preview}");
+    assert_eq!(library.run(&["list"]).trim(), "no saved words");
+
+    let imported = library.run(&["import", path(&pleco)]);
+    assert!(
+        imported.starts_with("added 2 words from Pleco file"),
+        "{imported}"
+    );
+    library.run(&["add", "学校"]);
+
+    // To Pleco, only 学校 is new: the other two came from there
+    let out = library.file("to-pleco.txt");
+    let exported = library.run(&["export", path(&out)]);
+    assert!(
+        exported.starts_with("wrote 1 word to Pleco file"),
+        "{exported}"
+    );
+    assert!(std::fs::read_to_string(&out).unwrap().contains("学校"));
+    let again = library.run(&["export", path(&out)]);
+    assert!(again.starts_with("nothing to export"), "{again}");
+
+    // Writing over a file takes --replace
+    let (_, stderr) = library.fail(&["export", path(&out), "--all"]);
+    assert!(stderr.contains("--replace"), "{stderr}");
+    let all = library.json(&["export", path(&out), "--all", "--replace"]);
+    assert_eq!(all["written"], 3);
+
+    // An export to Anki reads back as Anki
+    let anki = library.file("anki.txt");
+    library.run(&["export", path(&anki), "--to", "anki"]);
+    let plan = library.json(&["import", path(&anki), "--dry-run"]);
+    assert_eq!(plan["connector_id"], "anki");
+}
+
+#[test]
+fn an_import_with_error_lines_changes_nothing_without_force() {
+    let library = Library::new();
+    let broken = library.file("broken.txt");
+    std::fs::write(&broken, "你好\tni3 hao3\thello\n\tni3 hao3\thello\n").unwrap();
+    let (stdout, stderr) = library.fail(&["import", path(&broken), "--from", "pleco"]);
+    assert!(stdout.contains("line 2: error"), "{stdout}");
+    assert!(stderr.contains("--force"), "{stderr}");
+    assert_eq!(library.run(&["list"]).trim(), "no saved words");
+    library.run(&["import", path(&broken), "--from", "pleco", "--force"]);
+    assert!(library.run(&["list"]).contains("你好"));
+}
+
+#[test]
+fn errors_say_what_went_wrong() {
+    let library = Library::new();
+    let (_, stderr) = library.fail(&["show", "学校"]);
+    assert_eq!(stderr.trim(), "shouci: no saved word 学校");
+    let (_, stderr) = library.fail(&["--json", "show", "学校"]);
+    let error: Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "not_found");
+}
+
+#[test]
+fn dictionaries_list_and_choose() {
+    let library = Library::new();
+    let listed = library.json(&["dictionaries"]);
+    assert_eq!(listed[0]["id"], "cc-cedict");
+    assert_eq!(listed[0]["enabled"], true);
+    library.fail(&["dictionaries", "use", "nope"]);
 }

@@ -83,6 +83,43 @@ impl Shouci {
         )
     }
 
+    /// [`Shouci::preview_import`] with whichever connector reads the file
+    /// best: the fewest error lines, then the fewest words it could not
+    /// resolve or had to drop. A tie goes to the connector listed first.
+    /// The plan's `connector_id` says which one it was.
+    ///
+    /// # Errors
+    ///
+    /// When no connector can read the file, the first one's reason.
+    pub fn detect_import(
+        &self,
+        path: &Path,
+        policy: ImportPolicy,
+        force: bool,
+    ) -> Result<ImportPlan> {
+        let mut best: Option<((u32, u32), ImportPlan)> = None;
+        let mut first_error = None;
+        for connector in self.connectors().into_iter().filter(|c| c.can_import) {
+            match self.preview_import(path, &connector.id, policy, force) {
+                Ok(plan) => {
+                    let counts = plan.counts();
+                    let misfit = (counts.errors, counts.unresolved + counts.drops);
+                    if best.as_ref().is_none_or(|(fit, _)| misfit < *fit) {
+                        best = Some((misfit, plan));
+                    }
+                }
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        match (best, first_error) {
+            (Some((_, plan)), _) => Ok(plan),
+            (None, Some(err)) => Err(err),
+            (None, None) => Err(Error::unavailable("this build has no format to import")),
+        }
+    }
+
     /// Carries out a previewed import, all or nothing.
     ///
     /// # Errors

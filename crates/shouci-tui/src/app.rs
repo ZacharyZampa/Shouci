@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -13,21 +14,18 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use vocab_capture::{SearchMode, open_service, resolve, save_candidate};
-use vocab_core::{Result, VocabError, VocabItem};
-use vocab_db::{SaveOutcome, delete_item, list_items};
-use vocab_dictionary::{Candidate, SqliteDictionary, display_definition};
-use vocab_exchange::{ExportOptions, ImportOptions, export_file, import_file};
-use vocab_search::SearchService;
+use shouci_core::{
+    BulkAction, Config, ConnectorView, DictionaryResults, DictionaryStatus, Error, ExportRequest,
+    ExportScope, ImportPolicy, ItemView, Lifecycle, ManualWord, MatchBasis, QueryKind, Result,
+    SaveOutcome, SaveResult, Severity, Shouci, Verification, expand_tilde,
+};
 
 use crate::state::{
-    STATUS_FILTERS, View, candidate_key, find_candidate_index, find_saved_index, move_selection,
-    scroll_into_view,
+    Row, Scope, View, basis_label, counted, find_row_index, find_saved_index, kind_title,
+    move_selection, next_kind, rows, scroll_into_view,
 };
 use crate::theme::Theme;
-use crate::ui::{DETAIL_SCROLL_STEP, MIN_HEIGHT, MIN_WIDTH};
-
-const CODECS: [&str; 2] = ["pleco-utf8-text/v1", "anki-text/v1"];
+use crate::ui::{DETAIL_SCROLL_STEP, MIN_HEIGHT, MIN_WIDTH, plain_headword};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptKind {
@@ -38,7 +36,11 @@ enum PromptKind {
 #[derive(Debug, Clone)]
 struct TransferPrompt {
     kind: PromptKind,
-    codec_idx: usize,
+    /// Export: the format, by connector id. Imports detect theirs.
+    format: String,
+    /// Import: what to do with words already saved.
+    policy: ImportPolicy,
+    /// Export: only the words that format doesn't have yet.
     only_new: bool,
     path: String,
     /// False while the prompt is a confirm step that hands off to the native
@@ -55,10 +57,13 @@ struct PickerRequest {
     suggested: String,
 }
 
-fn pane_title(name: &'static str, view: View) -> Line<'static> {
+fn pane_title(name: &'static str, view: View, scope: Scope) -> Line<'static> {
     Line::from(vec![
         Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" · {}", crate::ui::pane_hint(view)), Theme::dim()),
+        Span::styled(
+            format!(" · {}", crate::ui::pane_hint(view, scope)),
+            Theme::dim(),
+        ),
     ])
 }
 
@@ -71,92 +76,100 @@ fn cancelled_message(kind: Option<PromptKind>) -> String {
     })
 }
 
-fn default_transfer_path(codec: &str) -> String {
-    let name = if codec == CODECS[1] {
-        "shouci-anki.txt"
-    } else {
-        "shouci-pleco.txt"
-    };
-    let home = vocab_exchange::expand_path(Path::new("~")).unwrap_or_default();
-    let desktop = home.join("Desktop");
-    let dir = if desktop.is_dir() { desktop } else { home };
-    dir.join(name).to_string_lossy().into_owned()
+/// Where a transfer file goes unless another place is chosen: Downloads, as
+/// in the Mac app, or home when there is no Downloads folder.
+fn default_transfer_path(connector: &str) -> String {
+    let home = expand_tilde(Path::new("~")).unwrap_or_default();
+    let downloads = home.join("Downloads");
+    let dir = if downloads.is_dir() { downloads } else { home };
+    dir.join(format!("shouci-{connector}.txt"))
+        .to_string_lossy()
+        .into_owned()
 }
 
-/// Two-pane terminal UI:
+fn policy_label(policy: ImportPolicy) -> &'static str {
+    match policy {
+        ImportPolicy::Skip => "skip",
+        ImportPolicy::Merge => "merge",
+        ImportPolicy::Overwrite => "overwrite",
+    }
+}
+
+fn next_policy(policy: ImportPolicy) -> ImportPolicy {
+    match policy {
+        ImportPolicy::Skip => ImportPolicy::Merge,
+        ImportPolicy::Merge => ImportPolicy::Overwrite,
+        ImportPolicy::Overwrite => ImportPolicy::Skip,
+    }
+}
+
+/// The date part of a stored timestamp (`2026-09-30T12:00:00.000Z`).
+fn day(timestamp: &str) -> &str {
+    timestamp.get(..10).unwrap_or(timestamp)
+}
+
+/// Two-pane terminal UI over the Shouci core:
 ///
-/// * Search (`F2`): type to search live, Enter saves the selected result.
-///   PgUp/PgDn scroll the detail pane.
-/// * Saved (`F1`): every item in the user database, newest first, with a
-///   status filter (Tab) and full detail for the selection.
+/// * Search (`F2`): type to search live, Enter saves the selected result,
+///   Ctrl+Z takes the save back. PgUp/PgDn scroll the detail pane.
+/// * Saved (`F1`): saved words, newest first, in four lists (Tab): all,
+///   needs review, archived, and the trash, with full detail for the
+///   selection.
 ///
 /// Operational errors (search/save/reload) are captured into a durable error
 /// slot instead of killing the event loop; transient feedback goes to status.
-pub struct App {
-    service: SearchService<SqliteDictionary>,
-    user_conn: rusqlite::Connection,
+pub struct App<'a> {
+    shouci: &'a Shouci,
     theme: Theme,
-    mode: SearchMode,
+    /// How to read the query; `None` lets the core work it out.
+    kind: Option<QueryKind>,
     query: String,
-    results: Vec<Candidate>,
+    /// The last search, for how the query was read.
+    found: Option<DictionaryResults>,
+    rows: Vec<Row>,
     list_state: ListState,
     view: View,
-    saved: Vec<VocabItem>,
+    saved: Vec<ItemView>,
     saved_state: ListState,
-    saved_filter_idx: usize,
+    scope: Scope,
     status: String,
     error: Option<String>,
     detail_scroll: u16,
     prompt: Option<TransferPrompt>,
     /// Set by the prompt when Enter should hand over to the native panel.
     picker: Option<PickerRequest>,
-    /// Saved item awaiting a `y` to confirm deletion: `(item_id, headword)`.
-    /// Deletion is irreversible, so `d` only arms it.
-    pending_delete: Option<(i64, String)>,
+    /// A word in the trash awaiting a `y` to delete it for good:
+    /// `(item_id, headword)`. That can't be undone, so `d` only arms it.
+    pending_purge: Option<(i64, String)>,
+    /// The last save from search, while Ctrl+Z can take it back.
+    last_save: Option<SaveResult>,
     pub should_quit: bool,
 }
 
-impl App {
+impl<'a> App<'a> {
     #[must_use]
-    pub fn new(service: SearchService<SqliteDictionary>, user_conn: rusqlite::Connection) -> Self {
+    pub fn new(shouci: &'a Shouci) -> Self {
         Self {
-            service,
-            user_conn,
+            shouci,
             theme: Theme::detect(),
-            mode: SearchMode::Pinyin,
+            kind: None,
             query: String::new(),
-            results: Vec::new(),
+            found: None,
+            rows: Vec::new(),
             list_state: ListState::default(),
             view: View::Search,
             saved: Vec::new(),
             saved_state: ListState::default(),
-            saved_filter_idx: 0,
+            scope: Scope::All,
             status: String::new(),
             error: None,
             detail_scroll: 0,
             prompt: None,
             picker: None,
-            pending_delete: None,
+            pending_purge: None,
+            last_save: None,
             should_quit: false,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn io_search(&mut self, mode: SearchMode, query: &str) -> vocab_core::Result<()> {
-        self.view = View::Search;
-        self.mode = mode;
-        self.query = query.to_owned();
-        self.run_search()
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn io_headwords(&self, limit: usize) -> Vec<String> {
-        self.results
-            .iter()
-            .take(limit)
-            .map(|candidate| candidate.entry.simplified.clone())
-            .collect()
     }
 
     /// Runs a fallible UI operation, capturing failures into the durable
@@ -172,6 +185,18 @@ impl App {
         self.error = None;
     }
 
+    fn selected_row(&self) -> Option<&Row> {
+        self.list_state
+            .selected()
+            .and_then(|index| self.rows.get(index))
+    }
+
+    fn selected_saved(&self) -> Option<&ItemView> {
+        self.saved_state
+            .selected()
+            .and_then(|index| self.saved.get(index))
+    }
+
     /// Handles one key press.
     ///
     /// Hotkeys are confined to keys that are never typed: `F1`/`F2` switch the
@@ -182,16 +207,17 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if a search, save, or list reload fails.
+    /// None today: failures land in the error slot. The signature leaves
+    /// room for errors the loop cannot recover from.
     pub fn on_key(&mut self, key: &KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
-        if let Some((item_id, head)) = self.pending_delete.take() {
+        if let Some((item_id, head)) = self.pending_purge.take() {
             let confirmed = matches!(key.code, KeyCode::Char('y' | 'Y'))
                 && !key.modifiers.contains(KeyModifiers::CONTROL);
             if confirmed {
-                let op = self.delete_saved(item_id, &head);
+                let op = self.purge(item_id, &head);
                 self.capture(op);
                 return Ok(());
             }
@@ -222,7 +248,7 @@ impl App {
             }
             KeyCode::F(2) => self.show_search(),
             // Shift+Tab toggles between the two views; plain Tab keeps its
-            // per-view meaning (search mode / saved filter).
+            // per-view meaning (how to read the query / which list).
             KeyCode::BackTab => match self.view {
                 View::Search => {
                     let op = self.show_saved();
@@ -245,6 +271,10 @@ impl App {
             KeyCode::Char('q' | 'c') => self.should_quit = true,
             KeyCode::Char('o') => self.begin_prompt(PromptKind::Import),
             KeyCode::Char('e') => self.begin_prompt(PromptKind::Export),
+            KeyCode::Char('z') => {
+                let op = self.undo();
+                self.capture(op);
+            }
             KeyCode::Char('r') if self.view == View::Saved => {
                 let op = self.reload_saved();
                 self.capture(op);
@@ -266,17 +296,14 @@ impl App {
     }
 
     fn reload_saved(&mut self) -> Result<()> {
-        let previous = self
-            .saved_state
-            .selected()
-            .and_then(|index| self.saved.get(index))
-            .map(|item| item.item_id);
-        let filter = STATUS_FILTERS[self.saved_filter_idx];
-        let items = list_items(&self.user_conn, filter)?;
-        self.saved = items;
-        // Restore the previous selection by stable id when it survives the
-        // reload; otherwise fall back to the top of the list.
-        let restored = previous.and_then(|id| find_saved_index(&self.saved, id));
+        let previous = self.saved_state.selected();
+        let previous_id = self.selected_saved().map(|item| item.id);
+        self.saved = self.shouci.list_items(&self.scope.filter())?;
+        // Keep the selected word when it is still listed; when it left the
+        // list (trashed, archived), stay at the same place in it.
+        let restored = previous_id
+            .and_then(|id| find_saved_index(&self.saved, id))
+            .or(previous.map(|index| index.min(self.saved.len().saturating_sub(1))));
         self.saved_state.select(if self.saved.is_empty() {
             None
         } else {
@@ -287,33 +314,118 @@ impl App {
         Ok(())
     }
 
-    /// Arms deletion of the selected item; the next key confirms (`y`) or
-    /// cancels (anything else). See [`App::on_key`].
-    fn request_delete_selected(&mut self) {
-        let Some(item) = self.saved_state.selected().and_then(|i| self.saved.get(i)) else {
+    /// Applies `action` to the selected saved word and says what happened.
+    fn change_selected(
+        &mut self,
+        action: &BulkAction,
+        done: impl FnOnce(&str) -> String,
+    ) -> Result<()> {
+        let Some(item) = self.selected_saved() else {
             self.status = String::from("nothing selected");
-            return;
+            return Ok(());
         };
-        let head = item.simplified.clone();
-        self.status =
-            format!("delete {head}? can't be undone · y deletes · any other key keeps it");
-        self.pending_delete = Some((item.item_id, head));
-    }
-
-    fn delete_saved(&mut self, item_id: i64, head: &str) -> Result<()> {
-        delete_item(&self.user_conn, item_id)?;
+        let (id, head) = (item.id, item.simplified.clone());
+        self.shouci.bulk(&[id], action)?;
         self.reload_saved()?;
-        self.status = format!("deleted {head}");
+        self.status = done(&head);
         Ok(())
     }
 
+    /// `d`: moves the selected word to the trash, or, in the trash, asks
+    /// before deleting it for good (the next key confirms with `y`; see
+    /// [`App::on_key`]).
+    fn trash_selected(&mut self) -> Result<()> {
+        if self.scope != Scope::Trash {
+            return self.change_selected(&BulkAction::Trash, |head| {
+                format!("moved {head} to the trash")
+            });
+        }
+        let Some((id, head)) = self
+            .selected_saved()
+            .map(|item| (item.id, item.simplified.clone()))
+        else {
+            self.status = String::from("nothing selected");
+            return Ok(());
+        };
+        self.status =
+            format!("delete {head} for good? can't be undone · y deletes · any other key keeps it");
+        self.pending_purge = Some((id, head));
+        Ok(())
+    }
+
+    fn purge(&mut self, item_id: i64, head: &str) -> Result<()> {
+        self.shouci.bulk(&[item_id], &BulkAction::Purge)?;
+        self.reload_saved()?;
+        self.status = format!("deleted {head} for good");
+        Ok(())
+    }
+
+    /// `n`: needs review, or checked again.
+    fn toggle_review(&mut self) -> Result<()> {
+        let Some(item) = self.selected_saved() else {
+            self.status = String::from("nothing selected");
+            return Ok(());
+        };
+        let to = if item.verification == Verification::NeedsReview {
+            Verification::Confirmed
+        } else {
+            Verification::NeedsReview
+        };
+        self.change_selected(&BulkAction::SetVerification(to), |head| match to {
+            Verification::NeedsReview => format!("marked {head} as needing review"),
+            Verification::Confirmed => format!("marked {head} as checked"),
+        })
+    }
+
+    /// Takes back the last save from search: a new word is deleted, a word
+    /// brought back from the trash goes back there.
+    fn undo(&mut self) -> Result<()> {
+        let Some(saved) = self.last_save.take() else {
+            self.status = String::from("nothing to take back");
+            return Ok(());
+        };
+        let ids = [saved.item.id];
+        self.shouci.bulk(&ids, &BulkAction::Trash)?;
+        if saved.outcome == SaveOutcome::Inserted {
+            self.shouci.bulk(&ids, &BulkAction::Purge)?;
+        }
+        match self.view {
+            View::Search => self.run_search()?,
+            View::Saved => self.reload_saved()?,
+        }
+        self.status = format!("took back {}", saved.item.simplified);
+        Ok(())
+    }
+
+    /// The formats words can be exported to. Imports detect theirs.
+    fn export_formats(&self) -> Vec<ConnectorView> {
+        self.shouci
+            .connectors()
+            .into_iter()
+            .filter(|connector| connector.can_export)
+            .collect()
+    }
+
+    fn format_name(&self, id: &str) -> String {
+        self.shouci
+            .connectors()
+            .into_iter()
+            .find(|connector| connector.id == id)
+            .map_or_else(|| id.to_owned(), |connector| connector.name)
+    }
+
     fn begin_prompt(&mut self, kind: PromptKind) {
-        let path = default_transfer_path(CODECS[0]);
+        let format = self
+            .export_formats()
+            .first()
+            .map(|connector| connector.id.clone())
+            .unwrap_or_default();
         self.prompt = Some(TransferPrompt {
             kind,
-            codec_idx: 0,
-            only_new: false,
-            path,
+            path: default_transfer_path(&format),
+            format,
+            policy: ImportPolicy::Skip,
+            only_new: true,
             typing: false,
         });
         self.refresh_prompt_status();
@@ -351,25 +463,30 @@ impl App {
     }
 
     fn on_prompt_control(&mut self, code: KeyCode) {
+        let formats = self.export_formats();
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
         match code {
             KeyCode::Char('q' | 'c') => {
                 self.should_quit = true;
                 return;
             }
-            KeyCode::Char('t') => {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    prompt.codec_idx = (prompt.codec_idx + 1) % CODECS.len();
-                    if !prompt.typing {
-                        prompt.path = default_transfer_path(CODECS[prompt.codec_idx]);
-                    }
+            KeyCode::Char('t') if prompt.kind == PromptKind::Export && !formats.is_empty() => {
+                let at = formats
+                    .iter()
+                    .position(|format| format.id == prompt.format)
+                    .map_or(0, |at| (at + 1) % formats.len());
+                prompt.format.clone_from(&formats[at].id);
+                if !prompt.typing {
+                    prompt.path = default_transfer_path(&prompt.format);
                 }
             }
-            KeyCode::Char('n') => {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    if prompt.kind == PromptKind::Export {
-                        prompt.only_new = !prompt.only_new;
-                    }
-                }
+            KeyCode::Char('n') if prompt.kind == PromptKind::Export => {
+                prompt.only_new = !prompt.only_new;
+            }
+            KeyCode::Char('p') if prompt.kind == PromptKind::Import => {
+                prompt.policy = next_policy(prompt.policy);
             }
             _ => return,
         }
@@ -416,119 +533,209 @@ impl App {
         let Some(prompt) = self.prompt.clone() else {
             return Ok(());
         };
-        let path = prompt.path.trim();
-        if path.is_empty() {
+        let typed = prompt.path.trim();
+        if typed.is_empty() {
             self.status = String::from("type a file path first (Esc cancels)");
             return Ok(());
         }
-        let codec = CODECS[prompt.codec_idx].to_owned();
-        let dict = self.service.provider();
-        let report = match prompt.kind {
-            PromptKind::Import => import_file(
-                &mut self.user_conn,
-                Some(dict),
-                Path::new(path),
-                &ImportOptions {
-                    codec,
-                    force: false,
-                    dry_run: false,
-                },
-            )?,
-            PromptKind::Export => export_file(
-                &mut self.user_conn,
-                Some(dict),
-                Path::new(path),
-                &ExportOptions {
-                    codec,
-                    only_new: prompt.only_new,
-                    allow_unresolved: false,
-                    include_archived: false,
-                    tags: Vec::new(),
-                    category: None,
-                    deck: "Shouci".to_owned(),
-                    dry_run: false,
-                },
-            )?,
+        let path = expand_tilde(Path::new(typed))?;
+        let status = match prompt.kind {
+            PromptKind::Import => self.import(&path, prompt.policy)?,
+            PromptKind::Export => self.export(&path, &prompt.format, prompt.only_new)?,
         };
         self.prompt = None;
         self.reload_saved()?;
-        self.status = report.summary;
-        self.succeeded();
+        self.status = status;
         Ok(())
+    }
+
+    /// Imports a file in whichever format reads it, and says what changed.
+    fn import(&self, path: &Path, policy: ImportPolicy) -> Result<String> {
+        let plan = self.shouci.detect_import(path, policy, false)?;
+        if plan.refused {
+            let errors = plan.counts().errors;
+            let first = plan
+                .issues
+                .iter()
+                .find(|issue| issue.severity == Severity::Error)
+                .map(|issue| format!(" (line {}: {})", issue.line, issue.message))
+                .unwrap_or_default();
+            return Err(Error::invalid(format!(
+                "{} {} errors, so nothing was imported{first}",
+                counted(errors, "line", "lines"),
+                if errors == 1 { "has" } else { "have" }
+            )));
+        }
+        let summary = self.shouci.apply_import(&plan)?;
+        let mut added = format!("added {}", counted(summary.inserted, "word", "words"));
+        if summary.unresolved > 0 {
+            let _ = write!(added, " ({} to review)", summary.unresolved);
+        }
+        let mut parts = vec![added];
+        for (count, done) in [
+            (summary.updated, "updated"),
+            (summary.skipped, "skipped"),
+            (summary.dropped, "dropped"),
+        ] {
+            if count > 0 {
+                parts.push(format!("{done} {count}"));
+            }
+        }
+        Ok(format!(
+            "{} from {} file {}",
+            parts.join(", "),
+            self.format_name(&plan.connector_id),
+            path.display()
+        ))
+    }
+
+    /// Exports to `format`, and says what was written and left out.
+    fn export(&self, path: &Path, format: &str, only_new: bool) -> Result<String> {
+        let request = ExportRequest {
+            scope: if only_new {
+                ExportScope::New
+            } else {
+                ExportScope::All
+            },
+            ..ExportRequest::default()
+        };
+        let plan = self.shouci.preview_export(path, format, &request)?;
+        let name = self.format_name(format);
+        let mut left = Vec::new();
+        if plan.left_out_already_there > 0 {
+            left.push(format!(
+                "{} already in {name}",
+                counted(plan.left_out_already_there, "word", "words")
+            ));
+        }
+        if plan.left_out_needs_review > 0 {
+            left.push(format!(
+                "{} needing review",
+                counted(plan.left_out_needs_review, "word", "words")
+            ));
+        }
+        let left = if left.is_empty() {
+            String::new()
+        } else {
+            format!(" · left out {}", left.join(", "))
+        };
+        if plan.item_ids.is_empty() {
+            return Ok(format!("nothing to export, so no file was written{left}"));
+        }
+        let summary = self.shouci.apply_export(&plan)?;
+        Ok(format!(
+            "wrote {} to {}{left}",
+            counted(summary.written, "word", "words"),
+            summary.path
+        ))
     }
 
     fn refresh_prompt_status(&mut self) {
         let Some(prompt) = self.prompt.clone() else {
             return;
         };
-        let kind = match prompt.kind {
-            PromptKind::Import => "import",
-            PromptKind::Export => "export",
-        };
-        let scope = if prompt.kind == PromptKind::Export && prompt.only_new {
-            " only-new"
-        } else {
-            ""
-        };
-        let codec = CODECS[prompt.codec_idx];
         let typed = prompt.path.trim();
         // Show the real destination, never the shorthand, so there is nothing
         // left to guess about where the file lands.
-        let resolved = vocab_exchange::expand_path(Path::new(typed)).unwrap_or_default();
+        let resolved = expand_tilde(Path::new(typed)).unwrap_or_default();
         let state = if typed.is_empty() {
-            "no path".to_owned()
+            "no path"
         } else if prompt.kind == PromptKind::Import {
             if resolved.exists() {
-                "file found".to_owned()
+                "file found"
             } else {
-                "file missing".to_owned()
+                "file missing"
             }
         } else if resolved.exists() {
-            "will replace".to_owned()
+            "will replace"
         } else {
-            "new file".to_owned()
+            "new file"
         };
-        let action = if prompt.typing {
-            "Enter run"
-        } else if prompt.kind == PromptKind::Import {
-            "Enter choose file"
-        } else {
-            "Enter choose location"
+        let action = match (prompt.typing, prompt.kind) {
+            (true, _) => "Enter run",
+            (false, PromptKind::Import) => "Enter choose file",
+            (false, PromptKind::Export) => "Enter choose location",
         };
-        self.status = format!(
-            "{kind} {codec}{scope} · {state} · {}  {action} · Ctrl+T codec · Esc cancel",
-            resolved.display()
-        );
+        let path = resolved.display();
+        self.status = match prompt.kind {
+            PromptKind::Import => format!(
+                "import Pleco or Anki · words you have: {} · {state} · {path}  {action} · \
+                 Ctrl+P words you have · Esc cancel",
+                policy_label(prompt.policy)
+            ),
+            PromptKind::Export => format!(
+                "export to {} · {} · {state} · {path}  {action} · Ctrl+T format · Ctrl+N {} · \
+                 Esc cancel",
+                self.format_name(&prompt.format),
+                if prompt.only_new {
+                    "new words only"
+                } else {
+                    "every word"
+                },
+                if prompt.only_new {
+                    "every word"
+                } else {
+                    "new only"
+                }
+            ),
+        };
     }
 
     fn on_saved_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Esc => self.show_search(),
-            KeyCode::Char('i') => self.begin_prompt(PromptKind::Import),
-            KeyCode::Char('e') => self.begin_prompt(PromptKind::Export),
-            KeyCode::Delete | KeyCode::Char('d') => self.request_delete_selected(),
+        let trash = self.scope == Scope::Trash;
+        let op = match code {
+            KeyCode::Esc => {
+                self.show_search();
+                Ok(())
+            }
+            KeyCode::Char('i') if !trash => {
+                self.begin_prompt(PromptKind::Import);
+                Ok(())
+            }
+            KeyCode::Char('e') if !trash => {
+                self.begin_prompt(PromptKind::Export);
+                Ok(())
+            }
+            KeyCode::Delete | KeyCode::Char('d') => self.trash_selected(),
+            KeyCode::Char('r') if trash => self.change_selected(&BulkAction::Restore, |head| {
+                format!("brought {head} back from the trash")
+            }),
+            KeyCode::Char('a') => match self.scope {
+                Scope::All | Scope::NeedsReview => {
+                    self.change_selected(&BulkAction::Archive, |head| format!("archived {head}"))
+                }
+                Scope::Archived => self
+                    .change_selected(&BulkAction::Unarchive, |head| format!("unarchived {head}")),
+                Scope::Trash => Ok(()),
+            },
+            KeyCode::Char('n') if !trash => self.toggle_review(),
             KeyCode::Tab => {
-                self.saved_filter_idx = (self.saved_filter_idx + 1) % STATUS_FILTERS.len();
-                let op = self.reload_saved();
-                self.capture(op);
-                if self.error.is_none() {
+                self.scope = self.scope.next();
+                self.reload_saved().map(|()| {
                     self.status = format!(
                         "showing {} · {}",
-                        crate::state::filter_label(STATUS_FILTERS[self.saved_filter_idx]),
-                        crate::state::counted(self.saved.len(), "word", "words")
+                        self.scope.label(),
+                        counted(
+                            u64::try_from(self.saved.len()).unwrap_or(u64::MAX),
+                            "word",
+                            "words"
+                        )
                     );
-                }
+                })
             }
             KeyCode::Down => {
                 move_selection(&mut self.saved_state, self.saved.len(), true);
                 self.detail_scroll = 0;
+                Ok(())
             }
             KeyCode::Up => {
                 move_selection(&mut self.saved_state, self.saved.len(), false);
                 self.detail_scroll = 0;
+                Ok(())
             }
-            _ => {}
-        }
+            _ => Ok(()),
+        };
+        self.capture(op);
     }
 
     fn on_search_key(&mut self, code: KeyCode) {
@@ -538,7 +745,8 @@ impl App {
                     self.should_quit = true;
                 } else {
                     self.query.clear();
-                    self.results.clear();
+                    self.found = None;
+                    self.rows.clear();
                     self.list_state.select(None);
                     self.detail_scroll = 0;
                     self.error = None;
@@ -546,48 +754,53 @@ impl App {
                 }
             }
             KeyCode::Tab => {
-                self.mode = match self.mode {
-                    SearchMode::English => SearchMode::Chinese,
-                    SearchMode::Pinyin => SearchMode::English,
-                    SearchMode::Chinese => SearchMode::Pinyin,
+                self.kind = next_kind(self.kind);
+                self.status = match self.kind {
+                    Some(kind) => format!("reading your search as {}", kind_title(kind)),
+                    None => String::from("working out what you type"),
                 };
-                self.status = String::from(match self.mode {
-                    SearchMode::English => "searching English definitions",
-                    SearchMode::Pinyin => "searching pinyin",
-                    SearchMode::Chinese => "searching Chinese characters",
-                });
+                if !self.query.trim().is_empty() {
+                    let op = self.run_search();
+                    self.capture(op);
+                }
             }
             KeyCode::Char(c) if !c.is_control() => {
                 self.query.push(c);
-                self.error = None;
-                let op = self.run_search();
-                self.capture(op);
+                self.typed();
             }
             KeyCode::Backspace => {
                 self.query.pop();
-                self.error = None;
-                let op = self.run_search();
-                self.capture(op);
+                self.typed();
             }
             KeyCode::Enter => {
                 if self.list_state.selected().is_some() {
                     let op = self.save_selected();
                     self.capture(op);
                 } else if !self.query.is_empty() {
-                    self.status =
-                        String::from("nothing to save: no matches (Tab tries another mode)");
+                    self.status = String::from(
+                        "nothing to save: no matches (Tab changes how your search is read)",
+                    );
                 }
             }
             KeyCode::Down => {
-                move_selection(&mut self.list_state, self.results.len(), true);
+                move_selection(&mut self.list_state, self.rows.len(), true);
                 self.detail_scroll = 0;
             }
             KeyCode::Up => {
-                move_selection(&mut self.list_state, self.results.len(), false);
+                move_selection(&mut self.list_state, self.rows.len(), false);
                 self.detail_scroll = 0;
             }
             _ => {}
         }
+    }
+
+    /// The query changed: search again. A save can no longer be taken back
+    /// once the search has moved on.
+    fn typed(&mut self) {
+        self.error = None;
+        self.last_save = None;
+        let op = self.run_search();
+        self.capture(op);
     }
 
     /// Scrolls the detail pane. Clamping to content happens in `draw`, where
@@ -604,132 +817,213 @@ impl App {
         let query = self.query.trim().to_owned();
         if query.is_empty() {
             // Live search: no query means no results, not stale ones.
-            self.results.clear();
+            self.found = None;
+            self.rows.clear();
             self.list_state.select(None);
             self.detail_scroll = 0;
             return Ok(());
         }
+        // Keep the user's place when the same query is searched again (after
+        // a save, say); a changed query starts from its best match.
         let previous = self
-            .list_state
-            .selected()
-            .and_then(|index| self.results.get(index))
-            .map(candidate_key);
-        self.results = resolve(&self.service, self.mode, &query)?;
-        // Keep the user's place when the same entry survives a re-search.
+            .found
+            .as_ref()
+            .filter(|found| found.query == query)
+            .and(self.selected_row())
+            .map(Row::key);
+        let found = match self.shouci.search_dictionary(&query, self.kind, None) {
+            Ok(found) => found,
+            Err(err) => {
+                self.found = None;
+                self.rows.clear();
+                self.list_state.select(None);
+                return Err(err);
+            }
+        };
+        self.rows = rows(&found);
+        self.found = Some(found);
         let restored = previous
             .as_deref()
-            .and_then(|key| find_candidate_index(&self.results, key));
+            .and_then(|key| find_row_index(&self.rows, key));
         self.list_state = ListState::default();
-        self.list_state.select(if self.results.is_empty() {
+        self.list_state.select(if self.rows.is_empty() {
             None
         } else {
             Some(restored.unwrap_or(0))
         });
         self.detail_scroll = 0;
         self.succeeded();
-        self.status = format!(
-            "{} · {}",
-            crate::state::counted(self.results.len(), "result", "results"),
-            self.mode_label()
-        );
+        self.status = self.search_status();
         Ok(())
+    }
+
+    fn search_status(&self) -> String {
+        let Some(found) = &self.found else {
+            return String::new();
+        };
+        let read_as = kind_title(found.kind);
+        let shown = u32::try_from(self.rows.len()).unwrap_or(u32::MAX);
+        match self.rows.first() {
+            None => format!("no matches · read as {read_as}"),
+            Some(Row::AsTyped(_)) => {
+                String::from("no dictionary entry · Enter keeps it to fill in later")
+            }
+            Some(Row::Candidate(_)) if found.total > shown => format!(
+                "showing {shown} of {} results · read as {read_as}",
+                found.total
+            ),
+            Some(Row::Candidate(_)) => format!(
+                "{} · read as {read_as}",
+                counted(found.total, "result", "results")
+            ),
+        }
     }
 
     fn save_selected(&mut self) -> Result<()> {
-        let Some(index) = self.list_state.selected() else {
+        let Some(row) = self.selected_row().cloned() else {
             return Ok(());
         };
-        let candidate = &self.results[index];
-        let outcome = save_candidate(&self.user_conn, candidate)?;
-        self.status = match outcome {
-            SaveOutcome::Inserted(item) => format!(
-                "saved {}",
-                crate::ui::plain_headword(&item.simplified, &item.traditional, &item.pinyin)
-            ),
-            SaveOutcome::Duplicate(item) => format!(
-                "already saved {} ({})",
-                crate::ui::plain_headword(&item.simplified, &item.traditional, &item.pinyin),
-                item.status.label()
-            ),
+        let result = match &row {
+            Row::Candidate(candidate) => self.shouci.save_candidate(candidate)?,
+            Row::AsTyped(text) => self.shouci.add_manual(&ManualWord {
+                simplified: text.clone(),
+                ..ManualWord::default()
+            })?,
         };
-        self.succeeded();
+        // Search again so the result shows as saved.
+        self.run_search()?;
+        let item = &result.item;
+        let word = plain_headword(&item.simplified, &item.traditional, &item.pinyin_display);
+        self.status = match result.outcome {
+            SaveOutcome::Inserted if item.pinyin.is_empty() => {
+                format!("saved {word} to fill in later · Ctrl+Z takes it back")
+            }
+            SaveOutcome::Inserted => format!("saved {word} · Ctrl+Z takes it back"),
+            SaveOutcome::Restored => {
+                format!("brought {word} back from the trash · Ctrl+Z takes it back")
+            }
+            SaveOutcome::AlreadySaved if item.verification == Verification::NeedsReview => {
+                format!("already saved {word} (needs review)")
+            }
+            SaveOutcome::AlreadySaved => format!("already saved {word}"),
+            SaveOutcome::Completed => format!("filled in {word}"),
+        };
+        self.last_save = matches!(
+            result.outcome,
+            SaveOutcome::Inserted | SaveOutcome::Restored
+        )
+        .then_some(result);
         Ok(())
     }
 
-    fn mode_label(&self) -> &'static str {
-        match self.mode {
-            SearchMode::English => "English",
-            SearchMode::Pinyin => "Pinyin",
-            SearchMode::Chinese => "Chinese",
+    /// How the query is read, for the header: chosen, worked out, or not
+    /// yet known.
+    fn mode_label(&self) -> String {
+        match (self.kind, &self.found) {
+            (Some(kind), _) => kind_title(kind).to_owned(),
+            (None, Some(found)) => format!("{} · auto", kind_title(found.kind)),
+            (None, None) => String::from("auto"),
         }
     }
 
     fn selected_detail(&self) -> String {
-        let Some(index) = self.list_state.selected() else {
-            return format!(
-                "type to search {} · Tab changes what you're searching · Enter saves the highlighted word",
-                self.mode_label()
+        let Some(row) = self.selected_row() else {
+            return String::from(
+                "type characters, pinyin, or English · Tab chooses how your search is read · \
+                 Enter saves the highlighted word",
             );
         };
-        let Some(candidate) = self.results.get(index) else {
-            return String::from("no selection");
+        let candidate = match row {
+            Row::AsTyped(text) => {
+                return format!(
+                    "{text}\nNo dictionary has this word. Enter keeps it as you typed it, \
+                     marked needs review, so you can fill in its reading and meaning later."
+                );
+            }
+            Row::Candidate(candidate) => candidate,
         };
-        let inferred = if candidate.diagnostic.is_inferred {
-            " (inferred)"
-        } else {
-            ""
-        };
-        let mut facts = vec![format!(
-            "{}{inferred}",
-            crate::state::basis_label(candidate.diagnostic.basis)
-        )];
-        if let Some(freq) = candidate.entry.frequency_rank {
+        let mut basis = basis_label(candidate.basis).to_owned();
+        if candidate.inferred && candidate.basis != MatchBasis::ContainedWord {
+            basis.push_str(" (partial match)");
+        }
+        let mut facts = vec![basis];
+        if let Some(freq) = candidate.frequency_rank {
             facts.push(format!("frequency rank {freq}"));
         }
-        if let Some(hsk) = candidate.entry.hsk_rank {
+        if let Some(hsk) = candidate.hsk_rank {
             facts.push(format!("HSK {hsk}"));
         }
-        format!(
-            "{}\n{}\n{}",
-            crate::ui::plain_headword(
-                &candidate.entry.simplified,
-                &candidate.entry.traditional,
-                &candidate.entry.pinyin,
+        let mut lines = vec![
+            plain_headword(
+                &candidate.simplified,
+                &candidate.traditional,
+                &candidate.pinyin_display,
             ),
-            display_definition(&candidate.entry.glosses.join("; ")),
+            candidate.definition_display.clone(),
             facts.join(" · "),
-        )
+        ];
+        if let Some(saved) = &candidate.saved {
+            lines.push(String::from(match (saved.lifecycle, saved.verification) {
+                (Lifecycle::Trashed, _) => "saved, now in the trash · Enter brings it back",
+                (Lifecycle::Archived, _) => "saved and archived",
+                (Lifecycle::Active, Verification::NeedsReview) => "saved · needs review",
+                (Lifecycle::Active, Verification::Confirmed) => "saved",
+            }));
+        }
+        lines.join("\n")
     }
 
     fn saved_detail(&self) -> String {
-        let Some(index) = self.saved_state.selected() else {
-            return String::from(if self.saved_filter_idx == 0 {
-                "no saved words yet — press F2 to search, then Enter to save a word"
-            } else {
-                "no words with this status — Tab shows the next filter"
+        let Some(item) = self.selected_saved() else {
+            return String::from(match self.scope {
+                Scope::All => "no saved words yet — press F2 to search, then Enter to save a word",
+                Scope::NeedsReview => "nothing needs review — Tab shows the next list",
+                Scope::Archived => "nothing is archived — Tab shows the next list",
+                Scope::Trash => "the trash is empty — Tab shows the next list",
             });
         };
-        let Some(item) = self.saved.get(index) else {
-            return String::from("no selection");
-        };
-        let mut lines = vec![crate::ui::plain_headword(
+        let mut lines = vec![plain_headword(
             &item.simplified,
             &item.traditional,
-            &item.pinyin,
+            &item.pinyin_display,
         )];
-        lines.push(display_definition(&item.definition));
-        lines.push(format!(
-            "{} · saved {} · changed {} · item {}",
-            item.status.label(),
-            item.created_at,
-            item.modified_at,
-            item.item_id
-        ));
-        if let Some(notes) = &item.notes {
-            lines.push(format!("notes: {notes}"));
+        if !item.definition_display.is_empty() {
+            lines.push(item.definition_display.clone());
         }
-        if let Some(origin) = &item.provenance.import_origin {
-            lines.push(format!("import: {origin}"));
+        let mut facts = Vec::new();
+        if item.verification == Verification::NeedsReview {
+            facts.push(String::from("needs review"));
+        }
+        match item.lifecycle {
+            Lifecycle::Active => {}
+            Lifecycle::Archived => facts.push(String::from("archived")),
+            Lifecycle::Trashed => facts.push(String::from("in the trash")),
+        }
+        facts.push(format!("saved {}", day(&item.created_at)));
+        if item.modified_at != item.created_at {
+            facts.push(format!("changed {}", day(&item.modified_at)));
+        }
+        facts.push(format!("item {}", item.id));
+        lines.push(facts.join(" · "));
+        if !item.tags.is_empty() {
+            lines.push(format!("tags: {}", item.tags.join(", ")));
+        }
+        if !item.collections.is_empty() {
+            lines.push(format!("collections: {}", item.collections.join(", ")));
+        }
+        if !item.destinations.is_empty() {
+            let names: Vec<String> = item
+                .destinations
+                .iter()
+                .map(|id| self.format_name(id))
+                .collect();
+            lines.push(format!("in {}", names.join(", ")));
+        }
+        if !item.notes.is_empty() {
+            lines.push(format!("notes: {}", item.notes));
+        }
+        if let Some(origin) = &item.source.import_origin {
+            lines.push(format!("imported from {origin}"));
         }
         lines.join("\n")
     }
@@ -740,20 +1034,32 @@ impl App {
         // No index numbers: selection is arrows-only (typing appends to the
         // query), so numbers would be decoration without a function.
         let items: Vec<ListItem> = self
-            .results
+            .rows
             .iter()
-            .map(|c| {
-                let marker = if c.diagnostic.is_inferred {
-                    "▸inferred"
-                } else {
-                    ""
-                };
-                ListItem::new(crate::ui::row_line(
-                    marker,
-                    (&c.entry.simplified, &c.entry.traditional, &c.entry.pinyin),
-                    &display_definition(&c.entry.glosses.join("; ")),
+            .map(|row| match row {
+                Row::AsTyped(text) => ListItem::new(crate::ui::row_line(
+                    "",
+                    (text, "", ""),
+                    "not in the dictionary · Enter keeps it to fill in later",
                     width,
-                ))
+                )),
+                Row::Candidate(candidate) => {
+                    let marker = match &candidate.saved {
+                        Some(saved) if saved.lifecycle != Lifecycle::Trashed => "saved",
+                        _ if candidate.inferred => "partial",
+                        _ => "",
+                    };
+                    ListItem::new(crate::ui::row_line(
+                        marker,
+                        (
+                            &candidate.simplified,
+                            &candidate.traditional,
+                            &candidate.pinyin_display,
+                        ),
+                        &candidate.definition_display,
+                        width,
+                    ))
+                }
             })
             .collect();
         scroll_into_view(&mut self.list_state, area.height as usize);
@@ -764,7 +1070,7 @@ impl App {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(theme.focus_border())
-                        .title(pane_title("results", View::Search)),
+                        .title(pane_title("results", View::Search, self.scope)),
                 )
                 .highlight_style(Theme::selected()),
             area,
@@ -775,17 +1081,22 @@ impl App {
     fn render_saved(&mut self, frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect) {
         let theme = self.theme;
         let width = frame.area().width;
-        // No ids or statuses on rows: every save is deliberately picked, so
-        // the active filter (header) plus the `selected` detail pane carry
-        // that context instead.
+        // Only "needs review" is marked, and only in the full list: the list
+        // name (header) and the detail pane carry the rest.
         let items: Vec<ListItem> = self
             .saved
             .iter()
             .map(|item| {
+                let marker =
+                    if self.scope == Scope::All && item.verification == Verification::NeedsReview {
+                        "review"
+                    } else {
+                        ""
+                    };
                 ListItem::new(crate::ui::row_line(
-                    "",
-                    (&item.simplified, &item.traditional, &item.pinyin),
-                    &display_definition(&item.definition),
+                    marker,
+                    (&item.simplified, &item.traditional, &item.pinyin_display),
+                    &item.definition_display,
                     width,
                 ))
             })
@@ -798,7 +1109,7 @@ impl App {
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(theme.focus_border())
-                        .title(pane_title("saved", View::Saved)),
+                        .title(pane_title("saved", View::Saved, self.scope)),
                 )
                 .highlight_style(Theme::selected()),
             area,
@@ -829,11 +1140,10 @@ impl App {
         let header = crate::ui::header_line(
             self.view,
             theme,
-            self.mode_label(),
+            &self.mode_label(),
             &self.query,
             self.saved.len(),
-            self.saved_filter_idx,
-            &STATUS_FILTERS,
+            self.scope,
         );
         let header_width = header.width();
         frame.render_widget(
@@ -893,10 +1203,14 @@ impl App {
                 ),
             panes.detail,
         );
+        let keys = match self.view {
+            View::Search => crate::ui::SEARCH_KEYS,
+            View::Saved => crate::ui::saved_keys(self.scope),
+        };
         frame.render_widget(
             Paragraph::new(crate::ui::help_line(
-                self.view,
                 theme,
+                keys,
                 &self.status,
                 self.error.as_deref(),
                 panes.footer.width,
@@ -907,26 +1221,70 @@ impl App {
     }
 }
 
-/// Runs the TUI event loop until the user quits.
+/// The library, ready to search, and what to tell the user once the TUI is
+/// up.
+struct Opened {
+    shouci: Shouci,
+    /// Words brought over, dictionary notes.
+    notes: Vec<String>,
+    /// Why search is unavailable.
+    problem: Option<String>,
+}
+
+/// Opens the library and loads the dictionaries before the TUI takes the
+/// screen, so a first-run download can say so in the terminal. Only a first
+/// run downloads: the monthly refresh is left to `shouci dictionaries
+/// update` and the Mac app.
+fn open() -> Result<Opened> {
+    let mut config = Config::from_env();
+    config.fetch_dictionaries = false;
+    let shouci = Shouci::open(config)?;
+    let mut notes = shouci.startup_notes().to_vec();
+    let shouci = if shouci.dictionaries()?.is_empty() {
+        eprintln!(
+            "shouci-tui: downloading the dictionary (first run only; needs an internet \
+             connection)…"
+        );
+        let mut config = shouci.config().clone();
+        config.fetch_dictionaries = true;
+        drop(shouci);
+        let fetched = Shouci::open(config)?;
+        notes.extend(fetched.startup_notes().iter().cloned());
+        fetched
+    } else {
+        shouci
+    };
+    let problem = shouci.load_dictionaries().err().map(|err| err.to_string());
+    if let DictionaryStatus::Ready { notes: more, .. } = shouci.dictionary_status() {
+        notes.extend(more);
+    }
+    Ok(Opened {
+        shouci,
+        notes,
+        problem,
+    })
+}
+
+/// Opens the library (see `SHOUCI_HOME`) and runs the TUI until the user
+/// quits.
 ///
 /// # Errors
 ///
-/// Returns an error if the terminal cannot be entered/exited or an event cannot
-/// be read.
-pub fn run(dictionary: &std::path::Path, user_db: &std::path::Path) -> Result<()> {
-    let service = open_service(Some(dictionary))?;
-    let user_conn = vocab_db::open_user_db(user_db)?;
+/// Returns an error if the library cannot be opened, the terminal cannot be
+/// entered/exited, or an event cannot be read.
+pub fn run() -> Result<()> {
+    let opened = open()?;
 
-    enable_raw_mode().map_err(|err| VocabError::new(format!("enable raw mode: {err}")))?;
+    enable_raw_mode().map_err(|err| Error::new(format!("enable raw mode: {err}")))?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)
-        .map_err(|err| VocabError::new(format!("enter alternate screen: {err}")))?;
+        .map_err(|err| Error::new(format!("enter alternate screen: {err}")))?;
     let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
         Ok(t) => t,
         Err(err) => {
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
             disable_raw_mode().ok();
-            return Err(VocabError::new(format!("terminal init: {err}")));
+            return Err(Error::new(format!("terminal init: {err}")));
         }
     };
 
@@ -939,30 +1297,31 @@ pub fn run(dictionary: &std::path::Path, user_db: &std::path::Path) -> Result<()
         default_hook(info);
     }));
 
-    let result = event_loop(&mut terminal, service, user_conn);
+    let result = event_loop(&mut terminal, &opened);
 
-    disable_raw_mode().map_err(|err| VocabError::new(format!("disable raw mode: {err}")))?;
+    disable_raw_mode().map_err(|err| Error::new(format!("disable raw mode: {err}")))?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .map_err(|err| VocabError::new(format!("leave alternate screen: {err}")))?;
+        .map_err(|err| Error::new(format!("leave alternate screen: {err}")))?;
     terminal
         .show_cursor()
-        .map_err(|err| VocabError::new(format!("restore cursor: {err}")))?;
+        .map_err(|err| Error::new(format!("restore cursor: {err}")))?;
 
     result
 }
 
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    service: SearchService<SqliteDictionary>,
-    user_conn: rusqlite::Connection,
+    opened: &Opened,
 ) -> Result<()> {
-    let mut app = App::new(service, user_conn);
+    let mut app = App::new(&opened.shouci);
+    app.status = opened.notes.join(" · ");
+    app.error.clone_from(&opened.problem);
     while !app.should_quit {
         terminal
             .draw(|frame| app.draw(frame, frame.area()))
-            .map_err(|err| VocabError::new(format!("draw: {err}")))?;
+            .map_err(|err| Error::new(format!("draw: {err}")))?;
         if let Event::Key(key) =
-            event::read().map_err(|err| VocabError::new(format!("read event: {err}")))?
+            event::read().map_err(|err| Error::new(format!("read event: {err}")))?
         {
             app.on_key(&key)?;
         }
@@ -1018,46 +1377,467 @@ fn pick_path(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use crossterm::event::KeyEventKind;
-    use vocab_capture::SearchMode;
-    use vocab_dictionary::{CedictSource, build_dictionary_db};
-    use vocab_search::DeterministicRanker;
+    use shouci_core::LibraryFilter;
+    use shouci_core::testing::{Sandbox, sandbox, scratch_dir};
 
     use super::*;
 
-    fn app() -> App {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/dictionary/cedict-sample.u8");
-        let artifact = std::fs::read(&path).expect("missing cedict sample fixture");
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
-        build_dictionary_db(&mut conn, &CedictSource::default(), &artifact).expect("build");
-        let provider = SqliteDictionary::from_connection(conn).expect("open provider");
-        let service = SearchService::new(provider, DeterministicRanker::default());
-        let user_conn = rusqlite::Connection::open_in_memory().expect("in-memory user db");
-        user_conn
-            .pragma_update(None, "foreign_keys", "ON")
-            .expect("foreign keys");
-        vocab_db::apply_schema(&user_conn).expect("user schema");
-        App::new(service, user_conn)
-    }
-
-    fn press(app: &mut App, code: KeyCode) -> vocab_core::Result<()> {
+    fn press(app: &mut App<'_>, code: KeyCode) {
         app.on_key(&KeyEvent::new(code, KeyModifiers::NONE))
+            .expect("key handled");
     }
 
-    fn ctrl(app: &mut App, code: KeyCode) -> vocab_core::Result<()> {
+    fn ctrl(app: &mut App<'_>, code: KeyCode) {
         app.on_key(&KeyEvent::new(code, KeyModifiers::CONTROL))
+            .expect("key handled");
     }
 
-    fn open_export_prompt(app: &mut App) {
-        ctrl(app, KeyCode::Char('e')).expect("open export prompt");
+    fn type_text(app: &mut App<'_>, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    /// Saved words outside the trash, newest first.
+    fn saved_heads(library: &Sandbox) -> Vec<String> {
+        library
+            .list_items(&LibraryFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.simplified)
+            .collect()
+    }
+
+    fn search_and_save(app: &mut App<'_>, word: &str) {
+        if !app.query.is_empty() {
+            // Esc on a non-empty query clears it (never quits here).
+            press(app, KeyCode::Esc);
+        }
+        type_text(app, word);
+        // Live search already populated results; Enter saves the selection.
+        press(app, KeyCode::Enter);
+        assert!(
+            app.status.starts_with("saved ") || app.status.starts_with("already saved "),
+            "unexpected status after Enter: {:?}",
+            app.status
+        );
+    }
+
+    fn headword(row: &Row) -> &str {
+        match row {
+            Row::Candidate(candidate) => &candidate.simplified,
+            Row::AsTyped(text) => text,
+        }
+    }
+
+    // --- Search ----------------------------------------------------------
+
+    #[test]
+    fn typing_populates_results_live() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "school");
+        // No Enter needed: results arrive as you type.
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(headword(&app.rows[0]), "学校");
+        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.mode_label(), "English · auto");
+        assert_eq!(app.status, "1 result · read as English");
+    }
+
+    #[test]
+    fn tab_chooses_how_the_query_is_read() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "mao");
+        assert_eq!(headword(&app.rows[0]), "猫", "worked out as pinyin");
+        // Tab: Hanzi, Pinyin, English, then back to working it out
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.kind, Some(QueryKind::Chinese));
+        assert_eq!(app.rows, [], "mao is not characters, so not kept as typed");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.mode_label(), "Pinyin");
+        assert_eq!(headword(&app.rows[0]), "猫");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.kind, None);
+        assert_eq!(app.mode_label(), "Pinyin · auto");
+    }
+
+    #[test]
+    fn hotkey_letters_always_type_when_query_is_empty() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "cepsq");
+        assert_eq!(app.query, "cepsq");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn enter_saves_the_selection_and_marks_it() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "school");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.status.starts_with("saved 学校 / 學校 [xué xiào]"),
+            "unexpected status: {:?}",
+            app.status
+        );
+        assert_eq!(saved_heads(&library), ["学校"]);
+        let Row::Candidate(candidate) = &app.rows[0] else {
+            panic!("a dictionary row");
+        };
+        assert!(candidate.saved.is_some(), "results show it as saved");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.status.starts_with("already saved 学校"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn control_z_takes_a_save_back() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "school");
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.status, "took back 学校");
+        assert_eq!(saved_heads(&library), [] as [String; 0]);
+        ctrl(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.status, "nothing to take back");
+        // Typing moves on: the next save is not taken back by an old Ctrl+Z
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Backspace);
+        ctrl(&mut app, KeyCode::Char('z'));
+        assert_eq!(saved_heads(&library), ["学校"]);
+    }
+
+    #[test]
+    fn characters_no_dictionary_has_are_kept_to_fill_in_later() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "旅行社");
+        assert_eq!(app.rows[0], Row::AsTyped("旅行社".to_owned()));
+        assert!(
+            app.selected_detail()
+                .contains("No dictionary has this word")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.status.starts_with("saved 旅行社 to fill in later"),
+            "{}",
+            app.status
+        );
+        let saved = library
+            .list_items(&LibraryFilter::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(saved.simplified, "旅行社");
+        assert_eq!(saved.verification, Verification::NeedsReview);
+    }
+
+    #[test]
+    fn enter_with_no_results_reports_nothing_to_save() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "zzzqqq");
+        assert_eq!(app.rows, []);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.status.starts_with("nothing to save"), "{}", app.status);
+        assert!(!app.should_quit);
+        assert_eq!(saved_heads(&library), [] as [String; 0]);
+    }
+
+    #[test]
+    fn enter_on_empty_query_is_silent() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.should_quit);
+        assert_eq!(app.status, "");
+        assert_eq!(saved_heads(&library), [] as [String; 0]);
+    }
+
+    #[test]
+    fn control_s_does_not_save() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "school");
+        assert_ne!(app.rows, []);
+        ctrl(&mut app, KeyCode::Char('s'));
+        assert_eq!(saved_heads(&library), [] as [String; 0]);
+        assert!(!app.status.starts_with("saved "), "{:?}", app.status);
+    }
+
+    #[test]
+    fn escape_clears_query_results_then_quits() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "ni");
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.query.is_empty(), "Esc clears a typed query");
+        assert!(app.rows.is_empty(), "no stale results left behind");
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.should_quit, "Esc with an empty query quits");
+    }
+
+    #[test]
+    fn control_c_quits_regardless_of_query() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "ni");
+        ctrl(&mut app, KeyCode::Char('c'));
+        assert!(app.should_quit);
+        assert_eq!(app.query, "ni", "Ctrl+C leaves the typed query intact");
+    }
+
+    #[test]
+    fn key_release_events_are_ignored() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        let mut release = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        app.on_key(&release).unwrap();
+        assert!(!app.should_quit);
+        assert_eq!(app.query, "");
+    }
+
+    #[test]
+    fn up_down_wrap_through_results() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "cat");
+        assert!(app.rows.len() >= 2);
+        // Live search may restore a non-zero selection while typing, so
+        // assert movement relative to wherever typing left the highlight.
+        let len = app.rows.len();
+        let start = app.list_state.selected().unwrap();
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.list_state.selected(), Some((start + 1) % len));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.list_state.selected(), Some((start + 2) % len));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.list_state.selected(), Some((start + 1) % len));
+    }
+
+    #[test]
+    fn research_restores_selection_by_identity() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "cat");
+        press(&mut app, KeyCode::Down);
+        let selected = headword(app.selected_row().unwrap()).to_owned();
+        // A trailing space trims to the same query and searches again.
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(headword(app.selected_row().unwrap()), selected);
+    }
+
+    #[test]
+    fn detail_scroll_moves_and_resets_on_selection_change() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "cat");
+        assert_eq!(app.detail_scroll, 0);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.detail_scroll, crate::ui::DETAIL_SCROLL_STEP);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.detail_scroll, 0);
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.detail_scroll, 0, "moving selection resets the scroll");
+    }
+
+    #[test]
+    fn typing_clears_a_stale_error() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        app.error = Some(String::from("boom"));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn search_without_a_dictionary_says_why() {
+        let library = shouci_core::testing::empty_sandbox();
+        let mut app = App::new(&library);
+        press(&mut app, KeyCode::Char('x'));
+        let error = app.error.clone().expect("an error");
+        assert!(error.contains("not loaded"), "{error}");
+    }
+
+    // --- Saved -----------------------------------------------------------
+
+    #[test]
+    fn f1_shows_saved_words_newest_first() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        search_and_save(&mut app, "school");
+        search_and_save(&mut app, "cat");
+
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(app.view, View::Saved);
+        assert_eq!(app.saved.len(), 2);
+        assert!(app.saved[0].id > app.saved[1].id, "newest first");
+        assert_eq!(app.saved_state.selected(), Some(0));
+        let detail = app.saved_detail();
+        assert!(
+            detail.contains(&app.saved[0].definition_display),
+            "detail shows the definition: {detail}"
+        );
+        assert!(
+            !detail.contains("needs_review"),
+            "no machine names: {detail}"
+        );
+    }
+
+    #[test]
+    fn tab_cycles_the_saved_lists() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        search_and_save(&mut app, "school");
+        press(&mut app, KeyCode::F(1));
+        assert_eq!(app.scope, Scope::All);
+        assert_eq!(app.saved.len(), 1);
+        for (scope, len) in [
+            (Scope::NeedsReview, 0),
+            (Scope::Archived, 0),
+            (Scope::Trash, 0),
+            (Scope::All, 1),
+        ] {
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.scope, scope);
+            assert_eq!(app.saved.len(), len, "{scope:?}");
+        }
+    }
+
+    #[test]
+    fn d_moves_to_the_trash_and_r_brings_back() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        search_and_save(&mut app, "school");
+        press(&mut app, KeyCode::F(1));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.saved, []);
+        assert_eq!(app.status, "moved 学校 to the trash");
+        // Over in the trash, r restores
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(app.scope, Scope::Trash);
+        assert_eq!(app.saved.len(), 1);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.saved, []);
+        assert_eq!(saved_heads(&library), ["学校"]);
+    }
+
+    #[test]
+    fn deleting_from_the_trash_asks_first() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        search_and_save(&mut app, "school");
+        press(&mut app, KeyCode::F(1));
+        press(&mut app, KeyCode::Char('d'));
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Tab);
+        }
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.saved.len(), 1, "d alone only asks");
+        assert!(app.status.contains("y deletes"), "{}", app.status);
+        // Any other key keeps it
+        press(&mut app, KeyCode::Down);
+        assert!(app.status.starts_with("kept "), "{}", app.status);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.saved.len(), 1, "a later y does nothing");
+        // y deletes
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.saved, []);
+        assert_eq!(app.status, "deleted 学校 for good");
+        assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    #[test]
+    fn a_archives_and_n_marks_for_review() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        search_and_save(&mut app, "school");
+        search_and_save(&mut app, "cat");
+        press(&mut app, KeyCode::F(1));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.saved[0].verification, Verification::NeedsReview);
+        assert!(app.status.starts_with("marked "), "{}", app.status);
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.saved.len(), 1, "archived words leave the list");
+        assert_eq!(
+            app.saved_state.selected(),
+            Some(0),
+            "the selection stays in place"
+        );
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.saved.len(),
+            0,
+            "the archived word no longer needs review here"
+        );
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.saved.len(), 1);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.status.starts_with("unarchived "), "{}", app.status);
+    }
+
+    #[test]
+    fn escape_and_f2_return_to_search() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        press(&mut app, KeyCode::F(1));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Search);
+        press(&mut app, KeyCode::F(1));
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.view, View::Search);
+    }
+
+    #[test]
+    fn saved_reload_preserves_selection_by_id() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        search_and_save(&mut app, "school");
+        search_and_save(&mut app, "cat");
+        press(&mut app, KeyCode::F(1));
+        press(&mut app, KeyCode::Down);
+        let selected_id = app.selected_saved().unwrap().id;
+        ctrl(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.selected_saved().unwrap().id, selected_id);
+    }
+
+    #[test]
+    fn shift_tab_toggles_between_views() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        assert_eq!(app.view, View::Search);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.view, View::Saved);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.view, View::Search);
+    }
+
+    // --- Import and export -------------------------------------------------
+
+    fn open_export_prompt(app: &mut App<'_>) {
+        ctrl(app, KeyCode::Char('e'));
     }
 
     #[test]
     fn export_prompt_starts_on_a_default_destination() {
-        let mut app = app();
+        let library = sandbox();
+        let mut app = App::new(&library);
         open_export_prompt(&mut app);
         let prompt = app.prompt.as_ref().expect("prompt open");
         assert!(prompt.path.ends_with("shouci-pleco.txt"), "{}", prompt.path);
@@ -1068,95 +1848,94 @@ mod tests {
             "status: {:?}",
             app.status
         );
-        assert!(app.status.contains("new file"), "status: {:?}", app.status);
+        assert!(app.status.contains("new words only"), "{:?}", app.status);
     }
 
     #[test]
-    fn codec_toggle_renames_the_default_file() {
-        let mut app = app();
+    fn the_format_toggle_renames_the_default_file() {
+        let library = sandbox();
+        let mut app = App::new(&library);
         open_export_prompt(&mut app);
-        ctrl(&mut app, KeyCode::Char('t')).expect("cycle codec");
+        ctrl(&mut app, KeyCode::Char('t'));
         let prompt = app.prompt.as_ref().expect("prompt open");
         assert!(prompt.path.ends_with("shouci-anki.txt"), "{}", prompt.path);
+        assert!(app.status.contains("export to Anki"), "{:?}", app.status);
+        ctrl(&mut app, KeyCode::Char('t'));
+        assert!(app.status.contains("export to Pleco"), "{:?}", app.status);
+    }
+
+    #[test]
+    fn only_new_and_policy_toggles_belong_to_their_direction() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        open_export_prompt(&mut app);
+        ctrl(&mut app, KeyCode::Char('n'));
+        assert!(!app.prompt.as_ref().expect("prompt").only_new);
+        assert!(app.status.contains("every word"), "{:?}", app.status);
+        ctrl(&mut app, KeyCode::Char('p'));
+        assert!(!app.status.contains("words you have"), "{:?}", app.status);
+
+        press(&mut app, KeyCode::Esc);
+        ctrl(&mut app, KeyCode::Char('o'));
         assert!(
-            app.status.contains("anki-text/v1"),
-            "status: {:?}",
+            app.status.contains("words you have: skip"),
+            "{:?}",
+            app.status
+        );
+        ctrl(&mut app, KeyCode::Char('p'));
+        assert!(
+            app.status.contains("words you have: merge"),
+            "{:?}",
             app.status
         );
     }
 
     #[test]
-    fn only_new_toggle_is_export_only() {
-        let mut app = app();
-        open_export_prompt(&mut app);
-        ctrl(&mut app, KeyCode::Char('n')).expect("toggle only-new");
-        assert!(app.prompt.as_ref().expect("prompt").only_new);
-        assert!(app.status.contains("only-new"), "{:?}", app.status);
-    }
-
-    #[test]
     fn enter_requests_the_panel_instead_of_writing() {
-        let mut app = app();
+        let library = sandbox();
+        let mut app = App::new(&library);
         search_and_save(&mut app, "school");
         open_export_prompt(&mut app);
-        press(&mut app, KeyCode::Enter).expect("enter");
+        press(&mut app, KeyCode::Enter);
         let request = app.take_picker().expect("panel requested");
         assert_eq!(request.kind, PromptKind::Export);
         assert!(app.take_picker().is_none(), "request is taken once");
         // Nothing was written: the transfer only runs once a path comes back.
-        assert!(!app.status.contains("exported"), "{:?}", app.status);
+        assert!(!app.status.contains("wrote"), "{:?}", app.status);
     }
 
     #[test]
     fn import_prompt_offers_the_open_panel() {
-        let mut app = app();
-        ctrl(&mut app, KeyCode::Char('o')).expect("open import prompt");
-        press(&mut app, KeyCode::Enter).expect("enter");
+        let library = sandbox();
+        let mut app = App::new(&library);
+        ctrl(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Enter);
         let request = app.take_picker().expect("panel requested");
         assert_eq!(request.kind, PromptKind::Import);
-        assert!(
-            app.prompt
-                .as_ref()
-                .expect("prompt")
-                .path
-                .ends_with("shouci-pleco.txt"),
-            "import default"
-        );
     }
 
     #[test]
     fn the_confirm_step_ignores_typed_characters() {
-        let mut app = app();
+        let library = sandbox();
+        let mut app = App::new(&library);
         open_export_prompt(&mut app);
         let before = app.prompt.as_ref().expect("prompt").path.clone();
-        for ch in "xyz".chars() {
-            press(&mut app, KeyCode::Char(ch)).expect("ignored");
-        }
+        type_text(&mut app, "xyz");
+        press(&mut app, KeyCode::Backspace);
         assert_eq!(app.prompt.as_ref().expect("prompt").path, before);
         assert!(app.take_picker().is_none(), "no panel without Enter");
     }
 
     #[test]
-    fn backspace_is_ignored_until_typing_is_enabled() {
-        let mut app = app();
-        open_export_prompt(&mut app);
-        let before = app.prompt.as_ref().expect("prompt").path.clone();
-        press(&mut app, KeyCode::Backspace).expect("ignored");
-        assert_eq!(app.prompt.as_ref().expect("prompt").path, before);
-    }
-
-    #[test]
     fn a_failed_panel_falls_back_to_typing() {
-        let mut app = app();
+        let library = sandbox();
+        let mut app = App::new(&library);
         open_export_prompt(&mut app);
         app.fall_back_to_typing("no panel available");
         let prompt = app.prompt.as_ref().expect("prompt still open");
         assert!(prompt.typing, "typing enabled after failure");
         assert!(app.status.contains("type the path"), "{:?}", app.status);
-
-        for ch in "/tmp".chars() {
-            press(&mut app, KeyCode::Char(ch)).expect("typed");
-        }
+        type_text(&mut app, "/tmp");
         assert!(
             app.prompt.as_ref().expect("prompt").path.ends_with("/tmp"),
             "typed into the path"
@@ -1165,9 +1944,10 @@ mod tests {
 
     #[test]
     fn a_dismissed_panel_leaves_the_prompt_clean() {
-        let mut app = app();
+        let library = sandbox();
+        let mut app = App::new(&library);
         open_export_prompt(&mut app);
-        press(&mut app, KeyCode::Enter).expect("enter");
+        press(&mut app, KeyCode::Enter);
         assert!(app.take_picker().is_some(), "panel requested");
         app.cancel_picker();
         assert!(app.prompt.is_none(), "prompt closed");
@@ -1176,11 +1956,12 @@ mod tests {
 
     #[test]
     fn tilde_is_expanded_in_the_confirm_step() {
-        let mut app = app();
+        let library = sandbox();
+        let mut app = App::new(&library);
         open_export_prompt(&mut app);
-        let home = vocab_exchange::expand_path(Path::new("~")).expect("home");
+        let home = expand_tilde(Path::new("~")).expect("home");
         app.prompt.as_mut().expect("prompt").typing = true;
-        app.prompt.as_mut().expect("prompt").path = format!("~{HOME_MARK}");
+        app.prompt.as_mut().expect("prompt").path = String::from("~/definitely-not-here.txt");
         app.refresh_prompt_status();
         assert!(
             app.status.contains(&home.to_string_lossy().into_owned()),
@@ -1189,448 +1970,120 @@ mod tests {
         );
     }
 
-    const HOME_MARK: &str = "/definitely-not-here.txt";
+    #[test]
+    fn a_picked_file_is_imported_and_new_words_exported() {
+        let library = sandbox();
+        let mut app = App::new(&library);
+        let dir = scratch_dir("tui-transfer");
+        let source = dir.join("from-pleco.txt");
+        std::fs::write(&source, "你好\tni3 hao3\thello\n").unwrap();
+
+        ctrl(&mut app, KeyCode::Char('o'));
+        app.accept_picked_path(source.to_string_lossy().into_owned());
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(
+            app.status.starts_with("added 1 word from Pleco file"),
+            "{}",
+            app.status
+        );
+        assert!(app.prompt.is_none(), "the prompt closes");
+
+        search_and_save(&mut app, "school");
+        let out = dir.join("to-pleco.txt");
+        open_export_prompt(&mut app);
+        app.accept_picked_path(out.to_string_lossy().into_owned());
+        assert!(app.status.starts_with("wrote 1 word to "), "{}", app.status);
+        assert!(
+            app.status.contains("left out 1 word already in Pleco"),
+            "{}",
+            app.status
+        );
+        assert!(std::fs::read_to_string(&out).unwrap().contains("学校"));
+
+        open_export_prompt(&mut app);
+        app.accept_picked_path(out.to_string_lossy().into_owned());
+        assert!(
+            app.status.starts_with("nothing to export"),
+            "{}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
-    fn pane_hints_advertise_the_transfer_keys() {
-        assert_eq!(crate::ui::pane_hint(View::Saved), "i import · e export");
+    fn pane_hints_advertise_the_main_keys() {
         assert_eq!(
-            crate::ui::pane_hint(View::Search),
+            crate::ui::pane_hint(View::Search, Scope::All),
             "Ctrl+O import · Ctrl+E export"
         );
-    }
-
-    fn search_and_save(app: &mut App, word: &str) {
-        if !app.query.is_empty() {
-            // Esc on a non-empty query clears it (never quits here).
-            press(app, KeyCode::Esc).unwrap();
-        }
-        while app.mode != SearchMode::English {
-            press(app, KeyCode::Tab).unwrap();
-        }
-        for ch in word.chars() {
-            press(app, KeyCode::Char(ch)).unwrap();
-        }
-        // Live search already populated results; Enter saves the selection.
-        press(app, KeyCode::Enter).unwrap();
-        assert!(
-            app.status.starts_with("saved ") || app.status.starts_with("already saved "),
-            "unexpected status after Enter: {:?}",
-            app.status
-        );
-    }
-
-    #[test]
-    fn typing_populates_results_live() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab).unwrap();
-        for ch in "school".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        // No Enter needed: results arrive as you type.
-        assert_eq!(app.results.len(), 1);
-        assert_eq!(app.results[0].entry.simplified, "学校");
-        assert_eq!(app.list_state.selected(), Some(0));
-    }
-
-    #[test]
-    fn hotkey_letters_always_type_when_query_is_empty() {
-        let mut app = app();
-        for ch in "cepsq".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        assert_eq!(app.query, "cepsq");
-        assert!(!app.should_quit);
-    }
-
-    #[test]
-    fn enter_saves_the_selection() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab).unwrap();
-        for ch in "school".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        press(&mut app, KeyCode::Enter).unwrap();
-        assert!(
-            app.status.starts_with("saved 学校 / 學校"),
-            "unexpected status: {:?}",
-            app.status
-        );
-        assert!(
-            list_items(&app.user_conn, None)
-                .unwrap()
-                .iter()
-                .any(|item| item.simplified == "学校")
-        );
-    }
-
-    #[test]
-    fn enter_with_no_results_reports_nothing_to_save() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab).unwrap();
-        for ch in "zzzqqq".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        assert!(app.results.is_empty());
-        press(&mut app, KeyCode::Enter).unwrap();
-        assert!(app.status.starts_with("nothing to save"), "{}", app.status);
-        assert!(!app.should_quit);
-        assert!(
-            list_items(&app.user_conn, None).unwrap().is_empty(),
-            "nothing may be saved from empty results"
-        );
-    }
-
-    #[test]
-    fn enter_on_empty_query_is_silent() {
-        let mut app = app();
-        press(&mut app, KeyCode::Enter).unwrap();
-        assert!(!app.should_quit);
-        assert!(app.status.is_empty());
-        assert!(
-            list_items(&app.user_conn, None).unwrap().is_empty(),
-            "nothing may be saved from an empty query"
-        );
-    }
-
-    #[test]
-    fn control_s_no_longer_saves() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab).unwrap();
-        for ch in "school".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        assert!(!app.results.is_empty());
-        app.on_key(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
-            .unwrap();
-        assert!(
-            list_items(&app.user_conn, None).unwrap().is_empty(),
-            "Ctrl+S must not save anything"
-        );
-        assert!(
-            !app.status.starts_with("saved "),
-            "Ctrl+S must not report a save: {:?}",
-            app.status
-        );
-    }
-
-    #[test]
-    fn escape_clears_query_results_then_quits() {
-        let mut app = app();
-        for ch in "ni".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        assert!(!app.should_quit);
-        press(&mut app, KeyCode::Esc).unwrap();
-        assert!(app.query.is_empty(), "Esc clears a typed query");
-        assert!(
-            app.results.is_empty(),
-            "live search leaves no stale results behind"
-        );
-        assert!(!app.should_quit);
-        press(&mut app, KeyCode::Esc).unwrap();
-        assert!(app.should_quit, "Esc with an empty query quits");
-    }
-
-    #[test]
-    fn control_c_quits_regardless_of_query() {
-        let mut app = app();
-        for ch in "ni".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        app.on_key(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-            .unwrap();
-        assert!(app.should_quit);
-        assert_eq!(app.query, "ni", "Ctrl+C leaves the typed query intact");
-    }
-
-    #[test]
-    fn tab_cycles_search_modes() {
-        let mut app = app();
-        assert_eq!(app.mode, SearchMode::Pinyin);
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.mode, SearchMode::English);
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.mode, SearchMode::Chinese);
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.mode, SearchMode::Pinyin);
-    }
-
-    #[test]
-    fn key_release_events_are_ignored() {
-        let mut app = app();
-        let mut release = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
-        release.kind = KeyEventKind::Release;
-        app.on_key(&release).unwrap();
-        assert!(!app.should_quit);
-        assert_eq!(app.query, "");
-    }
-
-    #[test]
-    fn up_down_wrap_through_results() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab).unwrap();
-        for ch in "cat".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        assert!(app.results.len() >= 2);
-        // Live search may restore a non-zero selection while typing, so
-        // assert movement relative to wherever typing left the highlight.
-        let len = app.results.len();
-        let start = app.list_state.selected().unwrap();
-        press(&mut app, KeyCode::Down).unwrap();
-        assert_eq!(app.list_state.selected(), Some((start + 1) % len));
-        press(&mut app, KeyCode::Down).unwrap();
-        assert_eq!(app.list_state.selected(), Some((start + 2) % len));
-        press(&mut app, KeyCode::Up).unwrap();
-        assert_eq!(app.list_state.selected(), Some((start + 1) % len));
-    }
-
-    #[test]
-    fn f1_shows_saved_items_newest_first() {
-        let mut app = app();
-        search_and_save(&mut app, "school");
-        search_and_save(&mut app, "cat");
-
-        press(&mut app, KeyCode::F(1)).unwrap();
-        assert_eq!(app.view, View::Saved);
-        assert_eq!(app.saved.len(), 2);
-        assert!(
-            app.saved[0].item_id > app.saved[1].item_id,
-            "saved list is newest first"
-        );
-        assert_eq!(app.saved_state.selected(), Some(0));
-        let detail = app.saved_detail();
-        assert!(
-            detail.contains(&display_definition(&app.saved[0].definition)),
-            "detail shows the definition: {detail}"
-        );
-        assert!(
-            !detail.contains("needs_review"),
-            "no machine status names: {detail}"
-        );
-    }
-
-    #[test]
-    fn tab_cycles_saved_status_filter() {
-        let mut app = app();
-        search_and_save(&mut app, "school");
-        press(&mut app, KeyCode::F(1)).unwrap();
-        assert_eq!(app.saved_filter_idx, 0);
-        assert_eq!(app.saved.len(), 1);
-
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.saved_filter_idx, 1);
-        assert_eq!(app.saved.len(), 1, "the saved item is confirmed");
-
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.saved_filter_idx, 2);
-        assert!(app.saved.is_empty(), "nothing needs review");
-
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.saved_filter_idx, 3);
-        assert!(app.saved.is_empty(), "nothing exported");
-
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.saved_filter_idx, 4);
-        assert!(app.saved.is_empty(), "nothing archived");
-
-        press(&mut app, KeyCode::Tab).unwrap();
-        assert_eq!(app.saved_filter_idx, 0);
-        assert_eq!(app.saved.len(), 1, "wraps back to 'all'");
-    }
-
-    #[test]
-    fn d_deletes_selected_saved_item() {
-        let mut app = app();
-        search_and_save(&mut app, "school");
-        press(&mut app, KeyCode::F(1)).unwrap();
-        assert_eq!(app.saved.len(), 1);
-        press(&mut app, KeyCode::Char('d')).unwrap();
-        assert_eq!(app.saved.len(), 1, "d alone only asks");
-        assert!(app.status.contains("y deletes"), "{}", app.status);
-        press(&mut app, KeyCode::Char('y')).unwrap();
-        assert!(app.saved.is_empty());
-        assert!(app.status.starts_with("deleted "), "{}", app.status);
-        assert!(app.error.is_none(), "{:?}", app.error);
-    }
-
-    #[test]
-    fn any_other_key_cancels_a_pending_delete() {
-        let mut app = app();
-        search_and_save(&mut app, "school");
-        press(&mut app, KeyCode::F(1)).unwrap();
-        press(&mut app, KeyCode::Delete).unwrap();
-        press(&mut app, KeyCode::Down).unwrap();
-        assert_eq!(app.saved.len(), 1, "cancelled delete keeps the item");
-        assert!(app.status.starts_with("kept "), "{}", app.status);
-        // The cancelling key is consumed; a later y does nothing.
-        press(&mut app, KeyCode::Char('y')).unwrap();
-        assert_eq!(app.saved.len(), 1);
-    }
-
-    #[test]
-    fn escape_from_saved_returns_to_search() {
-        let mut app = app();
-        search_and_save(&mut app, "school");
-        press(&mut app, KeyCode::F(1)).unwrap();
-        assert_eq!(app.view, View::Saved);
-        press(&mut app, KeyCode::Esc).unwrap();
-        assert_eq!(app.view, View::Search);
-    }
-
-    #[test]
-    fn f2_from_saved_returns_to_search() {
-        let mut app = app();
-        search_and_save(&mut app, "school");
-        press(&mut app, KeyCode::F(1)).unwrap();
-        press(&mut app, KeyCode::F(2)).unwrap();
-        assert_eq!(app.view, View::Search);
-    }
-
-    #[test]
-    fn research_restores_selection_by_identity() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab).unwrap();
-        for ch in "cat".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        press(&mut app, KeyCode::Enter).unwrap();
-        press(&mut app, KeyCode::Down).unwrap();
-        press(&mut app, KeyCode::Down).unwrap();
-        let selected = app.results[app.list_state.selected().unwrap()]
-            .entry
-            .simplified
-            .clone();
-        // Perturbing the query re-runs the search but keeps the same entry:
-        // a trailing space still trims to the same query.
-        press(&mut app, KeyCode::Char(' ')).unwrap();
-        press(&mut app, KeyCode::Backspace).unwrap();
-        let reselected = app.results[app.list_state.selected().unwrap()]
-            .entry
-            .simplified
-            .clone();
-        assert_eq!(selected, reselected);
-    }
-
-    #[test]
-    fn saved_reload_preserves_selection_by_id() {
-        let mut app = app();
-        search_and_save(&mut app, "school");
-        search_and_save(&mut app, "cat");
-
-        press(&mut app, KeyCode::F(1)).unwrap();
-        press(&mut app, KeyCode::Down).unwrap();
-        let selected_id = app.saved[app.saved_state.selected().unwrap()].item_id;
-        // Ctrl+R reloads without losing the selected item.
-        app.on_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
-            .unwrap();
         assert_eq!(
-            app.saved[app.saved_state.selected().unwrap()].item_id,
-            selected_id
+            crate::ui::pane_hint(View::Saved, Scope::All),
+            "i import · e export"
         );
-    }
-
-    #[test]
-    fn detail_scroll_moves_and_resets_on_selection_change() {
-        let mut app = app();
-        press(&mut app, KeyCode::Tab).unwrap();
-        for ch in "cat".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        assert_eq!(app.detail_scroll, 0);
-        press(&mut app, KeyCode::PageDown).unwrap();
-        assert_eq!(app.detail_scroll, crate::ui::DETAIL_SCROLL_STEP);
-        press(&mut app, KeyCode::PageUp).unwrap();
-        assert_eq!(app.detail_scroll, 0);
-        press(&mut app, KeyCode::PageDown).unwrap();
-        press(&mut app, KeyCode::Down).unwrap();
         assert_eq!(
-            app.detail_scroll, 0,
-            "moving selection resets detail scroll"
+            crate::ui::pane_hint(View::Saved, Scope::Trash),
+            "r restore · d delete for good"
         );
     }
 
-    #[test]
-    fn typing_clears_a_stale_error() {
-        let mut app = app();
-        app.error = Some(String::from("boom"));
-        press(&mut app, KeyCode::Char('x')).unwrap();
-        assert_eq!(app.error, None);
+    // --- Drawing -----------------------------------------------------------
+
+    fn screen(
+        app: &mut App<'_>,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, ratatui::layout::Position) {
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect()
+            })
+            .collect();
+        (rows, terminal.get_cursor_position().unwrap())
     }
 
     #[test]
     fn draw_renders_header_and_footer() {
-        use ratatui::{Terminal, backend::TestBackend};
-
-        let mut app = app();
-        for ch in "ni".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| app.draw(frame, frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let row = |y: u16| {
-            (0..80)
-                .map(|x| buffer[(x, y)].symbol().to_owned())
-                .collect::<String>()
-        };
-        assert!(row(2).contains("shouci"), "header shows brand");
-        assert!(row(2).contains("ni"), "header shows query");
-        assert!(row(22).contains("Enter"), "footer shows save hint");
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "ni");
+        let (rows, _) = screen(&mut app, 80, 24);
+        assert!(rows[2].contains("shouci"), "header shows brand");
+        assert!(rows[2].contains("ni"), "header shows query");
+        assert!(rows[22].contains("Enter"), "footer shows save hint");
     }
 
     #[test]
     fn cursor_follows_the_query_for_input_methods() {
-        use ratatui::{Terminal, backend::TestBackend, layout::Position};
-
-        let mut app = app();
-        for ch in "翻译".chars() {
-            press(&mut app, KeyCode::Char(ch)).unwrap();
-        }
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| app.draw(frame, frame.area()))
-            .unwrap();
-        // Header box at (1, 1); text "shouci [Pinyin]  翻译" is 21 cells wide
-        // (Chinese is double width), so the cursor sits at column 2 + 21.
-        assert_eq!(
-            terminal.get_cursor_position().unwrap(),
-            Position::new(23, 2)
-        );
-    }
-
-    #[test]
-    fn shift_tab_toggles_between_views() {
-        let mut app = app();
-        assert_eq!(app.view, View::Search);
-        press(&mut app, KeyCode::BackTab).unwrap();
-        assert_eq!(app.view, View::Saved);
-        press(&mut app, KeyCode::BackTab).unwrap();
-        assert_eq!(app.view, View::Search);
+        let library = sandbox();
+        let mut app = App::new(&library);
+        type_text(&mut app, "翻译");
+        assert_eq!(app.mode_label(), "Hanzi · auto");
+        let (_, cursor) = screen(&mut app, 80, 24);
+        // Header box at (1, 1); "shouci [Hanzi · auto]  翻译" is 27 cells
+        // wide (Chinese is double width), so the cursor sits at column 2 + 27.
+        assert_eq!(cursor, ratatui::layout::Position::new(29, 2));
     }
 
     #[test]
     fn draw_narrow_terminal_shows_resize_notice() {
-        use ratatui::{Terminal, backend::TestBackend};
-
-        let mut app = app();
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        terminal
-            .draw(|frame| app.draw(frame, frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let mut text = String::new();
-        for y in 0..10 {
-            for x in 0..40 {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-        }
-        assert!(text.contains("too small"), "narrow viewport shows notice");
+        let library = sandbox();
+        let mut app = App::new(&library);
+        let (rows, _) = screen(&mut app, 40, 10);
+        assert!(
+            rows.concat().contains("too small"),
+            "narrow viewport shows notice"
+        );
         // Input still works while the notice is up.
-        press(&mut app, KeyCode::Char('a')).unwrap();
+        press(&mut app, KeyCode::Char('a'));
         assert_eq!(app.query, "a");
     }
 }

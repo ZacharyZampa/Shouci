@@ -6,7 +6,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 
-use crate::state::{View, filter_label};
+use crate::state::{Scope, View};
 use crate::theme::Theme;
 
 /// Minimum usable terminal size. Below this the TUI renders a resize notice
@@ -23,6 +23,60 @@ pub(crate) const COMPACT_BELOW: u16 = 80;
 /// From this width the detail pane moves beside the list instead of under
 /// it, so long definitions get the full height.
 pub(crate) const SIDE_BY_SIDE_FROM: u16 = 120;
+
+/// A key and what it does, for the footer.
+pub(crate) type Key = (&'static str, &'static str);
+
+/// List actions first, then navigation, so import/export never scroll off
+/// the end of a narrow footer. Quit stays last.
+pub(crate) const SEARCH_KEYS: &[Key] = &[
+    ("Ctrl+O", "import"),
+    ("Ctrl+E", "export"),
+    ("Enter", "save"),
+    ("Shift+Tab", "switch"),
+    ("Tab", "mode"),
+    ("Esc", "clear"),
+    ("Ctrl+Q", "quit"),
+];
+
+/// The saved view's keys, which depend on the list shown.
+pub(crate) fn saved_keys(scope: Scope) -> &'static [Key] {
+    match scope {
+        Scope::All | Scope::NeedsReview => &[
+            ("i", "import"),
+            ("e", "export"),
+            ("d", "trash"),
+            ("a", "archive"),
+            ("n", "needs review"),
+            ("Shift+Tab", "switch"),
+            ("Tab", "list"),
+            ("Ctrl+R", "reload"),
+            ("Esc", "search"),
+            ("Ctrl+Q", "quit"),
+        ],
+        Scope::Archived => &[
+            ("i", "import"),
+            ("e", "export"),
+            ("d", "trash"),
+            ("a", "unarchive"),
+            ("n", "needs review"),
+            ("Shift+Tab", "switch"),
+            ("Tab", "list"),
+            ("Ctrl+R", "reload"),
+            ("Esc", "search"),
+            ("Ctrl+Q", "quit"),
+        ],
+        Scope::Trash => &[
+            ("r", "restore"),
+            ("d", "delete for good"),
+            ("Shift+Tab", "switch"),
+            ("Tab", "list"),
+            ("Ctrl+R", "reload"),
+            ("Esc", "search"),
+            ("Ctrl+Q", "quit"),
+        ],
+    }
+}
 
 /// Where each region of the screen goes for a given terminal size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,11 +128,11 @@ pub(crate) fn panes(area: Rect) -> Panes {
 #[must_use]
 pub(crate) fn row_line(
     marker: &str,
-    (simplified, traditional, pinyin): (&str, &str, &str),
+    (simplified, traditional, reading): (&str, &str, &str),
     gloss: &str,
     width: u16,
 ) -> Line<'static> {
-    let headword = if simplified == traditional || width < COMPACT_BELOW {
+    let headword = if traditional.is_empty() || simplified == traditional || width < COMPACT_BELOW {
         simplified.to_owned()
     } else {
         format!("{simplified} / {traditional}")
@@ -88,10 +142,11 @@ pub(crate) fn row_line(
         spans.push(Span::styled(format!("{marker} "), Theme::dim()));
     }
     spans.push(Span::styled(headword, Theme::headword()));
-    spans.push(Span::raw(format!(
-        "  {}  ",
-        vocab_pinyin::tone_marks(pinyin)
-    )));
+    if reading.is_empty() {
+        spans.push(Span::raw("  "));
+    } else {
+        spans.push(Span::raw(format!("  {reading}  ")));
+    }
     spans.push(Span::styled(gloss.to_owned(), Theme::dim()));
     Line::from(spans)
 }
@@ -114,13 +169,18 @@ pub(crate) fn query_cursor(header: Rect, header_text_width: usize) -> Position {
 /// Headword and reading as plain text, for status lines and the detail
 /// pane where there is no styling to separate them: `学 / 學 [xué]`.
 #[must_use]
-pub(crate) fn plain_headword(simplified: &str, traditional: &str, pinyin: &str) -> String {
-    let reading = vocab_pinyin::tone_marks(pinyin);
-    if simplified == traditional {
-        format!("{simplified} [{reading}]")
-    } else {
-        format!("{simplified} / {traditional} [{reading}]")
+pub(crate) fn plain_headword(simplified: &str, traditional: &str, reading: &str) -> String {
+    let mut text = simplified.to_owned();
+    if !traditional.is_empty() && traditional != simplified {
+        text.push_str(" / ");
+        text.push_str(traditional);
     }
+    if !reading.is_empty() {
+        text.push_str(" [");
+        text.push_str(reading);
+        text.push(']');
+    }
+    text
 }
 
 /// Key hints that fit in `room` cells, shown in their usual order. When not
@@ -163,8 +223,7 @@ pub(crate) fn header_line(
     mode_label: &str,
     query: &str,
     saved_len: usize,
-    filter_idx: usize,
-    filters: &[Option<vocab_core::ItemStatus>],
+    scope: Scope,
 ) -> Line<'static> {
     let mut spans = vec![Span::styled("shouci ", theme.accent())];
     match view {
@@ -174,14 +233,17 @@ pub(crate) fn header_line(
             spans.push(Span::raw(query.to_owned()));
         }
         View::Saved => {
-            let label = filters.get(filter_idx).copied().unwrap_or(None);
             spans.push(Span::styled(
-                format!("[saved · {}]", filter_label(label)),
+                format!("[saved · {}]", scope.label()),
                 theme.accent(),
             ));
             spans.push(Span::raw(format!(
                 "  {}",
-                crate::state::counted(saved_len, "word", "words")
+                crate::state::counted(
+                    u64::try_from(saved_len).unwrap_or(u64::MAX),
+                    "word",
+                    "words"
+                )
             )));
         }
     }
@@ -192,33 +254,12 @@ pub(crate) fn header_line(
 /// The error (when present) is literal text in the error slot — never color alone.
 #[must_use]
 pub(crate) fn help_line(
-    view: View,
     theme: Theme,
+    keys: &[Key],
     status: &str,
     error: Option<&str>,
     width: u16,
 ) -> Line<'static> {
-    // List actions first, then navigation, so import/export never scroll off
-    // the end of a narrow footer. Quit stays last.
-    const SEARCH_KEYS: &[(&str, &str)] = &[
-        ("Ctrl+O", "import"),
-        ("Ctrl+E", "export"),
-        ("Enter", "save"),
-        ("Shift+Tab", "switch"),
-        ("Tab", "mode"),
-        ("Esc", "clear"),
-        ("Ctrl+Q", "quit"),
-    ];
-    const SAVED_KEYS: &[(&str, &str)] = &[
-        ("i", "import"),
-        ("e", "export"),
-        ("d", "delete"),
-        ("Shift+Tab", "switch"),
-        ("Tab", "filter"),
-        ("Ctrl+R", "reload"),
-        ("Esc", "search"),
-        ("Ctrl+Q", "quit"),
-    ];
     // Transient message first: it just changed, so it must not be the part
     // that clips on narrow terminals. Idle footers still lead with the keys.
     let mut spans = Vec::new();
@@ -232,19 +273,17 @@ pub(crate) fn help_line(
     }
     let used = Line::from(spans.clone()).width();
     let room = usize::from(width).saturating_sub(used);
-    spans.extend(match view {
-        View::Search => key_spans(theme, SEARCH_KEYS, room),
-        View::Saved => key_spans(theme, SAVED_KEYS, room),
-    });
+    spans.extend(key_spans(theme, keys, room));
     Line::from(spans)
 }
 
-/// The transfer hint shown on the pane border itself, so import and export are
-/// visible on the box rather than only on a footer that can clip.
-pub(crate) fn pane_hint(view: View) -> &'static str {
-    match view {
-        View::Search => "Ctrl+O import · Ctrl+E export",
-        View::Saved => "i import · e export",
+/// The hint shown on the list pane's border, so the main actions are visible
+/// on the box rather than only on a footer that can clip.
+pub(crate) fn pane_hint(view: View, scope: Scope) -> &'static str {
+    match (view, scope) {
+        (View::Search, _) => "Ctrl+O import · Ctrl+E export",
+        (View::Saved, Scope::Trash) => "r restore · d delete for good",
+        (View::Saved, _) => "i import · e export",
     }
 }
 
@@ -260,40 +299,37 @@ pub(crate) fn detail_scroll_max(detail: &str, inner_width: u16, visible_height: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::STATUS_FILTERS;
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
 
     #[test]
     fn header_search_shows_mode_and_query() {
         let theme = Theme::monochrome();
-        let line = header_line(
-            View::Search,
-            theme,
-            "Pinyin",
-            "nihao",
-            0,
-            0,
-            &STATUS_FILTERS,
-        );
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let line = header_line(View::Search, theme, "Pinyin", "nihao", 0, Scope::All);
+        let text = text(&line);
         assert!(text.contains("shouci"), "{text}");
         assert!(text.contains("[Pinyin]"), "{text}");
         assert!(text.contains("nihao"), "{text}");
     }
 
     #[test]
-    fn header_saved_shows_filter_and_count() {
+    fn header_saved_shows_list_and_count() {
         let theme = Theme::monochrome();
-        let line = header_line(View::Saved, theme, "", "", 7, 0, &STATUS_FILTERS);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("[saved · all]"), "{text}");
-        assert!(text.contains("7 words"), "{text}");
+        let line = header_line(View::Saved, theme, "", "", 7, Scope::All);
+        let shown = text(&line);
+        assert!(shown.contains("[saved · all]"), "{shown}");
+        assert!(shown.contains("7 words"), "{shown}");
+        let trash = header_line(View::Saved, theme, "", "", 1, Scope::Trash);
+        assert!(text(&trash).contains("[saved · trash]  1 word"));
     }
 
     #[test]
     fn help_line_contains_view_keys_and_status() {
         let theme = Theme::monochrome();
-        let line = help_line(View::Search, theme, "3 results", None, 200);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let line = help_line(theme, SEARCH_KEYS, "3 results", None, 200);
+        let text = text(&line);
         assert!(text.contains("Enter"), "{text}");
         assert!(text.contains("save"), "{text}");
         assert!(!text.contains("Ctrl+S"), "{text}");
@@ -306,17 +342,27 @@ mod tests {
     #[test]
     fn help_line_surfaces_errors_literally() {
         let theme = Theme::monochrome();
-        let line = help_line(View::Saved, theme, "", Some("disk full"), 200);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let line = help_line(theme, saved_keys(Scope::All), "", Some("disk full"), 200);
+        let text = text(&line);
         assert!(text.contains("error: "), "{text}");
         assert!(text.contains("disk full"), "{text}");
     }
 
     #[test]
+    fn the_trash_offers_restore_and_delete_for_good() {
+        let theme = Theme::monochrome();
+        let line = help_line(theme, saved_keys(Scope::Trash), "", None, 200);
+        let text = text(&line);
+        assert!(text.contains("r restore"), "{text}");
+        assert!(text.contains("d delete for good"), "{text}");
+        assert!(!text.contains("export"), "{text}");
+    }
+
+    #[test]
     fn narrow_footers_drop_whole_hints_and_keep_quit() {
         let theme = Theme::monochrome();
-        let line = help_line(View::Search, theme, "", None, 40);
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let line = help_line(theme, SEARCH_KEYS, "", None, 40);
+        let text = text(&line);
         assert!(line.width() <= 40, "{text}");
         assert!(text.contains("Ctrl+Q quit"), "{text}");
         assert!(!text.ends_with(' '), "no half-cut hint: {text}");
@@ -349,11 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn rows_lead_with_the_headword_and_mark_tones() {
-        let text =
-            |line: Line<'_>| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
-        let wide = row_line("", ("学", "學", "xue2"), "learn", 100);
-        assert_eq!(text(wide.clone()), "学 / 學  xué  learn");
+    fn rows_lead_with_the_headword() {
+        let wide = row_line("", ("学", "學", "xué"), "learn", 100);
+        assert_eq!(text(&wide), "学 / 學  xué  learn");
         assert!(
             wide.spans[0]
                 .style
@@ -362,16 +406,20 @@ mod tests {
             "headword is bold"
         );
         assert_eq!(
-            text(row_line("", ("学", "學", "xue2"), "learn", 60)),
+            text(&row_line("", ("学", "學", "xué"), "learn", 60)),
             "学  xué  learn"
         );
         assert_eq!(
-            text(row_line("", ("你好", "你好", "ni3 hao3"), "hello", 100)),
+            text(&row_line("", ("你好", "你好", "nǐ hǎo"), "hello", 100)),
             "你好  nǐ hǎo  hello"
         );
         assert_eq!(
-            text(row_line("▸inferred", ("你", "你", "ni3"), "you", 100)),
-            "▸inferred 你  nǐ  you"
+            text(&row_line("saved", ("你", "你", "nǐ"), "you", 100)),
+            "saved 你  nǐ  you"
+        );
+        assert_eq!(
+            text(&row_line("new", ("蚌埠住了", "", ""), "keep it", 100)),
+            "new 蚌埠住了  keep it"
         );
     }
 
@@ -388,12 +436,13 @@ mod tests {
     }
 
     #[test]
-    fn plain_headwords_keep_brackets_and_marks() {
+    fn plain_headwords_keep_brackets_and_drop_what_is_missing() {
         assert_eq!(
-            plain_headword("学校", "學校", "xue2 xiao4"),
+            plain_headword("学校", "學校", "xué xiào"),
             "学校 / 學校 [xué xiào]"
         );
-        assert_eq!(plain_headword("你好", "你好", "ni3 hao3"), "你好 [nǐ hǎo]");
+        assert_eq!(plain_headword("你好", "你好", "nǐ hǎo"), "你好 [nǐ hǎo]");
+        assert_eq!(plain_headword("蚌埠住了", "", ""), "蚌埠住了");
     }
 
     #[test]

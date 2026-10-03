@@ -552,6 +552,36 @@ fn a_file_changed_after_the_preview_is_not_imported() {
 }
 
 #[test]
+fn an_import_file_is_read_as_the_format_that_fits() {
+    // Given an Anki export and a Pleco file
+    let shouci = sandbox();
+    let id = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let dir = scratch_dir("detect");
+    let anki = dir.join("anki.txt");
+    let request = ExportRequest {
+        scope: ExportScope::Selected(vec![id]),
+        ..ExportRequest::default()
+    };
+    let plan = shouci.preview_export(&anki, "anki", &request).unwrap();
+    shouci.apply_export(&plan).unwrap();
+    let pleco = dir.join("pleco.txt");
+    std::fs::write(&pleco, "你好\tni3 hao3\thello\n").unwrap();
+    // Then each is read as its own format
+    for (path, expected) in [(&anki, "anki"), (&pleco, "pleco")] {
+        let plan = shouci
+            .detect_import(path, ImportPolicy::Skip, false)
+            .unwrap();
+        assert_eq!(plan.connector_id, expected, "{}", path.display());
+    }
+    // and a missing file says so
+    let err = shouci
+        .detect_import(&dir.join("missing.txt"), ImportPolicy::Skip, false)
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn unknown_connectors_are_named() {
     let shouci = sandbox();
     let err = shouci

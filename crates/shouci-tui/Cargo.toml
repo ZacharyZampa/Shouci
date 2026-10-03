@@ -12,14 +12,11 @@ ratatui = "0.29.0"
 # xdg-portal and wayland stacks, and the typed-path prompt is the fallback
 # wherever no panel can open (headless, SSH, no portal).
 rfd = { version = "0.17.2", default-features = false }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
-vocab-core = { path = "../vocab-core" }
-vocab-db = { path = "../vocab-db" }
-vocab-dictionary = { path = "../vocab-dictionary" }
-vocab-pinyin = { path = "../vocab-pinyin" }
-vocab-capture = { path = "../vocab-capture" }
-vocab-exchange = { path = "../vocab-exchange" }
-vocab-search = { path = "../vocab-search" }
+shouci-core = { path = "../shouci-core" }
+
+[dev-dependencies]
+# Tests drive the app over a scratch library with the sample dictionary.
+shouci-core = { path = "../shouci-core", features = ["test-support"] }
 
 [lints]
 workspace = true

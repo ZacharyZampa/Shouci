@@ -1,8 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/shouci-cli",
     "crates/shouci-core",
     "crates/shouci-ffi",
+    "crates/shouci-tui",
     "crates/vocab-anki",
     "crates/vocab-core",
     "crates/vocab-db",
@@ -11,11 +13,6 @@ members = [
     "crates/vocab-pinyin",
     "crates/vocab-pleco",
     "crates/vocab-search",
-]
-# Frontends rejoin as they move onto shouci-core (milestone 2).
-exclude = [
-    "crates/shouci-cli",
-    "crates/shouci-tui",
 ]
 
 [workspace.package]

@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Build and install Shouci for Mac from this checkout.
+# Build and install Shouci for Mac from this checkout: the app, and the
+# `shouci` command and `shouci-tui` for the terminal.
 #
 #   scripts/install.sh              install, or update after `git pull`
 #   scripts/install.sh --status     show what is installed and where
-#   scripts/install.sh --uninstall  remove the app (your words stay)
-#
-# The CLI and TUI are moving onto the new core and are not built here yet.
+#   scripts/install.sh --uninstall  remove them (your words stay)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,6 +13,11 @@ MACAPP="${HOME}/Applications/Shouci.app"
 DATA_DIR="${SHOUCI_HOME:-${HOME}/Library/Application Support/Shouci}"
 DICTIONARIES="${SHOUCI_DICTIONARIES:-${DATA_DIR}/dictionaries}"
 LOGIN_AGENT="${HOME}/Library/LaunchAgents/com.zacharyzampa.shouci.plist"
+# The terminal tools live in BIN_DIR, linked from ~/.cargo/bin, which rustup
+# puts on PATH.
+BIN_DIR="${HOME}/.local/bin"
+CARGO_BIN="${HOME}/.cargo/bin"
+TOOLS=(shouci shouci-tui)
 OLD_AGENT_LABEL="com.plecocompanion.agent"
 OLD_AGENT_PLIST="${HOME}/Library/LaunchAgents/${OLD_AGENT_LABEL}.plist"
 OLD_DATA="${HOME}/Library/Application Support/pleco-companion"
@@ -49,6 +53,27 @@ quit_shouci() {
   fi
 }
 
+install_tools() {
+  echo "==> installing shouci and shouci-tui to ${BIN_DIR}"
+  mkdir -p "${BIN_DIR}" "${CARGO_BIN}"
+  local tool
+  for tool in "${TOOLS[@]}"; do
+    install -m 0755 "${ROOT}/target/release/${tool}" "${BIN_DIR}/${tool}"
+    ln -sfn "${BIN_DIR}/${tool}" "${CARGO_BIN}/${tool}"
+  done
+}
+
+remove_tools() {
+  local tool
+  for tool in "${TOOLS[@]}"; do
+    # Only the link this script made; a `cargo install` copy stays.
+    if [ "$(readlink "${CARGO_BIN}/${tool}" 2>/dev/null)" = "${BIN_DIR}/${tool}" ]; then
+      rm -f "${CARGO_BIN}/${tool}"
+    fi
+    rm -f "${BIN_DIR}/${tool}"
+  done
+}
+
 remove_legacy_agent() {
   launchctl bootout "gui/$(id -u)/${OLD_AGENT_LABEL}" >/dev/null 2>&1 || true
   pkill -x vocab-agent 2>/dev/null || true
@@ -68,6 +93,14 @@ status() {
   else
     echo "running:      no"
   fi
+  local tool
+  for tool in "${TOOLS[@]}"; do
+    if [ -x "${BIN_DIR}/${tool}" ]; then
+      printf '%-13s %s\n' "${tool}:" "${BIN_DIR}/${tool}"
+    else
+      printf '%-13s %s\n' "${tool}:" "not installed"
+    fi
+  done
   if [ -f "${DATA_DIR}/user.db" ]; then
     echo "your words:   ${DATA_DIR}/user.db"
   else
@@ -88,9 +121,10 @@ status() {
 
 do_uninstall() {
   quit_shouci
-  echo "==> removing ${MACAPP}"
+  echo "==> removing ${MACAPP}, shouci, and shouci-tui"
   rm -rf "${MACAPP}"
   rm -f "${LOGIN_AGENT}"
+  remove_tools
   remove_legacy_agent
   echo
   echo "Shouci is removed. Your words and dictionary are still in:"
@@ -112,11 +146,15 @@ do_install() {
   trap 'rm -rf "${stage}"' RETURN
   "${ROOT}/macos/scripts/package.sh" "${stage}/Shouci.app"
 
+  echo "==> building shouci and shouci-tui"
+  (cd "${ROOT}" && cargo build -q --release -p shouci-cli -p shouci-tui)
+
   quit_shouci
   echo "==> installing to ${MACAPP}"
   mkdir -p "$(dirname "${MACAPP}")"
   rm -rf "${MACAPP}"
   ditto "${stage}/Shouci.app" "${MACAPP}"
+  install_tools
   remove_legacy_agent
 
   echo "==> starting Shouci"
@@ -127,6 +165,7 @@ do_install() {
   echo
   echo "  Quick search:  Control-Option-V from any app (change it in Settings)"
   echo "  Your library:  Command-O in quick search, or open Shouci from Spotlight"
+  echo "  Terminal:      shouci --help, or shouci-tui"
   echo "  Update later:  git pull && ${0}"
   echo "  Remove:        ${0} --uninstall"
 }

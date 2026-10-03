@@ -31,7 +31,8 @@ cd Shouci
 
 This downloads and builds the dictionary, builds Shouci for Apple silicon and
 Intel, installs it to `~/Applications/Shouci.app`, and starts it. Look for
-**文** in the menu bar.
+**文** in the menu bar. It also installs `shouci` and `shouci-tui` for the
+terminal ([In the terminal](#in-the-terminal)).
 
 Shouci is built on your Mac and signed to run locally, so Gatekeeper doesn't
 ask about it. (There is no paid Apple developer account behind it, so a copy
@@ -114,8 +115,9 @@ Right-click 文 › Settings, or ⌘, in Shouci.
 | Your words | `~/Library/Application Support/Shouci/user.db` |
 | The dictionary | `~/Library/Application Support/Shouci/dictionaries/` |
 | Open at login | `~/Library/LaunchAgents/com.zacharyzampa.shouci.plist` (only if turned on) |
+| `shouci`, `shouci-tui` | `~/.local/bin/`, linked from `~/.cargo/bin/` |
 
-Uninstalling removes the app and the login item; delete
+Uninstalling removes the app, the terminal tools, and the login item; delete
 `~/Library/Application Support/Shouci` to remove your words too. Shouci logs
 errors to the system log and never logs what you search.
 
@@ -138,11 +140,41 @@ cargo run --release -p vocab-dictionary --example ensure -- --force \
   ~/Library/Application\ Support/Shouci/dictionaries/cc-cedict.db
 ```
 
-## CLI and TUI
+## In the terminal
 
-The command-line tool (`shouci`) and the terminal UI (`shouci-tui`) are
-moving onto the new core and are not built from this branch yet. The proof-of-
-concept versions are on `main`.
+`shouci` and `shouci-tui` use the same library as the app: a word saved in
+one shows up in the others.
+
+### `shouci`
+
+```sh
+shouci search to travel          # characters, pinyin, or English
+shouci add 旅行                   # saves the dictionary's match
+shouci add 猫 --pick 2            # several match: saves result 2 of `shouci search 猫`
+shouci add 蚌埠住了               # no entry: kept as typed, to fill in later
+shouci list                      # newest first; --needs-review, --tag, --view trash, …
+shouci show 旅行                  # your entry beside the dictionary's
+shouci edit 旅行 --notes "for the trip"
+shouci delete 旅行                # to the trash; `shouci restore` brings it back
+shouci import ~/Downloads/flash.txt   # Pleco or Anki, detected; --dry-run previews
+shouci export ~/Desktop/new.txt       # words new to Pleco; --to anki, --all
+```
+
+Name a saved word by its id (from `shouci list`) or its characters. Add
+`--json` to any command for the result as JSON. `shouci --help` lists the
+rest: tags, collections, archiving, and dictionaries.
+
+The first search downloads the dictionary if the app hasn't. Set `SHOUCI_HOME`
+to use a library somewhere else.
+
+### `shouci-tui`
+
+Type to search. **Enter** saves the highlighted word, **Ctrl+Z** takes the
+save back, and **Tab** chooses how your search is read (Hanzi, pinyin,
+English, or worked out). **F1** (or **Shift+Tab**) shows your words: **Tab**
+steps through all, needs review, archived, and the trash; **d** moves a word
+to the trash, **a** archives it, **n** marks it for review. **Ctrl+O**
+imports, **Ctrl+E** exports, **Ctrl+Q** quits.
 
 <img width="1053" height="866" alt="TUI Saved List" src="https://github.com/user-attachments/assets/7092da99-9401-4afc-a540-722a333b5952" />
 
