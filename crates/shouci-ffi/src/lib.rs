@@ -18,7 +18,9 @@ use shouci_core::{
 mod remote;
 mod transfer;
 
-pub use transfer::{ExportPlanView, ExportPreview, ImportPlanView, ImportPreview, IssueView};
+pub use transfer::{
+    DetectedImport, ExportPlanView, ExportPreview, ImportPlanView, ImportPreview, IssueView,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -294,6 +296,20 @@ impl Core {
             .shouci
             .preview_import(Path::new(&path), &connector, policy, force)?;
         Ok(Arc::new(ImportPreview::new(plan)))
+    }
+
+    /// `preview_import` with whichever format reads the file best.
+    pub fn detect_import(
+        &self,
+        path: String,
+        policy: ImportPolicy,
+        force: bool,
+    ) -> Result<DetectedImport> {
+        let found = self.shouci.detect_import(Path::new(&path), policy, force)?;
+        Ok(DetectedImport {
+            preview: Arc::new(ImportPreview::new(found.plan)),
+            unambiguous: found.unambiguous,
+        })
     }
 
     pub fn apply_import(&self, preview: Arc<ImportPreview>) -> Result<TransferSummary> {

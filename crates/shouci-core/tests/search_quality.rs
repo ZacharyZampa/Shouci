@@ -99,6 +99,55 @@ fn top50_surface_when_the_kind_is_given() {
     run(50, true, true);
 }
 
+/// Everyday English finds the everyday word first, not a rare one that
+/// happens to say just that (暍 `hot`) or a verb sense nobody uses (屯驻
+/// `to quarter`).
+#[test]
+fn common_words_lead_their_english() {
+    let shouci = shouci();
+    let words = [
+        ("hot", "热"),
+        ("quarter", "刻"),
+        ("cold", "冷"),
+        ("big", "大"),
+        ("small", "小"),
+        ("eat", "吃"),
+        ("drink", "喝"),
+        ("water", "水"),
+        ("dog", "狗"),
+        ("cat", "猫"),
+        ("book", "书"),
+        ("friend", "朋友"),
+        ("red", "红"),
+        ("slow", "慢"),
+        ("tired", "累"),
+        ("hungry", "饿"),
+        ("snow", "雪"),
+        ("buy", "买"),
+        ("sell", "卖"),
+        ("expensive", "贵"),
+        ("cheap", "便宜"),
+        ("bitter", "苦"),
+        ("sour", "酸"),
+        ("salty", "咸"),
+    ];
+    let mut misses = Vec::new();
+    for (english, word) in words {
+        let found = shouci
+            .search_dictionary(english, None, Some(3))
+            .expect("search");
+        let heads: Vec<&str> = found
+            .candidates
+            .iter()
+            .map(|c| c.simplified.as_str())
+            .collect();
+        if heads.first() != Some(&word) {
+            misses.push(format!("{english:?} expected {word} first in {heads:?}"));
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
+
 /// Verbs are searched the way the dictionary writes them: every probe word
 /// with a `to <english>` sense surfaces for `to <english>`. (Retrieval used
 /// to keep the first 2000 glosses with any word of the query, and `to`

@@ -7,7 +7,7 @@ use vocab_exchange::{
     ExportPlan, ExportRequest, ImportPlan, ImportPolicy, TransferSummary, content_hash,
 };
 
-use crate::dto::ConnectorView;
+use crate::dto::{ConnectorView, DetectedImport};
 use crate::{Error, Shouci, expand_tilde};
 
 /// `~` expanded and made absolute, so the same file is always the same
@@ -86,7 +86,8 @@ impl Shouci {
     /// [`Shouci::preview_import`] with whichever connector reads the file
     /// best: the fewest error lines, then the fewest words it could not
     /// resolve or had to drop. A tie goes to the connector listed first.
-    /// The plan's `connector_id` says which one it was.
+    /// The plan's `connector_id` says which one it was, and `unambiguous`
+    /// whether any other read the file as well.
     ///
     /// # Errors
     ///
@@ -96,16 +97,22 @@ impl Shouci {
         path: &Path,
         policy: ImportPolicy,
         force: bool,
-    ) -> Result<ImportPlan> {
+    ) -> Result<DetectedImport> {
         let mut best: Option<((u32, u32), ImportPlan)> = None;
+        let mut unambiguous = true;
         let mut first_error = None;
         for connector in self.connectors().into_iter().filter(|c| c.can_import) {
             match self.preview_import(path, &connector.id, policy, force) {
                 Ok(plan) => {
                     let counts = plan.counts();
                     let misfit = (counts.errors, counts.unresolved + counts.drops);
-                    if best.as_ref().is_none_or(|(fit, _)| misfit < *fit) {
-                        best = Some((misfit, plan));
+                    match &best {
+                        Some((fit, _)) if misfit > *fit => {}
+                        Some((fit, _)) if misfit == *fit => unambiguous = false,
+                        _ => {
+                            unambiguous = true;
+                            best = Some((misfit, plan));
+                        }
                     }
                 }
                 Err(err) => {
@@ -114,7 +121,7 @@ impl Shouci {
             }
         }
         match (best, first_error) {
-            (Some((_, plan)), _) => Ok(plan),
+            (Some((_, plan)), _) => Ok(DetectedImport { plan, unambiguous }),
             (None, Some(err)) => Err(err),
             (None, None) => Err(Error::unavailable("this build has no format to import")),
         }

@@ -644,11 +644,14 @@ pub fn apply_import(
     summary.skipped = counts.skips;
     summary.dropped = counts.drops;
     summary.unresolved = counts.unresolved;
-    if counts.conflicts > 0 {
-        summary.notes.push(format!(
-            "{} fields differed from saved words; the saved values were kept",
-            counts.conflicts
-        ));
+    match counts.conflicts {
+        0 => {}
+        1 => summary
+            .notes
+            .push("1 field differed from a saved word; the saved value was kept".to_owned()),
+        n => summary.notes.push(format!(
+            "{n} fields differed from saved words; the saved values were kept"
+        )),
     }
     Ok(summary)
 }

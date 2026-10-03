@@ -1059,7 +1059,7 @@ fn import(args: &ImportArgs, out: Out) -> Result<ExitCode> {
     let policy = args.existing.into();
     let plan = match &args.from {
         Some(format) => shouci.preview_import(&args.file, format, policy, args.force)?,
-        None => shouci.detect_import(&args.file, policy, args.force)?,
+        None => shouci.detect_import(&args.file, policy, args.force)?.plan,
     };
     let format = format_name(&shouci, &plan.connector_id);
     if args.dry_run {

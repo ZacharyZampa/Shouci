@@ -3,6 +3,8 @@
 //! crosses over, and an import plan cannot be edited between preview and
 //! apply.
 
+use std::sync::Arc;
+
 use shouci_core::{
     ExportPlan, ImportCounts, ImportPlan, ImportPolicy, Issue, PlannedLine, Severity,
 };
@@ -39,6 +41,14 @@ pub struct ImportPlanView {
     pub lines: Vec<PlannedLine>,
     pub notes: Vec<String>,
     pub counts: ImportCounts,
+}
+
+/// A file read as the format that fits it best.
+#[derive(uniffi::Record)]
+pub struct DetectedImport {
+    pub preview: Arc<ImportPreview>,
+    /// No other format reads the file as well.
+    pub unambiguous: bool,
 }
 
 #[derive(uniffi::Object)]

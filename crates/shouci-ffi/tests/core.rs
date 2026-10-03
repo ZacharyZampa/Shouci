@@ -233,7 +233,18 @@ fn import_and_export_through_previews() {
         .unwrap();
     assert_eq!(preview.view().words, vec!["米饭", "你好"]);
     assert_eq!(lib.core.apply_export(preview).unwrap().written, 2);
-    assert!(std::fs::read_to_string(out).unwrap().contains("米饭"));
+    assert!(std::fs::read_to_string(&out).unwrap().contains("米饭"));
+
+    let found = lib
+        .core
+        .detect_import(
+            out.to_string_lossy().into_owned(),
+            ImportPolicy::Skip,
+            false,
+        )
+        .unwrap();
+    assert_eq!(found.preview.view().connector_id, "anki");
+    assert!(found.unambiguous);
 }
 
 #[test]

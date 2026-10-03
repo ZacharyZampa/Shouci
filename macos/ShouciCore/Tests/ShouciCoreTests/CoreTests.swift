@@ -77,6 +77,10 @@ private func library() throws -> (Core, URL) {
     #expect(outgoing.view().words == ["米饭"])
     #expect(try core.applyExport(preview: outgoing).written == 1)
     #expect(try String(contentsOf: out, encoding: .utf8).contains("米饭"))
+
+    let found = try core.detectImport(path: out.path, policy: .merge, force: false)
+    #expect(found.preview.view().connectorId == "anki")
+    #expect(found.unambiguous)
 }
 
 @Test func pinyinHelpers() {

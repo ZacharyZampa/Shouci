@@ -568,11 +568,19 @@ fn an_import_file_is_read_as_the_format_that_fits() {
     std::fs::write(&pleco, "你好\tni3 hao3\thello\n").unwrap();
     // Then each is read as its own format
     for (path, expected) in [(&anki, "anki"), (&pleco, "pleco")] {
-        let plan = shouci
+        let found = shouci
             .detect_import(path, ImportPolicy::Skip, false)
             .unwrap();
-        assert_eq!(plan.connector_id, expected, "{}", path.display());
+        assert_eq!(found.plan.connector_id, expected, "{}", path.display());
+        assert!(found.unambiguous, "{}", path.display());
     }
+    // An empty file reads as either, so neither is sure
+    let empty = dir.join("empty.txt");
+    std::fs::write(&empty, "").unwrap();
+    let found = shouci
+        .detect_import(&empty, ImportPolicy::Skip, false)
+        .unwrap();
+    assert!(!found.unambiguous);
     // and a missing file says so
     let err = shouci
         .detect_import(&dir.join("missing.txt"), ImportPolicy::Skip, false)

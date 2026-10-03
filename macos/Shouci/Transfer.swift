@@ -15,7 +15,7 @@ final class ImportModel {
     var connector: String? {
         didSet { if connector != oldValue { refresh() } }
     }
-    /// True when only one format could read the file.
+    /// True when no other format reads the file as well.
     private(set) var detected = false
     var policy: ImportPolicy = .merge {
         didSet { if policy != oldValue { refresh() } }
@@ -89,51 +89,32 @@ final class ImportModel {
         detect()
     }
 
-    /// Reads the file as every format; keeps the one that reads it best.
+    /// Reads the file as whichever format fits it best (the core tries each).
     private func detect() {
         guard let file else { return }
         let path = file.path
         let policy = self.policy
-        let ids = formats.map(\.id)
         previewing?.cancel()
         isWorking = true
         previewing = Task {
             defer { isWorking = false }
-            let attempts = (try? await library.app.call { core in
-                ids.map { id -> Attempt in
-                    do {
-                        return Attempt(id: id, preview: try core.previewImport(path: path, connector: id, policy: policy, force: false), problem: nil)
-                    } catch {
-                        return Attempt(id: id, preview: nil, problem: describe(error))
-                    }
+            do {
+                let found = try await library.app.call {
+                    try $0.detectImport(path: path, policy: policy, force: false)
                 }
-            }) ?? []
-            guard !Task.isCancelled else { return }
-            let read = attempts.compactMap { attempt in attempt.preview.map { (attempt.id, $0, $0.view()) } }
-                .sorted { Self.misfit($0.2) < Self.misfit($1.2) }
-            guard let best = read.first else {
-                problem = attempts.compactMap(\.problem).first ?? "This file can’t be read as Pleco or Anki text."
-                return
+                guard !Task.isCancelled else { return }
+                let plan = found.preview.view()
+                detected = found.unambiguous
+                adopting = true
+                connector = plan.connectorId
+                adopting = false
+                preview = found.preview
+                self.plan = plan
+            } catch {
+                guard !Task.isCancelled else { return }
+                problem = describe(error)
             }
-            detected = read.count == 1 || Self.misfit(best.2) < Self.misfit(read[1].2)
-            adopting = true
-            connector = best.0
-            adopting = false
-            preview = best.1
-            plan = best.2
         }
-    }
-
-    /// How badly a format fits the file: error lines first, then lines it
-    /// could not resolve.
-    private static func misfit(_ plan: ImportPlanView) -> (UInt32, UInt32) {
-        (plan.counts.errors, plan.counts.unresolved + plan.counts.drops)
-    }
-
-    private struct Attempt: Sendable {
-        let id: String
-        let preview: ImportPreview?
-        let problem: String?
     }
 
     private func refresh() {

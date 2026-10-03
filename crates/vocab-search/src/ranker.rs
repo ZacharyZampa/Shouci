@@ -151,22 +151,27 @@ impl DeterministicRanker {
         };
         // Senses come most important first: among words that all have the
         // query as a sense, the one whose first sense it is leads. A rare
-        // word gives up a place or two, so it does not lead a common word
-        // for having fewer senses.
+        // word gives up places, so it does not lead a common word for
+        // having fewer senses: 暍 is only `hot`, but 热 is the word.
         let sense_position = senses
             .iter()
             .position(|sense| is_exact_sense(sense, &query))
             .unwrap_or(0);
-        let rarity = match cand.entry.frequency_rank {
-            Some(rank) if rank <= 10_000 => 0,
-            Some(rank) if rank <= 50_000 => 1,
-            Some(_) => 2,
+        let rarity = match (cand.entry.frequency_rank, cand.entry.hsk_rank) {
+            (Some(rank), _) if rank <= 10_000 => 0,
+            // Learners are taught it.
+            (_, Some(_)) => 1,
+            (Some(_), None) => 3,
             // No frequency at all: rare in modern Chinese.
-            None => 5,
+            (None, None) => 5,
         };
+        // A word nobody uses does not lead for having the query as a sense:
+        // 屯驻 is `to quarter` (troops), and 刻 is the quarter hour.
+        let known = cand.entry.frequency_rank.is_some() || cand.entry.hsk_rank.is_some();
 
         RankKey {
-            exact_single_gloss: !query.is_empty()
+            exact_single_gloss: known
+                && !query.is_empty()
                 && senses.iter().any(|sense| is_exact_sense(sense, &query)),
             gloss_prefix: !query.is_empty() && readings().any(|r| r.starts_with(&query)),
             gloss_word_prefix: !query.is_empty()
@@ -655,6 +660,57 @@ mod tests {
     }
 
     #[test]
+    fn english_a_rare_word_does_not_lead_for_having_fewer_senses() {
+        // As CC-CEDICT writes them: `hot` is 热's third sense, and 暍's only.
+        let rare = cand(1, "暍", "暍", "he4", &["hot"], Some(33_347), "src");
+        let mut hot = cand(
+            2,
+            "热",
+            "熱",
+            "re4",
+            &[
+                "to warm up",
+                "to heat up",
+                "hot (of weather)",
+                "heat",
+                "fervent",
+            ],
+            Some(1580),
+            "src",
+        );
+        hot.entry.hsk_rank = Some(1);
+        let ranked = ranker().rank_english("hot", vec![rare, hot]);
+        assert_eq!(ranked[0].entry.simplified, "热");
+    }
+
+    #[test]
+    fn english_an_unused_word_does_not_lead_on_its_sense() {
+        // 屯驻 means `to quarter` troops, and is in no frequency list or
+        // HSK level; 刻 is the quarter hour.
+        let station = cand(
+            1,
+            "屯驻",
+            "屯駐",
+            "tun2 zhu4",
+            &["to station; to quarter; to garrison"],
+            None,
+            "src",
+        );
+        let mut quarter = cand(
+            2,
+            "刻",
+            "刻",
+            "ke4",
+            &["quarter (hour)", "moment", "to carve"],
+            Some(11_122),
+            "src",
+        );
+        quarter.entry.hsk_rank = Some(2);
+        let ranked = ranker().rank_english("quarter", vec![station, quarter]);
+        assert_eq!(ranked[0].entry.simplified, "刻");
+    }
+
+    #[test]
     fn english_a_word_with_no_frequency_does_not_lead() {
         // 叕 has the sense first, but no frequency at all; 缺少 is common.
         let rare = cand(1, "叕", "叕", "zhuo2", &["to lack"], None, "src");
@@ -743,13 +799,14 @@ mod tests {
 
     #[test]
     fn english_classifier_note_counts_as_exact_lemma() {
+        // One frequency for all, so only the lemma decides.
         let lemma = cand(
             3,
             "猫",
             "貓",
             "mao1",
             &["cat (CL:隻|只[zhi1])", "(dialect) to hide oneself"],
-            None,
+            Some(500),
             "src",
         );
         let slang = cand(
@@ -758,7 +815,7 @@ mod tests {
             "喵星人",
             "miao1 xing1 ren2",
             &["cat (Internet slang)"],
-            None,
+            Some(500),
             "src",
         );
         let literary = cand(
@@ -767,7 +824,7 @@ mod tests {
             "狸奴",
             "li2 nu2",
             &["cat (literary or jocular)"],
-            None,
+            Some(500),
             "src",
         );
         let ranked =
@@ -780,16 +837,25 @@ mod tests {
 
     #[test]
     fn english_to_verb_counts_as_exact_lemma() {
+        // One frequency for both, so only the lemma decides.
         let go = cand(
             2,
             "去",
             "去",
             "qu4",
             &["to go", "to leave", "to remove"],
-            None,
+            Some(500),
             "src",
         );
-        let curse = cand(1, "去死", "去死", "qu4 si3", &["go to hell!"], None, "src");
+        let curse = cand(
+            1,
+            "去死",
+            "去死",
+            "qu4 si3",
+            &["go to hell!"],
+            Some(500),
+            "src",
+        );
         let ranked = ranker().rank_english("go", vec![curse.clone(), go.clone()]);
         assert_eq!(
             ranked[0].entry.simplified, "去",

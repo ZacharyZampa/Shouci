@@ -28,9 +28,10 @@ use rusqlite::Connection;
 
 pub use config::{Config, expand_tilde, expand_tilde_in};
 pub use dto::{
-    BulkAction, BulkResult, CandidateView, ConnectorView, DictionaryEntryView, DictionaryResults,
-    DictionaryStatus, DictionaryView, GroupView, ItemView, LegacyImport, LibraryResults,
-    LoadingStage, ManualWord, QuickAdd, SaveOutcome, SaveResult, SavedRef, SourceView,
+    BulkAction, BulkResult, CandidateView, ConnectorView, DetectedImport, DictionaryEntryView,
+    DictionaryResults, DictionaryStatus, DictionaryView, GroupView, ItemView, LegacyImport,
+    LibraryResults, LoadingStage, ManualWord, QuickAdd, SaveOutcome, SaveResult, SavedRef,
+    SourceView,
 };
 pub use search::DEFAULT_LIMIT;
 pub use vocab_core::connector::{Issue, Severity};

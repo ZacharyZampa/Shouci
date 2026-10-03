@@ -145,7 +145,10 @@ fn skip_leaves_saved_words_alone_and_reports_differences() {
     assert_eq!(find(&conn, "你好").definition, "hi there");
     assert_eq!(item_collections(&conn, id).unwrap(), [] as [String; 0]);
     assert!(
-        summary.notes.iter().any(|note| note.contains("kept")),
+        summary
+            .notes
+            .iter()
+            .any(|note| note == "1 field differed from a saved word; the saved value was kept"),
         "{:?}",
         summary.notes
     );

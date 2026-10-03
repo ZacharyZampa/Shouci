@@ -551,7 +551,7 @@ impl<'a> App<'a> {
 
     /// Imports a file in whichever format reads it, and says what changed.
     fn import(&self, path: &Path, policy: ImportPolicy) -> Result<String> {
-        let plan = self.shouci.detect_import(path, policy, false)?;
+        let plan = self.shouci.detect_import(path, policy, false)?.plan;
         if plan.refused {
             let errors = plan.counts().errors;
             let first = plan

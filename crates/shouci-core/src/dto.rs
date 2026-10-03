@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use vocab_core::{Lifecycle, MatchBasis, SourceKind, Verification, VocabItem};
 use vocab_dictionary::{Candidate, display_definition};
+use vocab_exchange::ImportPlan;
 use vocab_pinyin::tone_marks;
 use vocab_search::QueryKind;
 
@@ -323,6 +324,14 @@ pub struct ConnectorView {
     pub extensions: Vec<String>,
     pub can_import: bool,
     pub can_export: bool,
+}
+
+/// A file read as the format that fits it best.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedImport {
+    pub plan: ImportPlan,
+    /// No other format reads the file as well.
+    pub unambiguous: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

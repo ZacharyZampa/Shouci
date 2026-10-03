@@ -158,6 +158,9 @@ query (at most 100 characters)
   → rank (never drop)
       match quality (exact gloss, gloss prefix, …) → dictionary priority →
       frequency → HSK → entry id
+      English: an exact sense leads only for a word with a frequency or an
+      HSK level, and a word outside both the top 10,000 and HSK gives up
+      places (热 before 暍 for `hot`, 刻 before 屯驻 for `quarter`)
   → frontends cap what they show (quick search 8, CLI 20, TUI 50)
 ```
 
@@ -199,7 +202,8 @@ apply_import(plan)
   and tags and collections are only ever added.
 - **Format detection** (`detect_import`) previews with every connector and
   keeps the one with the fewest error lines, then the fewest unresolved or
-  dropped words. The Mac app applies the same rule in Swift.
+  dropped words. It also says whether the choice was unambiguous (no other
+  connector read the file as well), which the Mac app shows as Detected.
 
 Export:
 
