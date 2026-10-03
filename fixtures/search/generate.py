@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build fixtures/search/top1000.tsv from HSK 3.0 + dictionary.db."""
+"""Build fixtures/search/top1000.tsv from HSK 3.0 + cc-cedict.db."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sqlite3
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-HSK = ROOT / "data/dictionary/sources/hsk30-expanded.csv"
+HSK = ROOT / "data/dictionaries/sources/hsk30-expanded.csv"
 OUT = Path(__file__).with_name("top1000.tsv")
 MARKS = {
     "ā": "a1",
@@ -41,11 +41,12 @@ MARKS = {
 
 
 def dict_path() -> Path:
-    installed = Path.home() / "Library/Application Support/pleco-companion/dictionary.db"
-    local = ROOT / "data/dictionary/dictionary.db"
-    if installed.is_file():
-        return installed
-    return local
+    """The build the search-quality tests read, else the installed app's."""
+    local = ROOT / "data/dictionaries/cc-cedict.db"
+    installed = Path.home() / "Library/Application Support/Shouci/dictionaries/cc-cedict.db"
+    if local.is_file() or not installed.is_file():
+        return local
+    return installed
 
 
 def norm_pinyin(text: str) -> str:

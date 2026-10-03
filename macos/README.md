@@ -49,10 +49,12 @@ build while the installed app is running, give it another bundle id:
   closed, it is back to the menu bar only.
 - The window holds the whole library in memory (scopes, counts, and sorting
   are instant) and polls the core's data version, so words saved from quick
-  search or the CLI show up within two seconds.
+  search, `shouci`, or `shouci-tui` show up within two seconds.
 - Import reads the file with every format the core has and keeps the one
   that reads it best, so detection is the core's own parsers, not a guess
-  in Swift. Nothing is written until Import, and export previews (with
+  in Swift. (It is the rule of the core's `detect_import`, which the CLI and
+  TUI call; the app keeps its own loop to show whether the choice was
+  clear.) Nothing is written until Import, and export previews (with
   counts) before writing.
 - Settings live in `UserDefaults` under the menu-bar app's old keys
   (`ShouciHotkey*`), and open-at-login is the same user LaunchAgent

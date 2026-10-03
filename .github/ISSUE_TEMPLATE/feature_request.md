@@ -7,7 +7,7 @@ assignees: ''
 
 ---
 
-**If you'd like make a pull request with a proposed solution for your feature, please feel free to do so**
+**If you'd like to make a pull request with a proposed solution for your feature, please feel free to do so**
 
 **Is your feature request related to a problem? Please describe.**
 A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]

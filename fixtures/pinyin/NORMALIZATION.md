@@ -1,6 +1,6 @@
 # Pinyin normalization matrix
 
-Spec-first contract for `vocab-pinyin::normalize`, now implemented in Phase 1.
+Spec-first contract for `vocab-pinyin::normalize`.
 Each row is an input/output pair pinned by unit tests.
 
 Rules, in order:
