@@ -106,6 +106,7 @@ private struct ItemDetail: View {
                 }
                 status
                 yourEntry
+                    .zIndex(1)
                 dictionarySection
                 provenance
             }
@@ -113,8 +114,9 @@ private struct ItemDetail: View {
             .padding(.vertical, 26)
             .frame(maxWidth: 760, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .endsEditingOnClick()
         }
-        .task(id: LookupKey(item: item.id, rev: item.rev, dictionary: chosenDictionary)) {
+        .task(id: LookupKey(item: item, dictionary: chosenDictionary)) {
             await lookUp()
         }
     }
@@ -134,6 +136,8 @@ private struct ItemDetail: View {
         }
     }
 
+    /// Notes, tags, and collections are edited right here; the definition
+    /// and reading go through the editor, beside the dictionary.
     private var yourEntry: some View {
         VStack(alignment: .leading, spacing: 8) {
             CardLabel("Your entry")
@@ -144,27 +148,51 @@ private struct ItemDetail: View {
                 }
                 Divider()
                 field("Notes") {
-                    Text(item.notes.isEmpty ? "None" : item.notes)
-                        .foregroundStyle(item.notes.isEmpty ? Palette.tertiary : Palette.text)
-                }
-                Divider()
-                field("Tags") {
-                    if item.tags.isEmpty {
-                        Text("None").foregroundStyle(Palette.tertiary)
+                    if isEditable {
+                        let id = item.id
+                        NotesField(
+                            notes: item.notes, editorOpen: model.editor != nil,
+                            typing: { text in model.typedNotes = text.map { (id, $0) } },
+                            save: { notes in model.update(id, patch: ItemPatch(notes: notes)) })
                     } else {
-                        FlowLayout { ForEach(item.tags, id: \.self) { Chip(text: $0) } }
+                        Text(item.notes.isEmpty ? "None" : item.notes)
+                            .foregroundStyle(item.notes.isEmpty ? Palette.tertiary : Palette.text)
                     }
                 }
                 Divider()
-                field("Collections") {
-                    if item.collections.isEmpty {
-                        Text("None").foregroundStyle(Palette.tertiary)
-                    } else {
-                        FlowLayout { ForEach(item.collections, id: \.self) { Chip(text: $0, style: .plain) } }
-                    }
-                }
+                // Each name list's menu opens over the rows below it.
+                field("Tags") { nameList(.tag, item.tags, known: model.tags) }
+                    .zIndex(2)
+                Divider()
+                field("Collections") { nameList(.collection, item.collections, known: model.collections) }
+                    .zIndex(1)
             }
+            .endsEditingOnClick()
             .card()
+            // Half-typed notes or a name stay with their word.
+            .id(item.id)
+        }
+    }
+
+    /// A word in the Trash is only shown.
+    private var isEditable: Bool { item.lifecycle != .trashed }
+
+    @ViewBuilder
+    private func nameList(_ kind: GroupKind, _ names: [String], known: [GroupView]) -> some View {
+        if isEditable {
+            let id = item.id
+            NameList(
+                kind: kind, names: names, known: known,
+                add: { name in
+                    model.update(id, actions: [kind == .tag ? .addTags([name]) : .addToCollection(name)])
+                },
+                remove: { name in
+                    model.update(id, actions: [kind == .tag ? .removeTags([name]) : .removeFromCollection(name)])
+                })
+        } else if names.isEmpty {
+            Text("None").foregroundStyle(Palette.tertiary)
+        } else {
+            FlowLayout { ForEach(names, id: \.self) { Chip(text: $0, style: kind.chipStyle) } }
         }
     }
 
@@ -305,10 +333,120 @@ private struct ItemDetail: View {
         }
     }
 
+    /// What the lookup reads: notes, tags, and collections changing in place
+    /// don't look the word up again.
     private struct LookupKey: Hashable {
-        let item: Int64
-        let rev: Int64
+        let id: Int64
+        let simplified: String
+        let traditional: String
+        let pinyin: String
         let dictionary: String?
+
+        init(item: ItemView, dictionary: String?) {
+            id = item.id
+            simplified = item.simplified
+            traditional = item.traditional
+            pinyin = item.pinyin
+            self.dictionary = dictionary
+        }
+    }
+}
+
+/// Notes, edited where they're shown: saved on ↵ or when the field lets go of
+/// the keyboard, put back on Esc. ⌥↵ starts a new line.
+private struct NotesField: View {
+    let notes: String
+    /// The editor sheet is open: the note being typed goes into it, and is
+    /// saved here first.
+    let editorOpen: Bool
+    /// The text on each keystroke, and nil once editing ends.
+    let typing: (String?) -> Void
+    let save: (String) -> Void
+
+    @State private var text: String
+    /// The text when editing began; nil when not editing. Only a change from
+    /// it is saved, so clicking in and out writes nothing.
+    @State private var started: String?
+    @State private var hovering = false
+    @FocusState private var focused: Bool
+
+    init(notes: String, editorOpen: Bool, typing: @escaping (String?) -> Void, save: @escaping (String) -> Void) {
+        self.notes = notes
+        self.editorOpen = editorOpen
+        self.typing = typing
+        self.save = save
+        _text = State(initialValue: notes)
+    }
+
+    var body: some View {
+        TextField("Add a note", text: $text, axis: .vertical)
+            .textFieldStyle(.plain)
+            .focused($focused)
+            .onSubmit { focused = false }
+            .onExitCommand {
+                text = started ?? notes
+                focused = false
+            }
+            .onChange(of: focused) {
+                if focused { started = text } else { finish() }
+            }
+            .onChange(of: text) {
+                if started != nil { typing(text) }
+            }
+            .onChange(of: notes) {
+                if started == nil { text = notes }
+            }
+            .onChange(of: editorOpen) {
+                if editorOpen { focused = false }
+            }
+            .onDisappear(perform: finish)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(focused ? Palette.field : hovering ? Palette.window : .clear)
+                    .strokeBorder(focused ? Palette.accent : .clear))
+            // The text lines up with the other rows; the field's edge sits
+            // outside it.
+            .padding(.horizontal, -6)
+            .padding(.vertical, -4)
+            .onHover { hovering = $0 }
+    }
+
+    /// Ends editing: saves the text if it was changed, else shows the notes
+    /// as they are now (another app may have changed them meanwhile).
+    private func finish() {
+        guard let started else { return }
+        self.started = nil
+        typing(nil)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text != started && trimmed != notes {
+            save(trimmed)
+        } else {
+            text = notes
+        }
+    }
+}
+
+/// Ends editing a field in the key window: a note being typed saves, and a
+/// name's menu closes. The list and the toolbar's search keep the keyboard.
+@MainActor
+private func endEditing() {
+    guard let window = NSApp.keyWindow,
+          let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
+          !(editor.delegate is NSSearchField)
+    else { return }
+    window.makeFirstResponder(nil)
+}
+
+private extension View {
+    /// A click on empty space here ends editing, as it does in AppKit forms.
+    func endsEditingOnClick() -> some View {
+        background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture(perform: endEditing)
+        }
     }
 }
 
@@ -378,6 +516,12 @@ private struct BulkPanel: View {
     private var ids: [Int64] { items.map(\.id) }
     private var trashed: Bool { items.allSatisfy { $0.lifecycle == .trashed } }
 
+    /// Tags every selected word already has.
+    private var sharedTags: [String] {
+        guard let first = items.first else { return [] }
+        return first.tags.filter { tag in items.allSatisfy { $0.tags.contains(tag) } }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -394,9 +538,9 @@ private struct BulkPanel: View {
                     } else {
                         action("Add Tag…", icon: "tag") { addingTag = true }
                             .popover(isPresented: $addingTag, arrowEdge: .trailing) {
-                                TagPicker(tags: model.tags, count: items.count) { tag in
+                                TagPicker(tags: model.tags, shared: sharedTags, count: items.count) { tag in
                                     addingTag = false
-                                    model.perform(.addTags([tag]), on: ids)
+                                    if let tag { model.perform(.addTags([tag]), on: ids) }
                                 }
                             }
                         Divider()
@@ -476,54 +620,20 @@ private struct BulkPanel: View {
     }
 }
 
-/// Type a tag; pick an existing one or create it (mockup 03).
+/// Type a tag; pick an existing one or create it (mockup 03). `apply` gets
+/// nil when Esc closes it.
 private struct TagPicker: View {
     let tags: [GroupView]
+    let shared: [String]
     let count: Int
-    let apply: (String) -> Void
-    @State private var text = ""
-
-    private var name: String { text.trimmingCharacters(in: .whitespaces) }
-
-    private var matches: [GroupView] {
-        guard !name.isEmpty else { return Array(tags.prefix(5)) }
-        return tags.filter { $0.name.localizedCaseInsensitiveContains(name) }.prefix(5).map { $0 }
-    }
+    let apply: (String?) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Add tag to \(count) words").font(.headline)
-            TextField("Tag name", text: $text)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit { if !name.isEmpty { apply(name) } }
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(matches) { tag in
-                    Button {
-                        apply(tag.name)
-                    } label: {
-                        HStack {
-                            Image(systemName: "tag").foregroundStyle(Palette.accent)
-                            Text(tag.name)
-                            Spacer()
-                            Text(tag.count == 1 ? "1 word" : "\(tag.count) words").foregroundStyle(Palette.tertiary)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.vertical, 4)
-                }
-                if !name.isEmpty && !tags.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
-                    Button {
-                        apply(name)
-                    } label: {
-                        Label("Create tag “\(name)”", systemImage: "plus").contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Palette.accent)
-                    .padding(.vertical, 4)
-                }
-            }
-            .font(.system(size: 13))
+            NameInput(
+                kind: .tag, known: tags, present: shared, placement: .list, focusOnAppear: true,
+                choose: apply, dismiss: { apply(nil) })
         }
         .padding(14)
         .frame(width: 280)

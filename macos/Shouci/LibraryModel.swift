@@ -72,6 +72,11 @@ final class LibraryModel {
     @ObservationIgnored private var version: Int64?
     @ObservationIgnored private var searching: Task<Void, Never>?
     @ObservationIgnored private var watching: Task<Void, Never>?
+    /// The latest change queued for the library; the next one waits for it.
+    @ObservationIgnored private var lastChange: Task<Void, Never>?
+    /// Notes being typed in the detail and not saved yet. The editor starts
+    /// from them, and quitting saves them.
+    @ObservationIgnored var typedNotes: (id: Int64, text: String)?
 
     init(app: AppModel, preferences: Preferences) {
         self.app = app
@@ -306,9 +311,36 @@ final class LibraryModel {
         }
     }
 
+    /// Runs a change after the ones asked for before it, so changes to a
+    /// word land in the order they were made.
+    private func enqueue(_ work: @escaping @Sendable (Core) throws -> Void) {
+        let previous = lastChange
+        lastChange = Task {
+            await previous?.value
+            await change(work)
+        }
+    }
+
     func perform(_ action: BulkAction, on ids: [Int64]) {
         guard !ids.isEmpty else { return }
-        Task { await change { _ = try $0.bulk(ids: ids, action: action) } }
+        enqueue { _ = try $0.bulk(ids: ids, action: action) }
+    }
+
+    /// Changes one word where the detail shows it: its notes, a tag, a
+    /// collection. The fields and the groups change together or not at all.
+    func update(_ id: Int64, patch: ItemPatch = ItemPatch(), actions: [BulkAction] = []) {
+        enqueue { _ = try $0.editItem(id: id, patch: patch, actions: actions) }
+    }
+
+    /// Saves notes still being typed, then waits for the changes asked for:
+    /// quitting loses none of them.
+    func finishChanges() async {
+        if let typed = typedNotes, let item = byID[typed.id] {
+            let notes = typed.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if notes != item.notes { update(typed.id, patch: ItemPatch(notes: notes)) }
+        }
+        typedNotes = nil
+        await lastChange?.value
     }
 
     func emptyTrash() {
@@ -396,8 +428,12 @@ final class LibraryModel {
 
     // MARK: Editing
 
+    /// Opens the editor. A note being typed in the detail goes into it; the
+    /// detail saves that note as the editor opens.
     func edit(_ item: ItemView) {
-        editor = WordDraft(item: item, style: preferences.pinyinStyle)
+        var draft = WordDraft(item: item, style: preferences.pinyinStyle)
+        if let typed = typedNotes, typed.id == item.id { draft.notes = typed.text }
+        editor = draft
     }
 
     func newWord(simplified: String = "") {
@@ -411,6 +447,8 @@ final class LibraryModel {
             problem = "A word needs its characters."
             return false
         }
+        // After the changes made in the detail, so what the editor saves wins.
+        await lastChange?.value
         do {
             let id: Int64
             if let original = draft.original {

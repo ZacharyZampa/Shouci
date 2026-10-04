@@ -44,6 +44,8 @@ final class LibraryWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        // A note being typed saves rather than waiting in a hidden window.
+        window?.makeFirstResponder(nil)
         model.stopWatching()
         NSApp.setActivationPolicy(.accessory)
     }

@@ -149,8 +149,12 @@ struct CardLabel: View {
 
 extension View {
     /// The mockups' card: list background, hairline border, 12pt corners.
+    /// The border is drawn behind the content, so a menu opening from a
+    /// field inside covers it.
     func card() -> some View {
-        background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Palette.list))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.line))
+        background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Palette.list)
+                .strokeBorder(Palette.line))
     }
 }

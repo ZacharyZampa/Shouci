@@ -64,14 +64,19 @@ struct WordEditor: View {
                 labeled("Notes") {
                     TextField("", text: $draft.notes, axis: .vertical).lineLimit(2...5)
                 }
+                // Each name list's menu opens over the fields below it.
                 labeled("Tags") {
-                    NameList(names: $draft.tags, prompt: "Add tag", style: .accent, known: model.tags.map(\.name))
+                    NameList(
+                        kind: .tag, names: draft.tags, known: model.tags,
+                        add: { add($0, to: \.tags) }, remove: { name in draft.tags.removeAll { $0 == name } })
                 }
+                .zIndex(2)
                 labeled("Collections") {
                     NameList(
-                        names: $draft.collections, prompt: "Add to collection", style: .plain,
-                        known: model.collections.map(\.name))
+                        kind: .collection, names: draft.collections, known: model.collections,
+                        add: { add($0, to: \.collections) }, remove: { name in draft.collections.removeAll { $0 == name } })
                 }
+                .zIndex(1)
                 Toggle(isOn: $draft.needsReview) {
                     Label("Needs review", systemImage: "exclamationmark.triangle")
                 }
@@ -88,6 +93,12 @@ struct WordEditor: View {
             .textFieldStyle(.roundedBorder)
             .padding(.horizontal, 28)
             .padding(.vertical, 24)
+        }
+    }
+
+    private func add(_ name: String, to names: WritableKeyPath<WordDraft, [String]>) {
+        if !draft[keyPath: names].contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+            draft[keyPath: names].append(name)
         }
     }
 
@@ -253,51 +264,5 @@ private struct LargeField: View {
             .frame(height: 44)
             .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Palette.field))
             .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Palette.line))
-    }
-}
-
-/// Tags or collections as chips, with a field to add one.
-private struct NameList: View {
-    @Binding var names: [String]
-    let prompt: String
-    let style: Chip.Style
-    let known: [String]
-    @State private var text = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if !names.isEmpty {
-                FlowLayout(spacing: 6) {
-                    ForEach(names, id: \.self) { name in
-                        Chip(text: name, style: style) { names.removeAll { $0 == name } }
-                    }
-                }
-            }
-            HStack(spacing: 6) {
-                TextField(prompt, text: $text).onSubmit(add)
-                let unused = known.filter { !names.contains($0) }
-                if !unused.isEmpty {
-                    Menu {
-                        ForEach(unused, id: \.self) { name in
-                            Button(name) { names.append(name) }
-                        }
-                    } label: {
-                        Image(systemName: "chevron.down")
-                    }
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .accessibilityLabel("Choose from existing")
-                }
-            }
-        }
-    }
-
-    private func add() {
-        let name = text.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty else { return }
-        if !names.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
-            names.append(known.first { $0.caseInsensitiveCompare(name) == .orderedSame } ?? name)
-        }
-        text = ""
     }
 }

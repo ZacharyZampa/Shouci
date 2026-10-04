@@ -52,6 +52,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LaunchAtLogin.refresh()
     }
 
+    /// Quitting saves a note still being typed in the library window, and
+    /// waits for changes on their way to the library.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard library != nil else { return .terminateNow }
+        Task {
+            await libraryModel.finishChanges()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     /// Opening Shouci again (from Finder, Spotlight, or the Dock) opens the
     /// library window.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
