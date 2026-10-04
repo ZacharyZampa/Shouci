@@ -115,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return NSAttributedString(string: title, attributes: attributes)
         }
         let text = NSMutableAttributedString(string: "Made by Zachary Zampa\n", attributes: plain)
-        text.append(link("Portfolio", "https://zacharyzampa.github.io/ZampaPortfolio"))
+        text.append(link("Website", "https://zacharyzampa.github.io/ZampaPortfolio"))
         text.append(NSAttributedString(string: "  ·  ", attributes: plain))
         text.append(link("Buy me a coffee", "https://buymeacoffee.com/zacharyzampa"))
         return text
