@@ -34,6 +34,7 @@ final class SettingsWindowController: NSWindowController {
     private static func tab(_ label: String, symbol: String, view: some View) -> NSTabViewItem {
         let controller = NSHostingController(rootView: view)
         controller.sizingOptions = .preferredContentSize
+        controller.title = label  // the tab controller shows this as the window title
         let item = NSTabViewItem(viewController: controller)
         item.label = label
         item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
