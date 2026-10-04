@@ -7,6 +7,13 @@ Later, study the words in Pleco or Anki.
 Free and open source (MIT). Your words stay on your Mac: Shouci has no
 account and goes online only to download its dictionary.
 
+<p align="center">
+  <img src="docs/screenshots/library.png" alt="The Shouci library window: a list of saved words, with the selected word's definition, notes, tags and collections beside it" width="860">
+</p>
+<p align="center">
+  <img src="docs/screenshots/quick-search.png" alt="Quick search over another app: results for “to travel”, with a word you already have marked Saved" width="400">
+</p>
+
 Shouci is free. If it helps you, you can buy me a coffee:
 
 <a href="https://buymeacoffee.com/zacharyzampa"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="40"></a>
