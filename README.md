@@ -16,6 +16,19 @@ Want to help? [CONTRIBUTING.md](CONTRIBUTING.md). How it's built:
 
 ## Install (macOS)
 
+### Download
+
+Get the `.dmg` from [Releases](https://github.com/ZacharyZampa/Shouci/releases/latest),
+open it, and drag Shouci to Applications. It needs macOS 14 or later.
+
+macOS blocks it the first time, because there is no paid Apple developer
+account behind Shouci to sign it with: open System Settings › Privacy &
+Security, scroll to the message about Shouci, and choose **Open Anyway**. The
+dictionary downloads when you first open it. The download is the app only; the
+`shouci` and `shouci-tui` terminal tools come with building from source.
+
+### Build from source
+
 You need:
 
 - macOS 14 or later
@@ -38,10 +51,8 @@ Intel, installs it to `~/Applications/Shouci.app`, and starts it. Look for
 **文** in the menu bar. It also installs `shouci` and `shouci-tui` for the
 terminal ([In the terminal](#in-the-terminal)).
 
-Shouci is built on your Mac and signed to run locally, so Gatekeeper doesn't
-ask about it. (There is no paid Apple developer account behind it, so a copy
-downloaded from elsewhere is blocked the first time: allow it in System
-Settings › Privacy & Security › Open Anyway.)
+Built on your Mac, Shouci is signed to run locally, so Gatekeeper doesn't ask
+about it.
 
 | | |
 | --- | --- |
