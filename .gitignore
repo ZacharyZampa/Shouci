@@ -19,3 +19,6 @@ data/user/*.db
 *.db-wal
 *.db-shm
 *.db-journal
+
+# Release disk images (macos/scripts/make-dmg.sh).
+/dist

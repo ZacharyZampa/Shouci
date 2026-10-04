@@ -1176,7 +1176,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shouci-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "serde",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "shouci-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "shouci-ffi"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "shouci-core",
  "uniffi",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "shouci-tui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crossterm 0.29.0",
  "ratatui",
@@ -1606,14 +1606,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vocab-anki"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "vocab-core",
 ]
 
 [[package]]
 name = "vocab-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "vocab-db"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "vocab-core",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "vocab-dictionary"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "sha2",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "vocab-exchange"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1655,18 +1655,18 @@ dependencies = [
 
 [[package]]
 name = "vocab-pinyin"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "vocab-pleco"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "vocab-core",
 ]
 
 [[package]]
 name = "vocab-search"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "serde",

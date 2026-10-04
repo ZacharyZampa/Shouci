@@ -28,6 +28,7 @@ open macos/Shouci.xcodeproj               # or:
 xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci build
 swift test --package-path macos/ShouciCore
 macos/scripts/package.sh                  # install a release build
+macos/scripts/make-dmg.sh                 # a release build as dist/Shouci-<version>.dmg
 ```
 
 The app build stops with a message when the Rust core is missing or older
