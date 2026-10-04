@@ -4,15 +4,15 @@ Collect Chinese vocabulary without leaving what you're doing. Press a
 shortcut, type English, pinyin, or characters, pick the word, press Return.
 Later, study the words in Pleco or Anki.
 
-Free and open source (MIT). Your words stay on your Mac: Shouci has no
-account and goes online only to download its dictionary.
-
 <p align="center">
   <img src="docs/screenshots/library.png" alt="The Shouci library window: a list of saved words, with the selected word's definition, notes, tags and collections beside it" width="860">
 </p>
 <p align="center">
   <img src="docs/screenshots/quick-search.png" alt="Quick search over another app: results for “to travel”, with a word you already have marked Saved" width="400">
 </p>
+
+Free and open source (MIT). Your words stay on your Mac: Shouci has no
+account and goes online only to download its dictionary.
 
 Shouci is free. If it helps you, you can buy me a coffee:
 
@@ -187,7 +187,7 @@ steps through all, needs review, archived, and the trash; **d** moves a word
 to the trash, **a** archives it, **n** marks it for review. **Ctrl+O**
 imports, **Ctrl+E** exports, **Ctrl+Q** quits.
 
-<img width="1053" height="866" alt="TUI Saved List" src="https://github.com/user-attachments/assets/7092da99-9401-4afc-a540-722a333b5952" />
+<img width="560" alt="shouci-tui showing saved words" src="https://github.com/user-attachments/assets/7092da99-9401-4afc-a540-722a333b5952" />
 
 ## Build and test
 
