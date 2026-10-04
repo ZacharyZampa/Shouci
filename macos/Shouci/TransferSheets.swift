@@ -289,9 +289,9 @@ private struct PlannedRow: View {
             let saved = library.item(id).map { reading($0.pinyin) } ?? "—"
             var what: [String] = []
             if restore { what.append("back from the Trash") }
-            if !changes.isEmpty { what.append("updates \(changes.map(\.field).joined(separator: ", "))") }
+            if !changes.isEmpty { what.append("updates \(changes.map(\.field.name).joined(separator: ", "))") }
             if !tags.add.isEmpty || !collections.add.isEmpty { what.append("adds \((tags.add + collections.add).joined(separator: ", "))") }
-            if !conflicts.isEmpty { what.append("keeps your \(conflicts.map(\.field).joined(separator: ", "))") }
+            if !conflicts.isEmpty { what.append("keeps your \(conflicts.map(\.field.name).joined(separator: ", "))") }
             return (simplified, saved, "Already saved · " + what.joined(separator: "; "), Palette.accent)
         case .skip(let id, let simplified, _, let reason, _):
             let saved = id.flatMap(library.item).map { reading($0.pinyin) } ?? "—"
@@ -347,6 +347,7 @@ private struct ImportDone: View {
 
 struct ExportSheet: View {
     @State var model: ExportModel
+    @State private var confirmingReplace = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -533,9 +534,24 @@ struct ExportSheet: View {
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             } else {
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-                Button(model.count == 1 ? "Export 1 Word" : "Export \(model.count) Words", action: model.apply)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!model.canExport)
+                Button(model.count == 1 ? "Export 1 Word" : "Export \(model.count) Words") {
+                    if model.needsReplaceConfirmation {
+                        confirmingReplace = true
+                    } else {
+                        model.apply()
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!model.canExport)
+                .confirmationDialog(
+                    "Replace “\(model.destination.lastPathComponent)”?",
+                    isPresented: $confirmingReplace
+                ) {
+                    Button("Replace", role: .destructive, action: model.apply)
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("A file with this name is already in \(model.destination.deletingLastPathComponent().lastPathComponent). Exporting replaces it.")
+                }
             }
         }
     }

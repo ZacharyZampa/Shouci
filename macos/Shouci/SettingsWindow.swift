@@ -132,7 +132,7 @@ struct GeneralSettings: View {
             return
         }
         guard let binding = HotKeyBinding(event: event), binding.isValid else {
-            shortcutProblem = "Use Control or Command with a key (Option alone isn’t allowed)."
+            shortcutProblem = "Use Control or Command with a key, or a function key (Option or Shift alone isn’t allowed)."
             return
         }
         if let monitor { NSEvent.removeMonitor(monitor) }

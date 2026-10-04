@@ -46,62 +46,28 @@ impl IngestSource for HskSource {
         let text = std::str::from_utf8(artifact)
             .map_err(|err| VocabError::new(format!("hsk artifact is not UTF-8: {err}")))?;
         let mut levels: BTreeMap<String, u64> = BTreeMap::new();
-        let mut csv_columns: Option<(usize, usize)> = None;
+        let mut columns: Option<CsvColumns> = None;
         for (index, raw_line) in text.lines().enumerate() {
             let line_number = index + 1;
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if csv_columns.is_none() && line.contains("Simplified") && line.contains("Level") {
-                let header = parse_csv_row(line);
-                let simplified =
-                    header
-                        .iter()
-                        .position(|h| h == "Simplified")
-                        .ok_or_else(|| {
-                            VocabError::new(format!(
-                                "hsk line {line_number} CSV header has no Simplified"
-                            ))
-                        })?;
-                let level = header.iter().position(|h| h == "Level").ok_or_else(|| {
-                    VocabError::new(format!("hsk line {line_number} CSV header has no Level"))
-                })?;
-                csv_columns = Some((simplified, level));
-                continue;
-            }
-            let (word, level_raw) = if let Some((word_idx, level_idx)) = csv_columns {
-                let cols = parse_csv_row(line);
-                let word = cols.get(word_idx).map_or("", String::as_str);
-                let level = cols.get(level_idx).map_or("", String::as_str);
-                if word.is_empty() || level.is_empty() {
-                    return Err(VocabError::new(format!(
-                        "hsk line {line_number} is missing Simplified or Level: {line}"
-                    )));
-                }
-                (word.to_owned(), level.to_owned())
-            } else {
-                let mut parts = line.split_whitespace();
-                let Some(word) = parts.next() else {
+            if columns.is_none() {
+                if let Some(header) = csv_header(line, line_number)? {
+                    columns = Some(header);
                     continue;
-                };
-                let Some(level_raw) = parts.next() else {
-                    return Err(VocabError::new(format!(
-                        "hsk line {line_number} is missing a level: {line}"
-                    )));
-                };
-                if parts.next().is_some() {
-                    return Err(VocabError::new(format!(
-                        "hsk line {line_number} has extra fields: {line}"
-                    )));
                 }
-                (word.to_owned(), level_raw.to_owned())
+            }
+            let (word, level_raw) = match columns {
+                Some(columns) => csv_fields(line, columns, line_number)?,
+                None => whitespace_fields(line, line_number)?,
             };
-            let Some(level) = parse_hsk_level(&level_raw) else {
-                return Err(VocabError::new(format!(
+            let level = parse_hsk_level(&level_raw).ok_or_else(|| {
+                VocabError::new(format!(
                     "hsk line {line_number} has an invalid level {level_raw:?}: {line}"
-                )));
-            };
+                ))
+            })?;
             levels
                 .entry(word)
                 .and_modify(|current| *current = (*current).min(level))
@@ -117,6 +83,57 @@ impl IngestSource for HskSource {
                 entry
             })
             .collect())
+    }
+}
+
+/// Where the word and the level are in a CSV row.
+#[derive(Clone, Copy)]
+struct CsvColumns {
+    word: usize,
+    level: usize,
+}
+
+/// The columns, when `line` is a CSV header (it names `Simplified` and
+/// `Level`).
+fn csv_header(line: &str, line_number: usize) -> Result<Option<CsvColumns>> {
+    if !(line.contains("Simplified") && line.contains("Level")) {
+        return Ok(None);
+    }
+    let header = parse_csv_row(line);
+    let column = |name: &str| {
+        header.iter().position(|h| h == name).ok_or_else(|| {
+            VocabError::new(format!("hsk line {line_number} CSV header has no {name}"))
+        })
+    };
+    Ok(Some(CsvColumns {
+        word: column("Simplified")?,
+        level: column("Level")?,
+    }))
+}
+
+/// The word and the level from a CSV row.
+fn csv_fields(line: &str, columns: CsvColumns, line_number: usize) -> Result<(String, String)> {
+    let mut cols = parse_csv_row(line);
+    let mut take = |index: usize| cols.get_mut(index).map(std::mem::take).unwrap_or_default();
+    let (word, level) = (take(columns.word), take(columns.level));
+    if word.is_empty() || level.is_empty() {
+        return Err(VocabError::new(format!(
+            "hsk line {line_number} is missing Simplified or Level: {line}"
+        )));
+    }
+    Ok((word, level))
+}
+
+/// The word and the level from a `word level` line.
+fn whitespace_fields(line: &str, line_number: usize) -> Result<(String, String)> {
+    match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [word, level] => Ok(((*word).to_owned(), (*level).to_owned())),
+        [_] => Err(VocabError::new(format!(
+            "hsk line {line_number} is missing a level: {line}"
+        ))),
+        _ => Err(VocabError::new(format!(
+            "hsk line {line_number} has extra fields: {line}"
+        ))),
     }
 }
 
@@ -189,5 +206,15 @@ mod tests {
         let source = HskSource::default();
         let err = source.parse("去 banana\n".as_bytes()).unwrap_err();
         assert!(err.to_string().contains("invalid level"));
+    }
+
+    #[test]
+    fn rejects_lines_without_exactly_a_word_and_a_level() {
+        let source = HskSource::default();
+        let error = |text: &str| source.parse(text.as_bytes()).unwrap_err().to_string();
+        assert!(error("去\n").contains("line 1 is missing a level"));
+        assert!(error("去 1 x\n").contains("line 1 has extra fields"));
+        assert!(error("Simplified,Level\n猫,\n").contains("line 2 is missing Simplified or Level"));
+        assert!(error("Simplified,Levels\n").contains("line 1 CSV header has no Level"));
     }
 }

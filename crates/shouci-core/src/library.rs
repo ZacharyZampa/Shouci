@@ -1,6 +1,6 @@
 //! Saved words: reading, editing, organizing, and bulk changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 use vocab_core::{ItemPatch, LibraryFilter, LibraryView, Result, VocabItem};
@@ -17,6 +17,8 @@ pub(crate) fn item_view(conn: &Connection, item: VocabItem) -> Result<ItemView> 
 }
 
 /// Many words, loading their groups in three queries instead of three each.
+/// The groups are loaded for the whole library, however few `items` there
+/// are: three indexed queries, cheaper than one round trip per word.
 pub(crate) fn item_views(conn: &Connection, items: Vec<VocabItem>) -> Result<Vec<ItemView>> {
     let mut tags = vocab_db::tags_by_item(conn)?;
     let mut collections = vocab_db::collections_by_item(conn)?;
@@ -42,7 +44,7 @@ impl Shouci {
     ///
     /// Storage errors.
     pub fn list_items(&self, filter: &LibraryFilter) -> Result<Vec<ItemView>> {
-        let conn = self.read()?;
+        let conn = self.reader()?;
         let items = vocab_db::list_items(&conn, filter)?;
         item_views(&conn, items)
     }
@@ -51,7 +53,7 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::NotFound`] or a storage error.
     pub fn item(&self, id: i64) -> Result<ItemView> {
-        let conn = self.read()?;
+        let conn = self.reader()?;
         let item = vocab_db::require_item(&conn, id)?;
         item_view(&conn, item)
     }
@@ -64,9 +66,33 @@ impl Shouci {
     /// [`crate::ErrorKind::NotFound`], [`crate::ErrorKind::Invalid`] (no
     /// characters), [`crate::ErrorKind::Conflict`], or a storage error.
     pub fn update_item(&self, id: i64, patch: &ItemPatch) -> Result<ItemView> {
-        let conn = self.db()?;
-        let item = vocab_db::update_item(&conn, id, patch)?;
-        item_view(&conn, item)
+        self.edit_item(id, patch, &[])
+    }
+
+    /// Edits a word's fields and applies `actions` to it (the tags and
+    /// collections it gained and lost, say), all or nothing: a refused tag
+    /// name leaves the word as it was.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shouci::update_item`] and [`Shouci::bulk`]; nothing changes then.
+    pub fn edit_item(
+        &self,
+        id: i64,
+        patch: &ItemPatch,
+        actions: &[BulkAction],
+    ) -> Result<ItemView> {
+        let mut conn = self.writer()?;
+        // One transaction, so another process's edit in between is never
+        // overwritten with fields read before it.
+        vocab_db::with_tx(&mut conn, |tx| {
+            vocab_db::update_item(tx, id, patch)?;
+            for action in actions {
+                apply(tx, id, action)?;
+            }
+            let item = vocab_db::require_item(tx, id)?;
+            item_view(tx, item)
+        })
     }
 
     /// Applies `action` to every word in `ids`, all or nothing. Repeated ids
@@ -77,16 +103,13 @@ impl Shouci {
     /// The first failure (an unknown id, purging a word that isn't in the
     /// trash, a blank tag name); nothing changes then.
     pub fn bulk(&self, ids: &[i64], action: &BulkAction) -> Result<BulkResult> {
-        let mut unique: Vec<i64> = Vec::with_capacity(ids.len());
-        for &id in ids {
-            if !unique.contains(&id) {
-                unique.push(id);
-            }
-        }
+        let mut seen = HashSet::with_capacity(ids.len());
+        let unique: Vec<i64> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
         if unique.is_empty() {
             return Ok(BulkResult { changed: 0 });
         }
-        let mut conn = self.db()?;
+        let mut conn = self.writer()?;
+        // One transaction: the first failure rolls back the words before it.
         vocab_db::with_tx(&mut conn, |tx| {
             for &id in &unique {
                 apply(tx, id, action)?;
@@ -104,7 +127,7 @@ impl Shouci {
     /// Storage errors.
     pub fn empty_trash(&self) -> Result<BulkResult> {
         let ids: Vec<i64> = {
-            let conn = self.read()?;
+            let conn = self.reader()?;
             vocab_db::list_items(
                 &conn,
                 &LibraryFilter {
@@ -123,7 +146,7 @@ impl Shouci {
     ///
     /// Storage errors.
     pub fn tags(&self) -> Result<Vec<GroupView>> {
-        Ok(vocab_db::tags(&*self.read()?)?
+        Ok(vocab_db::tags(&*self.reader()?)?
             .into_iter()
             .map(GroupView::from)
             .collect())
@@ -134,7 +157,7 @@ impl Shouci {
     /// [`crate::ErrorKind::NotFound`], [`crate::ErrorKind::Conflict`] when
     /// the new name is taken, or a storage error.
     pub fn rename_tag(&self, from: &str, to: &str) -> Result<()> {
-        vocab_db::rename_tag(&*self.db()?, from, to)
+        vocab_db::rename_tag(&*self.writer()?, from, to)
     }
 
     /// Deletes a tag; its words stay.
@@ -143,14 +166,14 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::NotFound`] or a storage error.
     pub fn delete_tag(&self, name: &str) -> Result<()> {
-        vocab_db::delete_tag(&*self.db()?, name)
+        vocab_db::delete_tag(&*self.writer()?, name)
     }
 
     /// # Errors
     ///
     /// Storage errors.
     pub fn collections(&self) -> Result<Vec<GroupView>> {
-        Ok(vocab_db::collections(&*self.read()?)?
+        Ok(vocab_db::collections(&*self.reader()?)?
             .into_iter()
             .map(GroupView::from)
             .collect())
@@ -161,7 +184,7 @@ impl Shouci {
     /// [`crate::ErrorKind::Conflict`] if it exists,
     /// [`crate::ErrorKind::Invalid`] for a blank name, or a storage error.
     pub fn create_collection(&self, name: &str) -> Result<()> {
-        vocab_db::create_collection(&*self.db()?, name)
+        vocab_db::create_collection(&*self.writer()?, name)
     }
 
     /// # Errors
@@ -169,7 +192,7 @@ impl Shouci {
     /// [`crate::ErrorKind::NotFound`], [`crate::ErrorKind::Conflict`] when
     /// the new name is taken, or a storage error.
     pub fn rename_collection(&self, from: &str, to: &str) -> Result<()> {
-        vocab_db::rename_collection(&*self.db()?, from, to)
+        vocab_db::rename_collection(&*self.writer()?, from, to)
     }
 
     /// Deletes a collection; its words stay.
@@ -178,7 +201,7 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::NotFound`] or a storage error.
     pub fn delete_collection(&self, name: &str) -> Result<()> {
-        vocab_db::delete_collection(&*self.db()?, name)
+        vocab_db::delete_collection(&*self.writer()?, name)
     }
 
     /// Turns a tag into a collection of the same name (the tag goes away).
@@ -188,7 +211,7 @@ impl Shouci {
     /// [`crate::ErrorKind::NotFound`] if there is no such tag, or a storage
     /// error.
     pub fn collection_from_tag(&self, tag: &str) -> Result<GroupView> {
-        let mut conn = self.db()?;
+        let mut conn = self.writer()?;
         vocab_db::with_tx(&mut conn, |tx| {
             Ok(vocab_db::collection_from_tag(tx, tag)?.into())
         })

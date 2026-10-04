@@ -25,6 +25,10 @@ pub use transfer::{
 uniffi::setup_scaffolding!();
 
 /// A failure from the core. `message` is written for people.
+///
+/// One variant, because `UniFFI` can throw an enum but not a record; the
+/// kind is a field so Swift doesn't switch over a case per kind. Swift reads
+/// both through `kind` and `message` (`Extensions.swift`).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
 pub enum ShouciError {
     Failed { kind: ErrorKind, message: String },
@@ -238,6 +242,15 @@ impl Core {
 
     pub fn update_item(&self, id: i64, patch: ItemPatch) -> Result<ItemView> {
         Ok(self.shouci.update_item(id, &patch)?)
+    }
+
+    pub fn edit_item(
+        &self,
+        id: i64,
+        patch: ItemPatch,
+        actions: Vec<BulkAction>,
+    ) -> Result<ItemView> {
+        Ok(self.shouci.edit_item(id, &patch, &actions)?)
     }
 
     pub fn bulk(&self, ids: Vec<i64>, action: BulkAction) -> Result<BulkResult> {

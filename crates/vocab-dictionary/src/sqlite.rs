@@ -1,3 +1,17 @@
+//! The dictionary as a SQLite file: building it from its sources, and
+//! retrieving candidates for a query. Retrieval finds what might match and
+//! never orders it; `vocab-search` ranks.
+//!
+//! - English: FTS5 over glosses. Glosses with every word of the query, or
+//!   the phrase, come first; glosses with some of the words, a word starting
+//!   with one (token prefix), or the text anywhere (trigram) fill the rest,
+//!   up to [`MAX_RETRIEVAL`].
+//! - Pinyin: the query is segmented into syllables every way it can be
+//!   (`xian` and `xi an`), and each segmentation becomes a GLOB pattern on
+//!   the stored reading in which a syllable without a tone takes any tone.
+//! - Hanzi: exact and prefix matches; then entries holding every character
+//!   (inferred); then, when the text is not a word, the words inside it.
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
@@ -19,7 +33,12 @@ use crate::{
     DataSourceDescriptor, IngestSource, LayerKind, RawEntry, VALUE_FREQUENCY_RANK, VALUE_HSK_RANK,
 };
 
+/// Most candidates one query hands to ranking. A common word (`to`, `see`)
+/// matches far more glosses; the ones most likely to be the answer are kept
+/// (see [`prefer_exact_gloss_ids`]), and ranking stays fast.
 const MAX_RETRIEVAL: usize = 2000;
+/// Values bound in one `IN (…)` list: well under the 999 parameters older
+/// SQLite builds allow.
 const BIND_CHUNK: usize = 400;
 /// Longest word looked for inside a Chinese query that is not a word.
 const MAX_CONTAINED_CHARS: usize = 8;
@@ -670,21 +689,21 @@ impl DictionaryProvider for SqliteDictionary {
         }
 
         if some_segmented {
+            // `pinyin_normalized` is stored lowercase, and GLOB (unlike LIKE)
+            // is case-sensitive: each clause is a range on its index.
             for variant in cross_join_forms(crossable) {
                 clauses.push((
-                    "lower(pinyin_normalized) GLOB ?".to_owned(),
+                    "pinyin_normalized GLOB ?".to_owned(),
                     vec![syllable_pattern(&variant).into()],
                 ));
             }
         } else {
             // Nothing segmented (single letters, numbers, unknown input). Match
             // only by prefix; the old `%last%` contains clause is what flooded
-            // e.g. `nihao` with every entry containing "hao".
-            let prefix = format!("{}%", escape_like(q));
-            clauses.push((
-                "pinyin_normalized LIKE ? ESCAPE '\\'".to_owned(),
-                vec![prefix.into()],
-            ));
+            // e.g. `nihao` with every entry containing "hao". GLOB, not LIKE:
+            // a case-insensitive LIKE cannot use the index.
+            let prefix = format!("{}*", escape_glob(q));
+            clauses.push(("pinyin_normalized GLOB ?".to_owned(), vec![prefix.into()]));
         }
         self.select_entries_where(&clauses, MatchBasis::Pinyin, false, ClauseJoin::Or)
     }
@@ -942,6 +961,22 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// `s` matched literally inside a GLOB pattern.
+fn escape_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '*' | '?' | '[' => {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Cartesian product of per-token segmentation forms, capped to bound the
 /// clause count for heavily ambiguous input (e.g. `xian` -> `xi an` + `xian`).
 const MAX_PINYIN_PATTERNS: usize = 128;
@@ -1019,10 +1054,22 @@ impl ClauseJoin {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_like;
+    use super::{escape_glob, escape_like};
 
     #[test]
     fn escapes_like_wildcards() {
         assert_eq!(escape_like("100%_done"), "100\\%\\_done");
+    }
+
+    #[test]
+    fn escapes_glob_wildcards() {
+        assert_eq!(escape_glob("x*y?[z]"), "x[*]y[?][[]z]");
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let matches = |text: &str, pattern: &str| -> bool {
+            conn.query_row("SELECT ?1 GLOB ?2", [text, pattern], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(matches("x*yz", &format!("{}*", escape_glob("x*"))));
+        assert!(!matches("xyz", &format!("{}*", escape_glob("x*"))));
     }
 }

@@ -1,3 +1,7 @@
+//! The search-quality probe list: common words with their English, pinyin,
+//! and Hanzi, each of which must find the word (see
+//! `shouci-core/tests/search_quality.rs`).
+
 use std::path::PathBuf;
 
 /// One HSK probe row from `fixtures/search/top1000.tsv`.

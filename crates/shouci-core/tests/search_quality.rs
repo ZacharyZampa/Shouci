@@ -3,32 +3,40 @@
 //! first results for its English, pinyin, and Hanzi queries.
 //!
 //! Needs `data/dictionaries/cc-cedict.db` (`./scripts/check.sh` fetches it).
+//! Without it these tests pass with a note, so a fresh clone's `cargo test`
+//! works; `check.sh` sets `SHOUCI_REQUIRE_DICTIONARY=1`, which makes a
+//! missing build a failure instead.
 
 use std::path::Path;
 
 use shouci_core::testing::scratch_dir;
-use shouci_core::{Config, QueryKind, Shouci};
+use shouci_core::{Config, QueryKind, QuickAdd, Shouci};
 use vocab_search::load_search_probes;
 
 /// What the menu-bar popover shows.
 const POPOVER: u32 = 10;
 
-fn shouci() -> Shouci {
+fn shouci() -> Option<Shouci> {
     let dictionaries = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/dictionaries");
-    assert!(
-        dictionaries.join("cc-cedict.db").is_file(),
-        "search quality tests need data/dictionaries/cc-cedict.db; run ./scripts/check.sh"
-    );
+    if !dictionaries.join("cc-cedict.db").is_file() {
+        let required = std::env::var("SHOUCI_REQUIRE_DICTIONARY").is_ok_and(|v| v == "1");
+        assert!(
+            !required,
+            "search quality tests need data/dictionaries/cc-cedict.db; run ./scripts/check.sh"
+        );
+        eprintln!("skipped: no data/dictionaries/cc-cedict.db (./scripts/check.sh fetches it)");
+        return None;
+    }
     let mut config = Config::in_dir(scratch_dir("quality"));
     config.dictionaries_dir = dictionaries;
     config.fetch_dictionaries = false;
     let shouci = Shouci::open(config).expect("open");
     shouci.load_dictionaries().expect("load");
-    shouci
+    Some(shouci)
 }
 
 fn run(limit: usize, english: bool, kinds: bool) {
-    let shouci = shouci();
+    let Some(shouci) = shouci() else { return };
     let probes = load_search_probes();
     assert!(
         probes.len() >= limit,
@@ -104,7 +112,7 @@ fn top50_surface_when_the_kind_is_given() {
 /// `to quarter`).
 #[test]
 fn common_words_lead_their_english() {
-    let shouci = shouci();
+    let Some(shouci) = shouci() else { return };
     let words = [
         ("hot", "热"),
         ("quarter", "刻"),
@@ -154,7 +162,7 @@ fn common_words_lead_their_english() {
 /// alone filled them.)
 #[test]
 fn verbs_surface_when_searched_with_to() {
-    let shouci = shouci();
+    let Some(shouci) = shouci() else { return };
     let mut checked = 0usize;
     let mut misses = Vec::new();
     for probe in load_search_probes() {
@@ -197,4 +205,38 @@ fn verbs_surface_when_searched_with_to() {
         misses.len(),
         misses.join("\n")
     );
+}
+
+/// `shouci add <English>` saves the word when it is clear-cut, and asks when
+/// another word is as likely or the frequency data cannot tell.
+#[test]
+fn adding_plain_english_saves_the_clear_word_and_asks_otherwise() {
+    let Some(shouci) = shouci() else { return };
+    for (english, word) in [
+        ("school", "学校"),
+        ("eat", "吃"),
+        ("water", "水"),
+        ("travel", "旅行"),
+        ("big", "大"),
+    ] {
+        match shouci.quick_add(english, None).expect(english) {
+            QuickAdd::Saved(saved) => assert_eq!(saved.item.simplified, word, "{english}"),
+            QuickAdd::Ambiguous { candidates } => panic!(
+                "{english} should save {word}; got a choice of {:?}",
+                candidates.iter().map(|c| &c.simplified).collect::<Vec<_>>()
+            ),
+        }
+    }
+    // 先生 is more common than 老师 only because it also means "Mr."; 了 liǎo
+    // and 说 shuì carry the counts of 了 le and 说 shuō; 接受's sense has a
+    // note (`to accept (a suggestion, …)`) but still rivals 接下来.
+    for english in ["teacher", "finish", "persuade", "accept", "to"] {
+        assert!(
+            matches!(
+                shouci.quick_add(english, None).expect(english),
+                QuickAdd::Ambiguous { .. }
+            ),
+            "{english} should ask"
+        );
+    }
 }

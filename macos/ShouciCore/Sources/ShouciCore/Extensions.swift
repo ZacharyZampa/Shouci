@@ -37,6 +37,16 @@ extension ExportRequest {
     }
 }
 
+extension ImportField {
+    /// The field's name for people: `definition`, `notes`.
+    public var name: String {
+        switch self {
+        case .definition: "definition"
+        case .notes: "notes"
+        }
+    }
+}
+
 extension ItemView: Identifiable {}
 extension DictionaryView: Identifiable {}
 extension ConnectorView: Identifiable {}

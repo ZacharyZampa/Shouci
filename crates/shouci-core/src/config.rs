@@ -43,10 +43,10 @@ impl Config {
     ///
     /// With no `SHOUCI_HOME`, the proof of concept's directory is checked
     /// for words to bring over.
-    #[must_use]
     ///
     /// `~` and relative paths in the variables are resolved (against the
     /// home and current directories).
+    #[must_use]
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
         let home = var("HOME");

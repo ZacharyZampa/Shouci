@@ -51,6 +51,16 @@ impl Shouci {
         self.connectors.views()
     }
 
+    /// A format's name for people (`Pleco` for `pleco`), or the id itself
+    /// when this build has no such format.
+    #[must_use]
+    pub fn connector_name(&self, id: &str) -> String {
+        self.connectors.get(id).map_or_else(
+            |_| id.to_owned(),
+            |connector| connector.info().name.to_owned(),
+        )
+    }
+
     /// Reads a file and plans the import without writing anything. Words are
     /// checked against the loaded dictionaries; without them, words are taken
     /// as written and incomplete ones need review.
@@ -73,7 +83,7 @@ impl Shouci {
         let bytes = read_file(&path)?;
         let loaded = self.loaded_opt();
         vocab_exchange::plan_import(
-            &*self.read()?,
+            &*self.reader()?,
             loaded.as_deref().map(crate::dictionaries::Loaded::provider),
             connector,
             &bytes,
@@ -135,7 +145,7 @@ impl Shouci {
     /// changed since the preview (preview again); I/O or storage errors.
     pub fn apply_import(&self, plan: &ImportPlan) -> Result<TransferSummary> {
         let bytes = read_file(Path::new(&plan.path))?;
-        vocab_exchange::apply_import(&mut *self.db()?, plan, &content_hash(&bytes))
+        vocab_exchange::apply_import(&mut *self.writer()?, plan, &content_hash(&bytes))
     }
 
     /// Picks words and renders the file in memory, without writing it.
@@ -154,7 +164,7 @@ impl Shouci {
         let path = absolute(path)?;
         let loaded = self.loaded_opt();
         vocab_exchange::plan_export(
-            &*self.read()?,
+            &*self.reader()?,
             loaded.as_deref().map(crate::dictionaries::Loaded::provider),
             connector,
             &text(&path),
@@ -168,6 +178,6 @@ impl Shouci {
     ///
     /// I/O or storage errors.
     pub fn apply_export(&self, plan: &ExportPlan) -> Result<TransferSummary> {
-        vocab_exchange::apply_export(&mut *self.db()?, plan)
+        vocab_exchange::apply_export(&mut *self.writer()?, plan)
     }
 }

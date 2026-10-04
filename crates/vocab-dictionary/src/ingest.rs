@@ -25,7 +25,7 @@ pub struct DataSourceDescriptor {
 /// One parsed record from a source artifact, normalized to the composition key.
 ///
 /// Enrichment layers carry their scalar values (e.g. frequency rank, HSK rank) in
-/// `values`; keys are serialized field names recorded in the ingestion manifest.
+/// `values`, keyed by `VALUE_FREQUENCY_RANK` and `VALUE_HSK_RANK`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawEntry {
     pub simplified: String,

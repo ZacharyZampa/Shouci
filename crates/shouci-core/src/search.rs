@@ -2,10 +2,11 @@
 
 use rusqlite::Connection;
 use vocab_core::{
-    ItemSource, LibraryFilter, MatchBasis, Result, SourceKind, Verification, VocabItem,
+    DictionaryEntry, ItemSource, LibraryFilter, MatchBasis, Result, SourceKind, Verification,
+    VocabItem,
 };
 use vocab_db::{NewItem, Saved};
-use vocab_dictionary::Candidate;
+use vocab_dictionary::{Candidate, DictionaryProvider};
 use vocab_search::{LibraryDoc, QueryKind, match_library};
 
 use crate::dto::{
@@ -81,10 +82,68 @@ fn is_the_query(kind: QueryKind, query: &str, candidate: &Candidate) -> bool {
     }
 }
 
-fn take(limit: Option<u32>, default: usize) -> usize {
-    limit.map_or(default, |limit| {
-        usize::try_from(limit).unwrap_or(usize::MAX)
-    })
+/// For English, the best-ranked result when it is clearly the word: the
+/// English is its main sense, frequency or HSK data backs its place, and no
+/// other result with that main sense is as basic (HSK) or more common.
+/// `school` → 学校 and `eat` → 吃, though 宗 and 食 have those senses too;
+/// `teacher` (先生, 老师), `accept` (接下来, 接受), and `to` (了, 来, …) stay
+/// a choice for the person.
+fn clear_english_pick<'a>(
+    provider: &dyn DictionaryProvider,
+    query: &str,
+    strong: &[&'a Candidate],
+) -> Result<Option<&'a Candidate>> {
+    let Some((&top, rest)) = strong.split_first() else {
+        return Ok(None);
+    };
+    let top_entry = &top.entry;
+    if top_entry.frequency_rank.is_none() && top_entry.hsk_rank.is_none() {
+        return Ok(None);
+    }
+    if !vocab_search::english_is_main_sense(query, top) {
+        return Ok(None);
+    }
+    let mut rivals = rest
+        .iter()
+        .filter(|other| vocab_search::english_is_main_sense_ignoring_notes(query, other));
+    // Frequency counts characters, not readings: 了 liǎo (to finish) has the
+    // count of 了 le. Such a word is chosen only when nothing else has the
+    // sense.
+    if has_other_reading(provider, top_entry)? {
+        return Ok(rivals.next().is_none().then_some(top));
+    }
+    // Lower is better for both; missing data never contests.
+    let beats = |other: Option<u64>, mine: Option<u64>, ties: bool| match (other, mine) {
+        (Some(other), Some(mine)) => other < mine || (ties && other == mine),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let contested = rivals.any(|other| {
+        beats(other.entry.hsk_rank, top_entry.hsk_rank, true)
+            || beats(other.entry.frequency_rank, top_entry.frequency_rank, false)
+    });
+    Ok((!contested).then_some(top))
+}
+
+/// The characters have another reading with a meaning of its own (了 le and
+/// liǎo; a `see 大夫` pointer does not count).
+fn has_other_reading(provider: &dyn DictionaryProvider, entry: &DictionaryEntry) -> Result<bool> {
+    let key = vocab_db::reading_key(&entry.pinyin);
+    Ok(provider
+        .entries_by_headword(&entry.simplified)?
+        .iter()
+        .any(|other| {
+            other.simplified == entry.simplified
+                && vocab_db::reading_key(&other.pinyin) != key
+                && other
+                    .glosses
+                    .iter()
+                    .any(|gloss| !vocab_dictionary::is_cross_reference(&gloss.to_lowercase()))
+        }))
+}
+
+fn to_usize(n: u32) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 impl Shouci {
@@ -122,13 +181,13 @@ impl Shouci {
             (found.candidates, found.kind, found.guessed)
         };
         let total = count(candidates.len());
-        candidates.truncate(take(limit, take(Some(DEFAULT_LIMIT), 0)));
+        candidates.truncate(to_usize(limit.unwrap_or(DEFAULT_LIMIT)));
         Ok(DictionaryResults {
             query: query.to_owned(),
             kind,
             guessed,
             total,
-            candidates: views(&*self.read()?, candidates)?,
+            candidates: views(&*self.reader()?, candidates)?,
         })
     }
 
@@ -149,9 +208,9 @@ impl Shouci {
         limit: Option<u32>,
     ) -> Result<LibraryResults> {
         let query = check_query(query)?;
-        let conn = self.read()?;
+        let conn = self.reader()?;
         let items = vocab_db::list_items(&conn, filter)?;
-        let limit = take(limit, usize::MAX);
+        let limit = limit.map_or(usize::MAX, to_usize);
         if query.is_empty() {
             let total = count(items.len());
             let items: Vec<VocabItem> = items.into_iter().take(limit).collect();
@@ -201,32 +260,37 @@ impl Shouci {
     ///
     /// Storage errors.
     pub fn save_candidate(&self, candidate: &CandidateView) -> Result<SaveResult> {
-        let conn = self.db()?;
-        let saved = vocab_db::save_item(
-            &conn,
-            &NewItem {
-                simplified: candidate.simplified.clone(),
-                traditional: candidate.traditional.clone(),
-                pinyin: candidate.pinyin.clone(),
-                definition: candidate.definition(),
-                notes: String::new(),
-                // A word picked from the ones inside the query is that
-                // word, as the dictionary has it.
-                verification: if candidate.inferred && candidate.basis != MatchBasis::ContainedWord
-                {
-                    Verification::NeedsReview
-                } else {
-                    Verification::Confirmed
-                },
-                source: ItemSource {
-                    kind: SourceKind::Dictionary,
-                    id: Some(candidate.dictionary.clone()),
-                    version: Some(candidate.dictionary_version.clone()),
-                    import_origin: None,
-                },
+        self.save(&NewItem {
+            simplified: candidate.simplified.clone(),
+            traditional: candidate.traditional.clone(),
+            pinyin: candidate.pinyin.clone(),
+            definition: candidate.definition(),
+            notes: String::new(),
+            // A word picked from the ones inside the query is that
+            // word, as the dictionary has it.
+            verification: if candidate.inferred && candidate.basis != MatchBasis::ContainedWord {
+                Verification::NeedsReview
+            } else {
+                Verification::Confirmed
             },
-        )?;
-        save_result(&conn, saved)
+            source: ItemSource {
+                kind: SourceKind::Dictionary,
+                id: Some(candidate.dictionary.clone()),
+                version: Some(candidate.dictionary_version.clone()),
+                import_origin: None,
+            },
+        })
+    }
+
+    /// Saves `item` unless it is saved already. One transaction, so another
+    /// process saving the same word in between is found, not reported as a
+    /// conflict.
+    fn save(&self, item: &NewItem) -> Result<SaveResult> {
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| {
+            let saved = vocab_db::save_item(tx, item)?;
+            save_result(tx, saved)
+        })
     }
 
     /// Adds a word from one line of input, without a picker:
@@ -234,16 +298,22 @@ impl Shouci {
     /// - exactly one result that is the query itself (the same characters,
     ///   the same reading ignoring tones, or a gloss that is exactly the
     ///   English) → saved, confirmed, however many longer words also match;
+    /// - for English, first: the best-ranked result when the English is its
+    ///   main sense and frequency or HSK data backs it (`school` → 学校,
+    ///   though 宗 also means school) → saved, confirmed;
     /// - otherwise exactly one strong dictionary match → saved, confirmed;
-    /// - no match at all → the text is saved as typed, needing review (a
+    /// - no match at all → Chinese text is saved as typed, needing review (a
     ///   later save of the same characters with a reading completes it);
+    ///   anything else (a typo of an English word) is refused;
     /// - several strong matches → nothing is saved; the candidates come back
     ///   to choose from.
     ///
     /// # Errors
     ///
     /// [`crate::ErrorKind::Invalid`] for empty or overlong input;
-    /// [`crate::ErrorKind::Unavailable`] until dictionaries are loaded.
+    /// [`crate::ErrorKind::NotFound`] for text with no match and no Chinese
+    /// characters; [`crate::ErrorKind::Unavailable`] until dictionaries are
+    /// loaded.
     pub fn quick_add(&self, query: &str, kind: Option<QueryKind>) -> Result<QuickAdd> {
         let query = check_query(query)?;
         if query.is_empty() {
@@ -265,38 +335,47 @@ impl Shouci {
             .copied()
             .filter(|candidate| is_the_query(read_as, query, candidate))
             .collect();
-        let pick = match (exact.as_slice(), strong.as_slice()) {
+        let clear = if read_as == QueryKind::English {
+            clear_english_pick(loaded.provider(), query, &strong)?
+        } else {
+            None
+        };
+        let pick = clear.or(match (exact.as_slice(), strong.as_slice()) {
             ([only], _) | ([], [only]) => Some(*only),
             _ => None,
-        };
+        });
         if let Some(only) = pick {
             let view = CandidateView::new(only.clone(), None);
-            return Ok(QuickAdd::Saved(Box::new(self.save_candidate(&view)?)));
+            return Ok(self.save_candidate(&view)?.into());
         }
         // Words found inside the text are not the text: it is kept as typed.
+        // Only Chinese text, though: `helllo` is a typo, not a word to fill
+        // in later.
         if ranked
             .iter()
             .all(|candidate| candidate.diagnostic.basis == MatchBasis::ContainedWord)
         {
-            let conn = self.db()?;
-            let saved = vocab_db::save_item(
-                &conn,
-                &NewItem {
-                    simplified: query.to_owned(),
-                    traditional: String::new(),
-                    pinyin: String::new(),
-                    definition: String::new(),
-                    notes: String::new(),
-                    verification: Verification::NeedsReview,
-                    source: ItemSource::manual(),
-                },
-            )?;
-            return Ok(QuickAdd::Saved(Box::new(save_result(&conn, saved)?)));
+            if !vocab_search::has_han(query) {
+                return Err(Error::not_found(format!(
+                    "nothing in the dictionaries matches {query}; only Chinese characters \
+                     are saved to fill in later"
+                )));
+            }
+            let saved = self.save(&NewItem {
+                simplified: query.to_owned(),
+                traditional: String::new(),
+                pinyin: String::new(),
+                definition: String::new(),
+                notes: String::new(),
+                verification: Verification::NeedsReview,
+                source: ItemSource::manual(),
+            })?;
+            return Ok(saved.into());
         }
         let mut ranked = ranked;
-        ranked.truncate(take(Some(DEFAULT_LIMIT), 0));
+        ranked.truncate(to_usize(DEFAULT_LIMIT));
         Ok(QuickAdd::Ambiguous {
-            candidates: views(&*self.read()?, ranked)?,
+            candidates: views(&*self.reader()?, ranked)?,
         })
     }
 
@@ -323,22 +402,9 @@ impl Shouci {
         let mut traditional = text(&word.traditional);
         let mut pinyin = text(&word.pinyin);
         if traditional.is_none() {
-            if let Some(loaded) = self.loaded_opt() {
-                let key = pinyin.as_deref().map(vocab_db::reading_key);
-                let fits: Vec<_> = loaded
-                    .provider()
-                    .entries_by_headword(simplified)?
-                    .into_iter()
-                    .filter(|entry| entry.simplified == simplified)
-                    .filter(|entry| {
-                        key.as_ref()
-                            .is_none_or(|key| vocab_db::reading_key(&entry.pinyin) == *key)
-                    })
-                    .collect();
-                if let [entry] = fits.as_slice() {
-                    traditional = Some(entry.traditional.clone());
-                    pinyin.get_or_insert_with(|| entry.pinyin.clone());
-                }
+            if let Some(entry) = self.only_entry_for(simplified, pinyin.as_deref())? {
+                traditional = Some(entry.traditional);
+                pinyin.get_or_insert(entry.pinyin);
             }
         }
         let definition = text(&word.definition).unwrap_or_default();
@@ -348,7 +414,7 @@ impl Shouci {
         } else {
             Verification::Confirmed
         };
-        let mut conn = self.db()?;
+        let mut conn = self.writer()?;
         vocab_db::with_tx(&mut conn, |tx| {
             let saved = vocab_db::save_item(
                 tx,
@@ -377,5 +443,29 @@ impl Shouci {
                 item: item_view(tx, item)?,
             })
         })
+    }
+
+    /// The one dictionary entry for these characters (and reading, when
+    /// given), or `None` when there are none, several, or no dictionaries.
+    fn only_entry_for(
+        &self,
+        simplified: &str,
+        pinyin: Option<&str>,
+    ) -> Result<Option<DictionaryEntry>> {
+        let Some(loaded) = self.loaded_opt() else {
+            return Ok(None);
+        };
+        let key = pinyin.map(vocab_db::reading_key);
+        let mut fits: Vec<DictionaryEntry> = loaded
+            .provider()
+            .entries_by_headword(simplified)?
+            .into_iter()
+            .filter(|entry| entry.simplified == simplified)
+            .filter(|entry| {
+                key.as_ref()
+                    .is_none_or(|key| vocab_db::reading_key(&entry.pinyin) == *key)
+            })
+            .collect();
+        Ok(if fits.len() == 1 { fits.pop() } else { None })
     }
 }

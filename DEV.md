@@ -105,8 +105,9 @@ and its `dictionary.db` is copied so the first launch needs no download.
 `user.db` runs in WAL mode with a busy timeout, so the app and the CLI can
 write at once. Its schema version is `PRAGMA user_version`;
 `vocab-db/src/migrate.rs` appends migrations and never edits a shipped one.
-In the repository, `data/dictionaries/` holds the build that tests and CI
-use (`check.sh` points `SHOUCI_DICTIONARIES` there).
+In a checkout, `data/dictionaries/` is where the build that tests and CI use
+goes (`check.sh` points `SHOUCI_DICTIONARIES` there). It is not committed:
+the first run of `check.sh` downloads and builds it.
 
 ## The core
 
@@ -169,7 +170,7 @@ Saving:
 | Call | What is saved |
 | --- | --- |
 | `save_candidate` | The chosen result. Confirmed, unless it was inferred from its characters (then needs review). A word from the trash comes back; a placeholder saved without a reading is completed. |
-| `quick_add` (CLI `add`) | One result that is the query itself (same characters, same toneless reading, or a gloss that is exactly the English) → saved, confirmed. Otherwise one strong match → saved. No match, or only words inside the text → the text as typed, needs review. Several strong matches → nothing; the candidates come back. |
+| `quick_add` (CLI `add`) | One result that is the query itself (same characters, same toneless reading, or a gloss that is exactly the English) → saved, confirmed. For English, several such results, of which the first has the English as its main sense and is more common than every other word with that main sense → the first (`school` → 学校; `to` stays a choice). Otherwise one strong match → saved. No match, or only words inside the text → Chinese text as typed, needs review (anything else, such as a typo, is refused). Several strong matches → nothing; the candidates come back. |
 | `add_manual` | A word typed in. A missing traditional form (and reading) comes from the dictionary when exactly one entry fits. Confirmed only with a reading and a definition. |
 
 Library search (`search_library`) matches in memory over every saved word
@@ -268,10 +269,14 @@ cargo run -p vocab-dictionary --example ingest -- <cedict.u8> <out.db> [--freque
   characters). Results go to stdout, notes and progress to stderr. `--json`
   prints the core's DTOs; errors become `{"error": {"kind", "message"}}`.
   Exit status 0, 1 for an error or nothing saved, 2 for a usage error.
-- **`shouci-tui`**: `app.rs` (state, keys, core calls, the event loop),
-  `state.rs` and `ui.rs` (pure, tested without a terminal), `theme.rs`
+- **`shouci-tui`**: `app/` is the state and its methods, by job: `mod.rs`
+  (the state, key routing, the event loop), `search.rs`, `saved.rs`,
+  `prompt.rs` (import and export), and `render.rs` (drawing). `state.rs`
+  and `ui.rs` are pure helpers, tested without a terminal; `theme.rs`
   (`NO_COLOR` gives monochrome). Dictionaries load before the TUI takes the
   screen. File panels come from `rfd`, with a typed path as the fallback.
+- Wording both text frontends print (`counted`, what an import changed)
+  lives once, in `shouci_core::text`.
 - **Mac app**: [macos/README.md](macos/README.md). Every core call goes
   through `AppModel.call`, off the main thread.
 
@@ -290,7 +295,7 @@ cargo run -p vocab-dictionary --example ingest -- <cedict.u8> <out.db> [--freque
 | A file format | its connector crate |
 | Schema | a new migration in `vocab-db/src/migrate.rs` |
 | CLI commands and output | `shouci-cli/src/main.rs`, `text.rs` |
-| TUI keys and screens | `shouci-tui/src/app.rs`, `ui.rs` |
+| TUI keys and screens | `shouci-tui/src/app/`, `ui.rs` |
 | The Swift API | `shouci-ffi/src/lib.rs` (methods), `remote.rs` (types) |
 
 Do not pull in tantivy or fuzzy matchers for dictionary lookup. FTS5 is

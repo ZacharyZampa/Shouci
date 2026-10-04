@@ -51,22 +51,34 @@ final class AppModel {
     /// background. Also the retry after a failure.
     func loadDictionaries() {
         guard let core else { return }
-        dictionary = .loading("Preparing the dictionary…")
-        Task.detached(priority: .utility) { try? core.loadDictionaries() }
+        // Search keeps working while a ready dictionary is checked again.
+        if !isSearchable { dictionary = .loading("Preparing the dictionary…") }
+        let loading = Task.detached(priority: .utility) { try? core.loadDictionaries() }
         polling?.cancel()
         polling = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, let core = self.core else { return }
-                if self.apply(core.dictionaryStatus()) { return }
+                if self.apply(core.dictionaryStatus()) { break }
                 try? await Task.sleep(for: .milliseconds(250))
             }
+            // The core reports Ready as soon as what is installed opens,
+            // before the download step adds its notes ("could not be updated
+            // this month"): show the status the load ends with.
+            await loading.value
+            guard !Task.isCancelled, let self, let core = self.core else { return }
+            _ = self.apply(core.dictionaryStatus())
         }
     }
 
+    /// Runs `work` off the main thread. A caller cancelled before the work
+    /// starts (a search or preview superseded by a newer one) gets
+    /// `CancellationError` instead: the detached task is not cancelled with
+    /// its caller, and a core call cannot be stopped once it runs.
     func call<T: Sendable>(_ work: @escaping @Sendable (Core) throws -> T) async throws -> T {
         guard let core else {
             throw ShouciError.Failed(kind: .unavailable, message: "Shouci is still opening your library.")
         }
+        try Task.checkCancellation()
         return try await Task.detached(priority: .userInitiated) { try work(core) }.value
     }
 

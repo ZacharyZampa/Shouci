@@ -3,7 +3,7 @@
 //!
 //! Plain SQLite and plain functions over a [`rusqlite::Connection`]; a
 //! [`rusqlite::Transaction`] works anywhere a connection does. The schema is
-//! versioned with `PRAGMA user_version` (see [`migrate`]). Nothing outside
+//! versioned with `PRAGMA user_version` (see `migrate.rs`). Nothing outside
 //! `shouci-core` calls this crate.
 
 mod items;

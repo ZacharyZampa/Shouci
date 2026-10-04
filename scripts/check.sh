@@ -9,6 +9,7 @@ cd "${ROOT}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 export SHOUCI_SKIP_DICTIONARY_REFRESH=1
 export SHOUCI_DICTIONARIES="${ROOT}/data/dictionaries"
+export SHOUCI_REQUIRE_DICTIONARY=1
 
 if [ ! -f data/dictionaries/cc-cedict.db ]; then
   echo "==> cc-cedict.db missing, fetching"

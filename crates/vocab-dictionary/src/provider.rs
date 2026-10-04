@@ -1,3 +1,7 @@
+//! What search needs from a dictionary: retrieval by query kind, and lookup
+//! by headword. [`crate::SqliteDictionary`] is one; [`crate::DictionarySet`]
+//! searches several in priority order.
+
 use vocab_core::{DictionaryEntry, MatchBasis, Result};
 use vocab_pinyin::NormalizedPinyin;
 

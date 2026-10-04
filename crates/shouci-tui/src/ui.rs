@@ -239,7 +239,7 @@ pub(crate) fn header_line(
             ));
             spans.push(Span::raw(format!(
                 "  {}",
-                crate::state::counted(
+                shouci_core::text::counted(
                     u64::try_from(saved_len).unwrap_or(u64::MAX),
                     "word",
                     "words"

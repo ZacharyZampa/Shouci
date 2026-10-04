@@ -94,31 +94,11 @@ impl Shouci {
                 self.set_ready(loaded, problems);
             }
         }
-        let mut fetch_errors = Vec::new();
-        if self.config.fetch_dictionaries {
-            for spec in catalog::builtin() {
-                let mut progress = |stage: FetchStage| {
-                    let stage = match stage {
-                        FetchStage::Waiting => LoadingStage::Waiting,
-                        FetchStage::Downloading => LoadingStage::Downloading,
-                        FetchStage::Building => LoadingStage::Building,
-                    };
-                    self.report(stage, spec.name);
-                };
-                match (spec.ensure)(
-                    &dictionary_path(&self.config.dictionaries_dir, spec.id),
-                    &mut progress,
-                ) {
-                    Ok(Ensured::RefreshFailed(err)) => notes.push(format!(
-                        "{} could not be updated this month, so the previous copy is in use \
-                         ({err}).",
-                        spec.name
-                    )),
-                    Ok(Ensured::Current | Ensured::Built | Ensured::Refreshed) => {}
-                    Err(err) => fetch_errors.push(format!("{}: {err}", spec.name)),
-                }
-            }
-        }
+        let fetch_errors = if self.config.fetch_dictionaries {
+            self.fetch_builtins(&mut notes)
+        } else {
+            Vec::new()
+        };
         if !self.is_ready() {
             self.set_loading(LoadingStage::Opening, None);
         }
@@ -158,6 +138,35 @@ impl Shouci {
             self.reopen_keeping_notes();
         }
         outcome
+    }
+
+    /// Downloads and builds missing built-in dictionaries and refreshes
+    /// stale ones, reporting progress in the status. A failed refresh adds a
+    /// note (the previous copy stays in use); returns the failed downloads.
+    fn fetch_builtins(&self, notes: &mut Vec<String>) -> Vec<String> {
+        let mut fetch_errors = Vec::new();
+        for spec in catalog::builtin() {
+            let mut progress = |stage: FetchStage| {
+                let stage = match stage {
+                    FetchStage::Waiting => LoadingStage::Waiting,
+                    FetchStage::Downloading => LoadingStage::Downloading,
+                    FetchStage::Building => LoadingStage::Building,
+                };
+                self.report(stage, spec.name);
+            };
+            match (spec.ensure)(
+                &dictionary_path(&self.config.dictionaries_dir, spec.id),
+                &mut progress,
+            ) {
+                Ok(Ensured::RefreshFailed(err)) => notes.push(format!(
+                    "{} could not be updated this month, so the previous copy is in use ({err}).",
+                    spec.name
+                )),
+                Ok(Ensured::Current | Ensured::Built | Ensured::Refreshed) => {}
+                Err(err) => fetch_errors.push(format!("{}: {err}", spec.name)),
+            }
+        }
+        fetch_errors
     }
 
     #[must_use]
@@ -238,7 +247,7 @@ impl Shouci {
                 return Err(Error::invalid(format!("no dictionary '{id}' is installed")));
             }
         }
-        vocab_db::set_setting(&*self.db()?, ENABLED_KEY, &unique.join(","))?;
+        vocab_db::set_setting(&*self.writer()?, ENABLED_KEY, &unique.join(","))?;
         match self.load.running.try_lock() {
             Ok(_running) => {
                 if self.is_ready() {
@@ -258,7 +267,7 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::NotFound`] for an unknown word or dictionary.
     pub fn lookup_in(&self, item_id: i64, dictionary: &str) -> Result<Vec<DictionaryEntryView>> {
-        let item = vocab_db::require_item(&*self.read()?, item_id)?;
+        let item = vocab_db::require_item(&*self.reader()?, item_id)?;
         let entries = self.with_dictionary(dictionary, |dict| {
             dict.entries_by_headword(&item.simplified)
         })?;
@@ -289,7 +298,7 @@ impl Shouci {
     /// [`crate::ErrorKind::NotFound`] when the dictionary has no such entry;
     /// [`crate::ErrorKind::Conflict`] when it has several.
     pub fn use_definition(&self, item_id: i64, dictionary: &str) -> Result<ItemView> {
-        let item = vocab_db::require_item(&*self.read()?, item_id)?;
+        let item = vocab_db::require_item(&*self.reader()?, item_id)?;
         let entries = self.with_dictionary(dictionary, |dict| {
             dict.entries_by_headword(&item.simplified)
         })?;
@@ -311,7 +320,7 @@ impl Shouci {
                 )));
             }
         };
-        let mut conn = self.db()?;
+        let mut conn = self.writer()?;
         vocab_db::with_tx(&mut conn, |tx| {
             vocab_db::update_item(
                 tx,
@@ -431,7 +440,7 @@ impl Shouci {
     }
 
     fn enabled_ids(&self, installed: &[DictionaryInfo]) -> Result<Vec<String>> {
-        let saved = vocab_db::get_setting(&*self.read()?, ENABLED_KEY)?;
+        let saved = vocab_db::get_setting(&*self.reader()?, ENABLED_KEY)?;
         let mut ids: Vec<String> = Vec::new();
         for id in saved
             .as_deref()

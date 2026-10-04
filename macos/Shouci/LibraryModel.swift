@@ -4,60 +4,11 @@ import ShouciCore
 
 /// The library window's state (mockups 01–04). The whole library is loaded
 /// at once, so scopes, counts, and sorting are instant; search and every
-/// change go to the core.
+/// change go to the core. What the list shows for a scope is worked out in
+/// `LibraryList.swift`; the editor's draft is `WordDraft.swift`.
 @MainActor
 @Observable
 final class LibraryModel {
-    enum Scope: Hashable {
-        case all
-        case needsReview
-        case recent
-        case archived
-        case trash
-        case collection(String)
-        case tag(String)
-    }
-
-    enum Sort: String, CaseIterable, Identifiable {
-        case added
-        case edited
-        case pinyin
-
-        var id: Self { self }
-
-        var title: String {
-            switch self {
-            case .added: "Date Added"
-            case .edited: "Date Edited"
-            case .pinyin: "Pinyin"
-            }
-        }
-    }
-
-    /// What a list row is, for selection.
-    enum Pick: Hashable {
-        case item(Int64)
-        case candidate(String)
-    }
-
-    enum Row: Identifiable {
-        case item(ItemView)
-        case candidate(CandidateView)
-
-        var id: Pick {
-            switch self {
-            case .item(let item): .item(item.id)
-            case .candidate(let candidate): .candidate(candidate.id)
-            }
-        }
-    }
-
-    struct Group: Identifiable {
-        let title: String
-        let rows: [Row]
-        var id: String { title }
-    }
-
     /// A name being typed: a new collection, or a rename.
     struct Naming: Identifiable {
         enum Purpose {
@@ -117,17 +68,10 @@ final class LibraryModel {
     private(set) var focusSearchRequests = 0
 
     @ObservationIgnored private var byID: [Int64: ItemView] = [:]
-    @ObservationIgnored private var dates: [Int64: Dates] = [:]
+    @ObservationIgnored private var dates: [Int64: ItemDates] = [:]
     @ObservationIgnored private var version: Int64?
     @ObservationIgnored private var searching: Task<Void, Never>?
     @ObservationIgnored private var watching: Task<Void, Never>?
-
-    private struct Dates {
-        let added: Date
-        let edited: Date
-        let archived: Date?
-        let trashed: Date?
-    }
 
     init(app: AppModel, preferences: Preferences) {
         self.app = app
@@ -139,23 +83,20 @@ final class LibraryModel {
     func reload() async {
         guard app.core != nil else { return }
         do {
-            let (all, trash, tags, collections, dictionaries, version, connectors) = try await app.call { core in
+            // The version first: a change landing while the rest loads then
+            // shows up as a newer version, and the watcher loads again.
+            let (version, all, trash, tags, collections, dictionaries, connectors) = try await app.call { core in
                 (
+                    try core.dataVersion(),
                     try core.listItems(filter: LibraryFilter(view: .all)),
                     try core.listItems(filter: LibraryFilter(view: .trash)),
                     try core.tags(), try core.collections(), try core.dictionaries(),
-                    try core.dataVersion(), core.connectors()
+                    core.connectors()
                 )
             }
             items = all + trash
             byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            dates = byID.mapValues { item in
-                Dates(
-                    added: When.parse(item.createdAt) ?? .distantPast,
-                    edited: When.parse(item.modifiedAt) ?? .distantPast,
-                    archived: item.archivedAt.flatMap(When.parse),
-                    trashed: item.deletedAt.flatMap(When.parse))
-            }
+            dates = byID.mapValues(ItemDates.init)
             self.tags = tags
             self.collections = collections
             self.dictionaries = dictionaries
@@ -201,23 +142,7 @@ final class LibraryModel {
     func item(_ id: Int64) -> ItemView? { byID[id] }
 
     func items(in scope: Scope) -> [ItemView] {
-        switch scope {
-        case .all:
-            return items.filter { $0.lifecycle == .active }
-        case .needsReview:
-            return items.filter { $0.lifecycle == .active && $0.verification == .needsReview }
-        case .recent:
-            let since = Date.now.addingTimeInterval(-7 * 86_400)
-            return items.filter { $0.lifecycle == .active && (dates[$0.id]?.added ?? .distantPast) >= since }
-        case .archived:
-            return items.filter { $0.lifecycle == .archived }
-        case .trash:
-            return items.filter { $0.lifecycle == .trashed }
-        case .collection(let name):
-            return items.filter { $0.lifecycle != .trashed && $0.collections.contains(name) }
-        case .tag(let name):
-            return items.filter { $0.lifecycle != .trashed && $0.tags.contains(name) }
-        }
+        LibraryList.items(items, in: scope, dates: dates, now: .now)
     }
 
     var isSearching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -271,47 +196,7 @@ final class LibraryModel {
             }
             return groups
         }
-        let list = items(in: scope)
-        if sort == .pinyin {
-            let sorted = list.sorted { ($0.pinyin.isEmpty ? "~" : $0.pinyin.lowercased()) < ($1.pinyin.isEmpty ? "~" : $1.pinyin.lowercased()) }
-            return grouped(sorted) { item in
-                item.pinyin.first.map { String($0).uppercased() } ?? "No reading"
-            }
-        }
-        let date: (ItemView) -> Date = { [dates, scope, sort] item in
-            let dated = dates[item.id]
-            switch scope {
-            case .trash: return dated?.trashed ?? dated?.edited ?? .distantPast
-            case .archived: return dated?.archived ?? dated?.edited ?? .distantPast
-            default: return (sort == .edited ? dated?.edited : dated?.added) ?? .distantPast
-            }
-        }
-        let now = Date.now
-        return grouped(list.sorted { date($0) > date($1) }) { Self.period(date($0), now: now) }
-    }
-
-    private func grouped(_ items: [ItemView], by title: (ItemView) -> String) -> [Group] {
-        var groups: [Group] = []
-        var current: (title: String, rows: [Row])?
-        for item in items {
-            let key = title(item)
-            if current?.title != key {
-                if let current { groups.append(Group(title: current.title, rows: current.rows)) }
-                current = (key, [])
-            }
-            current?.rows.append(.item(item))
-        }
-        if let current { groups.append(Group(title: current.title, rows: current.rows)) }
-        return groups
-    }
-
-    static func period(_ date: Date, now: Date) -> String {
-        let calendar = Calendar.current
-        if calendar.isDateInToday(date) { return "Today" }
-        if calendar.isDateInYesterday(date) { return "Yesterday" }
-        if calendar.isDate(date, equalTo: now, toGranularity: .weekOfYear) { return "Earlier this week" }
-        if calendar.isDate(date, equalTo: now, toGranularity: .month) { return "Earlier this month" }
-        return date.formatted(.dateTime.month(.wide).year())
+        return LibraryList.groups(items(in: scope), scope: scope, sort: sort, dates: dates, now: .now)
     }
 
     /// Rows in list order, for moving the selection from the search field.
@@ -529,12 +414,13 @@ final class LibraryModel {
         do {
             let id: Int64
             if let original = draft.original {
-                let patch = draft.patch(from: original)
+                let patch = draft.patch(from: original) ?? ItemPatch()
                 let changes = draft.groupChanges(from: original)
                 id = original.id
-                try await app.call { core in
-                    if let patch { _ = try core.updateItem(id: id, patch: patch) }
-                    for action in changes { _ = try core.bulk(ids: [id], action: action) }
+                // One call, so the fields and the groups change together or
+                // not at all.
+                _ = try await app.call { core in
+                    try core.editItem(id: id, patch: patch, actions: changes)
                 }
             } else {
                 let word = ManualWord(
@@ -558,75 +444,8 @@ final class LibraryModel {
             return true
         } catch {
             problem = describe(error)
+            await reload()
             return false
         }
-    }
-}
-
-/// The editor's copy of a word (mockup 04). `original` is nil for a new one.
-struct WordDraft: Identifiable {
-    let id = UUID()
-    var original: ItemView?
-    var simplified = ""
-    var traditional = ""
-    var pinyin = ""
-    var definition = ""
-    var notes = ""
-    var tags: [String] = []
-    var collections: [String] = []
-    var needsReview = false
-    /// The reading as first shown, to tell whether it was edited.
-    private(set) var shownPinyin = ""
-
-    init(simplified: String = "") {
-        self.simplified = simplified
-    }
-
-    init(item: ItemView, style: PinyinStyle) {
-        original = item
-        simplified = item.simplified
-        traditional = item.traditional
-        pinyin = style == .numbers ? item.pinyin : item.pinyinDisplay
-        shownPinyin = pinyin
-        definition = item.definition
-        notes = item.notes
-        tags = item.tags
-        collections = item.collections
-        needsReview = item.verification == .needsReview
-    }
-
-    var trimmed: WordDraft {
-        var copy = self
-        copy.simplified = simplified.trimmingCharacters(in: .whitespacesAndNewlines)
-        copy.traditional = traditional.trimmingCharacters(in: .whitespacesAndNewlines)
-        copy.pinyin = pinyin.trimmingCharacters(in: .whitespacesAndNewlines)
-        copy.definition = definition.trimmingCharacters(in: .whitespacesAndNewlines)
-        copy.notes = notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        return copy
-    }
-
-    /// Only the fields that changed; nil when none did.
-    func patch(from item: ItemView) -> ItemPatch? {
-        let patch = ItemPatch(
-            simplified: simplified != item.simplified ? simplified : nil,
-            traditional: traditional != item.traditional ? traditional : nil,
-            pinyin: pinyin != shownPinyin.trimmingCharacters(in: .whitespacesAndNewlines) ? pinyin : nil,
-            definition: definition != item.definition ? definition : nil,
-            notes: notes != item.notes ? notes : nil,
-            verification: needsReview != (item.verification == .needsReview)
-                ? (needsReview ? .needsReview : .confirmed) : nil)
-        return patch == ItemPatch() ? nil : patch
-    }
-
-    /// Tags and collections gained and lost.
-    func groupChanges(from item: ItemView) -> [BulkAction] {
-        var actions: [BulkAction] = []
-        let addedTags = tags.filter { !item.tags.contains($0) }
-        let removedTags = item.tags.filter { !tags.contains($0) }
-        if !addedTags.isEmpty { actions.append(.addTags(addedTags)) }
-        if !removedTags.isEmpty { actions.append(.removeTags(removedTags)) }
-        actions += collections.filter { !item.collections.contains($0) }.map(BulkAction.addToCollection)
-        actions += item.collections.filter { !collections.contains($0) }.map(BulkAction.removeFromCollection)
-        return actions
     }
 }

@@ -87,12 +87,55 @@ fn quick_add_never_guesses_between_strong_matches() {
 }
 
 #[test]
-fn quick_add_keeps_unknown_text_for_review() {
+fn quick_add_keeps_unknown_chinese_for_review() {
     let shouci = sandbox();
-    let result = saved(shouci.quick_add("zzzqqq", None).unwrap());
+    let result = saved(shouci.quick_add("蚌埠住了", None).unwrap());
     assert_eq!(result.item.verification, Verification::NeedsReview);
-    assert_eq!(result.item.simplified, "zzzqqq");
+    assert_eq!(result.item.simplified, "蚌埠住了");
     assert_eq!(result.item.definition, "", "no invented definition");
+}
+
+#[test]
+fn quick_add_refuses_unknown_text_that_is_not_chinese() {
+    // A typo is not a word to fill in later.
+    let shouci = sandbox();
+    let err = shouci.quick_add("zzzqqq", None).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+    assert_eq!(heads(&shouci, &active()), [] as [String; 0]);
+}
+
+#[test]
+fn an_edit_with_a_refused_tag_changes_nothing() {
+    let shouci = sandbox();
+    let id = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let before = shouci.item(id).unwrap();
+    let err = shouci
+        .edit_item(
+            id,
+            &ItemPatch {
+                definition: Some("place of learning".to_owned()),
+                ..ItemPatch::default()
+            },
+            &[
+                BulkAction::AddTags(vec!["fine".to_owned()]),
+                BulkAction::AddTags(vec!["bad\tname".to_owned()]),
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Invalid);
+    assert_eq!(shouci.item(id).unwrap(), before);
+    let edited = shouci
+        .edit_item(
+            id,
+            &ItemPatch {
+                definition: Some("place of learning".to_owned()),
+                ..ItemPatch::default()
+            },
+            &[BulkAction::AddTags(vec!["fine".to_owned()])],
+        )
+        .unwrap();
+    assert_eq!(edited.definition, "place of learning");
+    assert_eq!(edited.tags, ["fine"]);
 }
 
 #[test]

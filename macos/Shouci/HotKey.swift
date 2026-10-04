@@ -19,13 +19,18 @@ struct HotKeyBinding: Equatable, Sendable {
 
     var display: String { symbols.joined() }
 
-    /// macOS refuses bare keys and Option-only (or Option+Shift) combinations.
+    /// Control or Command, or a function key. macOS refuses bare keys and
+    /// Option-only (or Option+Shift) combinations, and a Shift-only shortcut
+    /// would take a capital letter from every app.
     var isValid: Bool {
-        let meaningful = modifiers & UInt32(controlKey | cmdKey | shiftKey)
-        if meaningful == 0 { return false }
-        if modifiers & UInt32(optionKey) != 0 && meaningful == UInt32(shiftKey) { return false }
-        return true
+        if Self.functionKeys.contains(Int(keyCode)) { return true }
+        return modifiers & UInt32(controlKey | cmdKey) != 0
     }
+
+    private static let functionKeys: Set<Int> = [
+        kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10,
+        kVK_F11, kVK_F12, kVK_F13, kVK_F14, kVK_F15, kVK_F16, kVK_F17, kVK_F18, kVK_F19, kVK_F20,
+    ]
 
     /// The shortcut a key-down event asks for.
     init?(event: NSEvent) {

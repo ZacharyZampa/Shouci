@@ -2,7 +2,8 @@
 
 .DS_Store
 
-# Dictionary source artifacts are hash-pinned elsewhere, never committed.
+# Dictionary source artifacts are downloaded (pinned ones are hash-checked in
+# crates/vocab-dictionary/src/fetch.rs), never committed.
 data/dictionaries/sources/*
 !data/dictionaries/sources/README.md
 

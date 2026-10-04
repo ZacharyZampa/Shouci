@@ -5,7 +5,7 @@
 //! Pleco category or an Anki deck. A word can have any number of each. Names
 //! are case-insensitive: `HSK1` and `hsk1` are one tag.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use vocab_core::{Result, VocabError};
@@ -26,6 +26,7 @@ enum Group {
 }
 
 impl Group {
+    /// The table of names.
     fn table(self) -> &'static str {
         match self {
             Self::Tag => "tags",
@@ -33,14 +34,16 @@ impl Group {
         }
     }
 
-    fn links(self) -> &'static str {
+    /// The table linking words to names.
+    fn join_table(self) -> &'static str {
         match self {
             Self::Tag => "item_tags",
             Self::Collection => "collection_items",
         }
     }
 
-    fn key(self) -> &'static str {
+    /// The join table's column naming the tag or collection.
+    fn foreign_key(self) -> &'static str {
         match self {
             Self::Tag => "tag_id",
             Self::Collection => "collection_id",
@@ -106,8 +109,8 @@ fn list(conn: &Connection, group: Group) -> Result<Vec<NameCount>> {
          LEFT JOIN items i ON i.id = l.item_id AND i.deleted_at IS NULL \
          GROUP BY g.id ORDER BY g.name COLLATE NOCASE",
         table = group.table(),
-        links = group.links(),
-        key = group.key(),
+        links = group.join_table(),
+        key = group.foreign_key(),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -125,8 +128,8 @@ fn names_of(conn: &Connection, group: Group, item_id: i64) -> Result<Vec<String>
         "SELECT g.name FROM {table} g JOIN {links} l ON l.{key} = g.id \
          WHERE l.item_id = ?1 ORDER BY g.name COLLATE NOCASE",
         table = group.table(),
-        links = group.links(),
-        key = group.key(),
+        links = group.join_table(),
+        key = group.foreign_key(),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([item_id], |row| row.get(0))?;
@@ -138,8 +141,8 @@ fn names_by_item(conn: &Connection, group: Group) -> Result<HashMap<i64, Vec<Str
         "SELECT l.item_id, g.name FROM {table} g JOIN {links} l ON l.{key} = g.id \
          ORDER BY g.name COLLATE NOCASE",
         table = group.table(),
-        links = group.links(),
-        key = group.key(),
+        links = group.join_table(),
+        key = group.foreign_key(),
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
@@ -156,8 +159,8 @@ fn link(conn: &Connection, group: Group, item_id: i64, name: &str) -> Result<()>
     let added = conn.execute(
         &format!(
             "INSERT OR IGNORE INTO {} (item_id, {}) VALUES (?1, ?2)",
-            group.links(),
-            group.key()
+            group.join_table(),
+            group.foreign_key()
         ),
         params![item_id, group_id],
     )?;
@@ -174,8 +177,8 @@ fn unlink(conn: &Connection, group: Group, item_id: i64, name: &str) -> Result<(
     let removed = conn.execute(
         &format!(
             "DELETE FROM {} WHERE item_id = ?1 AND {} = ?2",
-            group.links(),
-            group.key()
+            group.join_table(),
+            group.foreign_key()
         ),
         params![item_id, group_id],
     )?;
@@ -188,12 +191,22 @@ fn unlink(conn: &Connection, group: Group, item_id: i64, name: &str) -> Result<(
 fn replace(conn: &Connection, group: Group, item_id: i64, names: &[String]) -> Result<()> {
     require_item(conn, item_id)?;
     // Every name must be valid before the old ones go.
+    let mut wanted = BTreeSet::new();
     for name in names {
-        clean_name(group, name)?;
+        // Names compare as `COLLATE NOCASE` does: ASCII case only.
+        wanted.insert(clean_name(group, name)?.to_ascii_lowercase());
+    }
+    let current: BTreeSet<String> = names_of(conn, group, item_id)?
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    if current == wanted {
+        // Nothing to change, so the word's revision stays.
+        return Ok(());
     }
     mark_changed(conn, item_id)?;
     conn.execute(
-        &format!("DELETE FROM {} WHERE item_id = ?1", group.links()),
+        &format!("DELETE FROM {} WHERE item_id = ?1", group.join_table()),
         [item_id],
     )?;
     for name in names {
@@ -226,8 +239,8 @@ fn mark_members_changed(conn: &Connection, group: Group, group_id: i64) -> Resul
         &format!(
             "UPDATE items SET modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
              rev = rev + 1 WHERE id IN (SELECT item_id FROM {} WHERE {} = ?1)",
-            group.links(),
-            group.key()
+            group.join_table(),
+            group.foreign_key()
         ),
         [group_id],
     )?;
@@ -436,7 +449,7 @@ mod tests {
 
     use super::{
         add_tag, add_to_collection, collection_from_tag, collections, delete_tag, item_tags,
-        rename_tag, set_tags, tags,
+        rename_tag, set_collections, set_tags, tags,
     };
     use crate::items::{NewItem, save_item, set_trashed};
     use crate::open_in_memory;
@@ -512,6 +525,21 @@ mod tests {
         rename_tag(&conn, "x", "y").unwrap();
         let after = crate::require_item(&conn, a).unwrap().rev;
         assert_eq!(after, before + 2);
+    }
+
+    #[test]
+    fn setting_the_same_groups_is_no_change() {
+        let conn = open_in_memory().unwrap();
+        let a = saved(&conn, "一", "yi1");
+        set_tags(&conn, a, &["x".to_owned(), "y".to_owned()]).unwrap();
+        set_collections(&conn, a, &["Food".to_owned()]).unwrap();
+        let before = crate::require_item(&conn, a).unwrap().rev;
+        set_tags(&conn, a, &["Y".to_owned(), " x ".to_owned()]).unwrap();
+        set_collections(&conn, a, &["food".to_owned()]).unwrap();
+        assert_eq!(crate::require_item(&conn, a).unwrap().rev, before);
+        set_tags(&conn, a, &["x".to_owned()]).unwrap();
+        assert!(crate::require_item(&conn, a).unwrap().rev > before);
+        assert_eq!(item_tags(&conn, a).unwrap(), vec!["x"]);
     }
 
     #[test]

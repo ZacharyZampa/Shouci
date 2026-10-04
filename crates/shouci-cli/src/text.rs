@@ -3,6 +3,8 @@
 
 use std::fmt::Write;
 
+pub use shouci_core::text::counted;
+use shouci_core::text::{import_outcome, with_review};
 use shouci_core::{
     CandidateView, ConnectorView, DictionaryEntryView, DictionaryView, ExportPlan, GroupView,
     ImportPlan, ItemView, Lifecycle, MatchBasis, Severity, SourceKind, TransferSummary,
@@ -11,26 +13,6 @@ use shouci_core::{
 
 /// Definitions in lists are cut to this many characters.
 const DEFINITION_CHARS: usize = 60;
-
-/// `1 word`, `3 words`.
-pub fn counted(count: impl Into<u64>, singular: &str, plural: &str) -> String {
-    match count.into() {
-        1 => format!("1 {singular}"),
-        count => format!("{count} {plural}"),
-    }
-}
-
-/// Whether `text` has a Chinese character: only then can it be saved as a
-/// word to fill in later.
-pub fn has_han(text: &str) -> bool {
-    text.chars().any(|c| {
-        matches!(c,
-            '\u{3400}'..='\u{4dbf}'
-            | '\u{4e00}'..='\u{9fff}'
-            | '\u{f900}'..='\u{faff}'
-            | '\u{20000}'..='\u{3134f}')
-    })
-}
 
 /// `学校 / 學校 [xué xiào]`: the traditional form only when it differs, the
 /// reading only when there is one.
@@ -300,36 +282,13 @@ pub fn issue_lines(plan: &ImportPlan) -> Vec<String> {
 
 /// What an import did.
 pub fn import_summary(summary: &TransferSummary, format: &str) -> String {
-    let mut parts = vec![format!(
-        "added {}",
-        with_review(summary.inserted, summary.unresolved)
-    )];
-    if summary.updated > 0 {
-        parts.push(format!("updated {}", summary.updated));
-    }
-    if summary.skipped > 0 {
-        parts.push(format!("skipped {}", summary.skipped));
-    }
-    if summary.dropped > 0 {
-        parts.push(format!("dropped {}", summary.dropped));
-    }
     let mut lines = vec![format!(
         "{} from {format} file {}",
-        parts.join(", "),
+        import_outcome(summary),
         summary.path
     )];
     lines.extend(summary.notes.iter().cloned());
     lines.join("\n")
-}
-
-/// `3 words (1 needs review)`.
-fn with_review(words: u32, review: u32) -> String {
-    let words = counted(words, "word", "words");
-    match review {
-        0 => words,
-        1 => format!("{words} (1 needs review)"),
-        review => format!("{words} ({review} need review)"),
-    }
 }
 
 /// What an export would write, and what it leaves out.
@@ -394,7 +353,7 @@ fn count(n: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{clip, counted, day, headword};
+    use super::{clip, day, headword};
 
     #[test]
     fn headwords_drop_what_adds_nothing() {
@@ -407,9 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_and_clipping() {
-        assert_eq!(counted(1_u32, "word", "words"), "1 word");
-        assert_eq!(counted(0_u32, "word", "words"), "0 words");
+    fn clipping_and_days() {
         assert_eq!(clip("abcdef", 4), "abc…");
         assert_eq!(clip("abc", 4), "abc");
         assert_eq!(day("2026-09-30T12:00:00.000Z"), "2026-09-30");

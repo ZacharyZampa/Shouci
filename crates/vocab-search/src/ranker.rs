@@ -1,4 +1,12 @@
-use std::cmp::Ordering;
+//! Orders retrieved candidates. Ranking never removes one.
+//!
+//! Each query kind has its own key, whose fields compare in declaration
+//! order: the first field that differs decides. `Reverse` marks a field
+//! where true, or more, comes first. Every key ends in [`TailKey`]
+//! (dictionary priority, frequency, HSK level, entry id), so equal matches
+//! still get one fixed order. DEV.md ("Search path") has the rules in prose.
+
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 
 use vocab_core::MatchBasis;
@@ -6,70 +14,72 @@ use vocab_core::SourceId;
 use vocab_dictionary::{Candidate, english_terms, is_cross_reference};
 use vocab_pinyin::{NormalizedPinyin, normalize, segment};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TailKey {
-    pub source_index: usize,
-    pub frequency: u64,
-    pub hsk: u64,
-    pub entry_id: i64,
+/// The frequency rank under which a word counts as everyday.
+const COMMON_WORD_RANK: u64 = 10_000;
+
+/// The last tiebreaks, shared by every query kind.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TailKey {
+    source_index: usize,
+    frequency: u64,
+    hsk: u64,
+    entry_id: i64,
 }
 
-impl TailKey {
-    #[must_use]
-    pub fn compare(&self, other: &Self) -> Ordering {
-        self.source_index
-            .cmp(&other.source_index)
-            .then_with(|| self.frequency.cmp(&other.frequency))
-            .then_with(|| self.hsk.cmp(&other.hsk))
-            .then_with(|| self.entry_id.cmp(&other.entry_id))
-    }
+/// How an entry's glosses match an English query.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EnglishKey {
+    /// A sense is the query (`travel` in `to travel`), and the word is one
+    /// people use.
+    known_sense: Reverse<bool>,
+    /// A sense starts with the query: `trav` in `to travel`.
+    sense_prefix: Reverse<bool>,
+    /// A sense starts with the query as a word: `cat` in `cat (CL:隻|只[zhi1])`.
+    sense_word_prefix: Reverse<bool>,
+    /// The glosses contain the query as typed.
+    phrase: Reverse<bool>,
+    /// Every word of the query is a word of the glosses.
+    every_word: Reverse<bool>,
+    /// Every word of the query starts a word of the glosses (`trav`).
+    every_word_prefix: Reverse<bool>,
+    /// How many of the query's words the glosses have, 0–100.
+    percent_words: Reverse<usize>,
+    /// Which sense the query is (0 for the first), plus [`rarity`].
+    standing: usize,
+    tail: TailKey,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
-pub(crate) struct RankKey {
-    pub exact_single_gloss: bool,
-    pub gloss_prefix: bool,
-    pub gloss_word_prefix: bool,
-    pub exact_phrase: bool,
-    pub exact_token: bool,
-    pub prefix: bool,
-    pub undersized: bool,
-    pub pinyin_sequence: usize,
-    pub token_coverage: usize,
-    pub span: usize,
-    pub exact_simplified: bool,
-    pub exact_traditional: bool,
-    pub tail: TailKey,
+/// How an entry's reading matches a pinyin query.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PinyinKey {
+    /// The reading is the query, in one of its segmentations.
+    exact: Reverse<bool>,
+    /// Too few syllables to spell the whole query (好 for `nihao`).
+    undersized: bool,
+    /// The longest run of the query's syllables, in order.
+    aligned_run: Reverse<usize>,
+    /// How many of the query's syllables the reading has, 0–100.
+    percent_syllables: Reverse<usize>,
+    /// Fewer syllables first.
+    syllables: usize,
+    tail: TailKey,
 }
 
-impl RankKey {
-    #[must_use]
-    pub fn compare(&self, other: &Self) -> Ordering {
-        self.exact_single_gloss
-            .cmp(&other.exact_single_gloss)
-            .reverse()
-            .then_with(|| self.gloss_prefix.cmp(&other.gloss_prefix).reverse())
-            .then_with(|| {
-                self.gloss_word_prefix
-                    .cmp(&other.gloss_word_prefix)
-                    .reverse()
-            })
-            .then_with(|| self.exact_phrase.cmp(&other.exact_phrase).reverse())
-            .then_with(|| self.exact_token.cmp(&other.exact_token).reverse())
-            .then_with(|| self.prefix.cmp(&other.prefix).reverse())
-            .then_with(|| self.undersized.cmp(&other.undersized))
-            .then_with(|| other.pinyin_sequence.cmp(&self.pinyin_sequence))
-            .then_with(|| other.token_coverage.cmp(&self.token_coverage))
-            .then_with(|| self.span.cmp(&other.span))
-            .then_with(|| self.exact_simplified.cmp(&other.exact_simplified).reverse())
-            .then_with(|| {
-                self.exact_traditional
-                    .cmp(&other.exact_traditional)
-                    .reverse()
-            })
-            .then_with(|| self.tail.compare(&other.tail))
-    }
+/// How an entry matches Chinese characters.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ChineseKey {
+    /// The word starts with the query (or is it).
+    prefix: Reverse<bool>,
+    /// Inferred from the query's characters, not found as a word.
+    inferred: bool,
+    /// Has every character of the query: before the words inside it.
+    every_character: Reverse<bool>,
+    /// For a word inside the query (蚌埠 in 蚌埠住了): where it starts, then
+    /// the longer word first. `None`, for any other match, comes first.
+    inside_query: Option<(usize, Reverse<usize>)>,
+    exact_simplified: Reverse<bool>,
+    exact_traditional: Reverse<bool>,
+    tail: TailKey,
 }
 
 #[must_use]
@@ -113,42 +123,23 @@ impl DeterministicRanker {
             .unwrap_or(usize::MAX)
     }
 
-    fn english_key(&self, query: &str, cand: &Candidate) -> RankKey {
+    fn english_key(&self, query: &str, cand: &Candidate) -> EnglishKey {
         let gloss = cand.entry.glosses.join(" ").to_lowercase();
         let query = query.trim().to_lowercase();
+        let has_query = !query.is_empty();
         let terms = english_terms(&query);
         let gloss_tokens = tokens(&gloss);
-        // One gloss can hold several senses: `to visit; to call on`. A
-        // pointer to another entry (`see 大夫[dai4 fu5]`) is not one.
-        let senses: Vec<String> = cand
-            .entry
-            .glosses
-            .iter()
-            .flat_map(|g| g.split(';'))
-            .map(|g| sense_core(&g.to_lowercase()))
-            .filter(|sense| !sense.is_empty() && !is_cross_reference(sense))
-            .collect();
-        // A verb's sense is written `to travel`; it starts with `travel` too.
-        let readings = || {
-            senses
-                .iter()
-                .flat_map(|sense| [Some(sense.as_str()), sense.strip_prefix("to ")])
-                .flatten()
-        };
+        let senses = senses(cand);
 
-        let matched = terms
+        let words_matched = terms
             .iter()
             .filter(|term| gloss_tokens.iter().any(|g| g == *term))
             .count();
-        let prefixed = terms
+        let words_prefixed = terms
             .iter()
             .filter(|term| gloss_tokens.iter().any(|g| g.starts_with(term.as_str())))
             .count();
-        let coverage = if terms.is_empty() {
-            0
-        } else {
-            matched * 100 / terms.len()
-        };
+        let is_sense = senses.iter().any(|sense| is_exact_sense(sense, &query));
         // Senses come most important first: among words that all have the
         // query as a sense, the one whose first sense it is leads. A rare
         // word gives up places, so it does not lead a common word for
@@ -157,42 +148,24 @@ impl DeterministicRanker {
             .iter()
             .position(|sense| is_exact_sense(sense, &query))
             .unwrap_or(0);
-        let rarity = match (cand.entry.frequency_rank, cand.entry.hsk_rank) {
-            (Some(rank), _) if rank <= 10_000 => 0,
-            // Learners are taught it.
-            (_, Some(_)) => 1,
-            (Some(_), None) => 3,
-            // No frequency at all: rare in modern Chinese.
-            (None, None) => 5,
-        };
         // A word nobody uses does not lead for having the query as a sense:
         // 屯驻 is `to quarter` (troops), and 刻 is the quarter hour.
         let known = cand.entry.frequency_rank.is_some() || cand.entry.hsk_rank.is_some();
 
-        RankKey {
-            exact_single_gloss: known
-                && !query.is_empty()
-                && senses.iter().any(|sense| is_exact_sense(sense, &query)),
-            gloss_prefix: !query.is_empty() && readings().any(|r| r.starts_with(&query)),
-            gloss_word_prefix: !query.is_empty()
-                && readings().any(|r| {
-                    r == query
-                        || r.starts_with(&format!("{query} "))
-                        || r.starts_with(&format!("{query};"))
-                        || r.starts_with(&format!("{query}("))
-                }),
-            exact_phrase: !query.is_empty() && gloss.contains(&query),
+        EnglishKey {
+            known_sense: Reverse(known && is_sense),
+            sense_prefix: Reverse(has_query && readings(&senses).any(|r| r.starts_with(&query))),
+            sense_word_prefix: Reverse(
+                has_query && readings(&senses).any(|r| starts_as_word(r, &query)),
+            ),
+            phrase: Reverse(has_query && gloss.contains(&query)),
             // Every word of the query, then every word at least as a prefix
             // (`trav` in `travel`); a gloss sharing only some words ranks by
             // how many.
-            exact_token: !terms.is_empty() && matched == terms.len(),
-            prefix: !terms.is_empty() && prefixed == terms.len(),
-            undersized: false,
-            pinyin_sequence: 0,
-            token_coverage: coverage,
-            span: sense_position + rarity,
-            exact_simplified: false,
-            exact_traditional: false,
+            every_word: Reverse(!terms.is_empty() && words_matched == terms.len()),
+            every_word_prefix: Reverse(!terms.is_empty() && words_prefixed == terms.len()),
+            percent_words: Reverse(percent(words_matched, terms.len())),
+            standing: sense_position + rarity(cand),
             tail: self.tail(cand),
         }
     }
@@ -202,79 +175,107 @@ impl DeterministicRanker {
         query_variants: &[Vec<String>],
         min_span: usize,
         cand: &Candidate,
-    ) -> RankKey {
+    ) -> PinyinKey {
         let cand_norm = normalize(&cand.entry.pinyin);
         let cand_tokens = tokens(cand_norm.as_str());
         let exact = |variant: &Vec<String>| variant.join(" ") == cand_norm.as_str();
-        let sequence = query_variants
+        let aligned_run = query_variants
             .iter()
             .map(|query| longest_aligned_run(query, &cand_tokens))
             .max()
             .unwrap_or(0);
 
-        RankKey {
-            exact_single_gloss: false,
-            gloss_prefix: false,
-            gloss_word_prefix: false,
-            exact_phrase: false,
-            exact_token: query_variants.iter().any(exact),
-            prefix: false,
+        PinyinKey {
+            exact: Reverse(query_variants.iter().any(exact)),
             undersized: cand_tokens.len() < min_span,
-            pinyin_sequence: sequence,
-            token_coverage: best_syllable_coverage(query_variants, &cand_tokens),
-            span: cand_tokens.len(),
-            exact_simplified: false,
-            exact_traditional: false,
+            aligned_run: Reverse(aligned_run),
+            percent_syllables: Reverse(best_syllable_coverage(query_variants, &cand_tokens)),
+            syllables: cand_tokens.len(),
             tail: self.tail(cand),
         }
     }
 
-    fn chinese_key(&self, query: &str, cand: &Candidate) -> RankKey {
+    fn chinese_key(&self, query: &str, cand: &Candidate) -> ChineseKey {
         let query = query.trim();
+        let has_query = !query.is_empty();
+        let entry = &cand.entry;
         // Below every real match: entries with all of the query's characters,
-        // then the words found inside it in reading order, the longer word
-        // first where two start together.
-        let (coverage, span) = match cand.diagnostic.basis {
-            MatchBasis::CharacterFallback => (1, 0),
-            MatchBasis::ContainedWord => {
-                let entry = &cand.entry;
-                let at = query
-                    .find(entry.simplified.as_str())
-                    .or_else(|| query.find(entry.traditional.as_str()))
-                    .map_or(usize::MAX / 64, |byte| query[..byte].chars().count());
-                (
-                    0,
-                    at * 32 + 32_usize.saturating_sub(entry.simplified.chars().count()),
-                )
-            }
-            _ => (0, 0),
-        };
-        RankKey {
-            exact_single_gloss: false,
-            gloss_prefix: false,
-            gloss_word_prefix: false,
-            exact_phrase: false,
-            exact_token: false,
-            prefix: !query.is_empty() && cand.entry.simplified.starts_with(query),
-            undersized: cand.diagnostic.is_inferred,
-            pinyin_sequence: 0,
-            token_coverage: coverage,
-            span,
-            exact_simplified: !query.is_empty() && cand.entry.simplified == query,
-            exact_traditional: !query.is_empty() && cand.entry.traditional == query,
+        // then the words found inside it in reading order.
+        let inside_query = (cand.diagnostic.basis == MatchBasis::ContainedWord).then(|| {
+            let starts_at = query
+                .find(entry.simplified.as_str())
+                .or_else(|| query.find(entry.traditional.as_str()))
+                .map_or(usize::MAX, |byte| query[..byte].chars().count());
+            (starts_at, Reverse(entry.simplified.chars().count()))
+        });
+        ChineseKey {
+            prefix: Reverse(has_query && entry.simplified.starts_with(query)),
+            inferred: cand.diagnostic.is_inferred,
+            every_character: Reverse(cand.diagnostic.basis == MatchBasis::CharacterFallback),
+            inside_query,
+            exact_simplified: Reverse(has_query && entry.simplified == query),
+            exact_traditional: Reverse(has_query && entry.traditional == query),
             tail: self.tail(cand),
         }
     }
 }
 
+/// An entry's senses, lowercased. One gloss can hold several: `to visit;
+/// to call on`. A pointer to another entry (`see 大夫[dai4 fu5]`) is not one.
+fn senses(cand: &Candidate) -> Vec<String> {
+    cand.entry
+        .glosses
+        .iter()
+        .flat_map(|g| g.split(';'))
+        .map(|g| sense_core(&g.to_lowercase()))
+        .filter(|sense| !sense.is_empty() && !is_cross_reference(sense))
+        .collect()
+}
+
+/// Each sense as written, and a verb's sense without its `to `: `to travel`
+/// starts with `travel` too.
+fn readings(senses: &[String]) -> impl Iterator<Item = &str> {
+    senses
+        .iter()
+        .flat_map(|sense| [Some(sense.as_str()), sense.strip_prefix("to ")])
+        .flatten()
+}
+
+/// True when `reading` is `query` or starts with it as a whole word.
+fn starts_as_word(reading: &str, query: &str) -> bool {
+    reading
+        .strip_prefix(query)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ';', '(']))
+}
+
+/// Places a word gives up for being uncommon: none for an everyday word, a
+/// few for one only learners are taught, most for one in no list at all
+/// (rare in modern Chinese).
+fn rarity(cand: &Candidate) -> usize {
+    match (cand.entry.frequency_rank, cand.entry.hsk_rank) {
+        (Some(rank), _) if rank <= COMMON_WORD_RANK => 0,
+        (_, Some(_)) => 1,
+        (Some(_), None) => 3,
+        (None, None) => 5,
+    }
+}
+
+/// `part` as a percentage of `whole`; 0 when there is nothing to count.
+fn percent(part: usize, whole: usize) -> usize {
+    (part * 100).checked_div(whole).unwrap_or(0)
+}
+
 /// Sorts by `key`, computing it once per candidate. The sort is stable, so
 /// equal keys keep retrieval order.
-fn sort_by_key(candidates: Vec<Candidate>, key: impl Fn(&Candidate) -> RankKey) -> Vec<Candidate> {
-    let mut keyed: Vec<(RankKey, Candidate)> = candidates
+fn sort_by_key<K: Ord>(
+    candidates: Vec<Candidate>,
+    key: impl Fn(&Candidate) -> K,
+) -> Vec<Candidate> {
+    let mut keyed: Vec<(K, Candidate)> = candidates
         .into_iter()
         .map(|candidate| (key(&candidate), candidate))
         .collect();
-    keyed.sort_by(|(a, _), (b, _)| a.compare(b));
+    keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
     keyed.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
@@ -303,13 +304,6 @@ fn tokens(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// True when a lowercased gloss is the dictionary definition of `query`.
-///
-/// CC-CEDICT writes the lemma as `cat (CL:…)` or the verb as `to go`. Those
-/// are exact senses, not merely phrases that happen to start with the query
-/// (`go to hell`, `cat (Internet slang)`). Classifier notes are structural
-/// and stripped; other parentheticals are left in place so slang/literary
-/// marked usages stay below the unmarked lemma.
 /// True when any candidate gloss is an English lemma for `query`
 /// (`cat`, `cat (CL:…)`, `to go`), not merely a containing phrase.
 #[must_use]
@@ -327,6 +321,47 @@ pub fn english_has_lemma(query: &str, candidates: &[Candidate]) -> bool {
     })
 }
 
+/// True when `query` is the candidate's main sense: the first synonym of its
+/// first gloss (`school` for 学校, `to eat` in `to eat; to consume` for 吃),
+/// not a later one.
+#[must_use]
+pub fn english_is_main_sense(query: &str, candidate: &Candidate) -> bool {
+    main_sense(candidate)
+        .is_some_and(|sense| is_exact_definition(&sense, &query.trim().to_lowercase()))
+}
+
+/// [`english_is_main_sense`], ignoring every note in parentheses:
+/// `to accept (a suggestion, punishment, bribe etc)` is `to accept`.
+#[must_use]
+pub fn english_is_main_sense_ignoring_notes(query: &str, candidate: &Candidate) -> bool {
+    main_sense(candidate).is_some_and(|sense| {
+        let mut plain = String::with_capacity(sense.len());
+        let mut depth = 0usize;
+        for c in sense.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => plain.push(c),
+                _ => {}
+            }
+        }
+        is_exact_definition(&plain, &query.trim().to_lowercase())
+    })
+}
+
+/// The first synonym of the first gloss, lowercased.
+fn main_sense(candidate: &Candidate) -> Option<String> {
+    let gloss = candidate.entry.glosses.first()?.to_lowercase();
+    Some(gloss.split("; ").next().unwrap_or_default().to_owned())
+}
+
+/// True when a lowercased gloss is the dictionary definition of `query`.
+///
+/// CC-CEDICT writes the lemma as `cat (CL:…)` or the verb as `to go`. Those
+/// are exact senses, not merely phrases that happen to start with the query
+/// (`go to hell`, `cat (Internet slang)`). Classifier notes are structural
+/// and stripped; other parentheticals are left in place so slang/literary
+/// marked usages stay below the unmarked lemma.
 fn is_exact_definition(gloss_lower: &str, query_lower: &str) -> bool {
     is_exact_sense(&sense_core(gloss_lower), query_lower)
 }
@@ -393,7 +428,7 @@ fn best_syllable_coverage(query_variants: &[Vec<String>], cand_tokens: &[String]
             .iter()
             .filter(|t| cand_tokens.iter().any(|c| syllable_equates(t, c)))
             .count();
-        best = best.max(matched * 100 / unique.len());
+        best = best.max(percent(matched, unique.len()));
     }
     best
 }
@@ -487,6 +522,36 @@ mod tests {
 
     fn ranker() -> DeterministicRanker {
         DeterministicRanker::default()
+    }
+
+    #[test]
+    fn the_main_sense_is_the_first_synonym_of_the_first_gloss() {
+        let eat = cand(
+            1,
+            "吃",
+            "吃",
+            "chi1",
+            &["to eat; to consume", "to absorb"],
+            None,
+            "t",
+        );
+        assert!(english_is_main_sense("eat", &eat));
+        assert!(english_is_main_sense("to eat", &eat));
+        assert!(!english_is_main_sense("consume", &eat), "a later synonym");
+        assert!(!english_is_main_sense("absorb", &eat), "a later gloss");
+        let accept = cand(
+            2,
+            "接受",
+            "接受",
+            "jie1 shou4",
+            &["to accept (a suggestion, punishment, bribe etc); to acquiesce"],
+            None,
+            "t",
+        );
+        assert!(!english_is_main_sense("accept", &accept));
+        assert!(english_is_main_sense_ignoring_notes("accept", &accept));
+        let nothing = cand(3, "x", "x", "x1", &[], None, "t");
+        assert!(!english_is_main_sense_ignoring_notes("x", &nothing));
     }
 
     #[test]

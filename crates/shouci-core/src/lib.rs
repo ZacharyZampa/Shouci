@@ -16,6 +16,7 @@ mod dictionaries;
 pub mod dto;
 mod library;
 mod search;
+pub mod text;
 mod transfer;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -41,15 +42,10 @@ pub use vocab_core::{
 };
 pub use vocab_exchange::{
     ExportPlan, ExportRequest, ExportScope, FieldChange, FieldConflict, ImportAction, ImportCounts,
-    ImportPlan, ImportPolicy, Incoming, NameChange, PlannedLine, SkipReason, TransferSummary,
+    ImportField, ImportPlan, ImportPolicy, Incoming, NameChange, PlannedLine, SkipReason,
+    TransferSummary,
 };
 pub use vocab_search::QueryKind;
-
-/// Text helpers for frontends that format raw fields themselves.
-pub mod text {
-    pub use vocab_dictionary::display_definition;
-    pub use vocab_pinyin::tone_marks;
-}
 
 use connectors::Registry;
 use dictionaries::{DictState, LoadControl};
@@ -61,7 +57,7 @@ pub const MAX_QUERY_CHARS: usize = 100;
 pub struct Shouci {
     config: Config,
     /// Every write goes through this connection.
-    user: Mutex<Connection>,
+    writer: Mutex<Connection>,
     /// Reads (search, listings, previews) use their own connection, so a long
     /// import never blocks them, and so `data_version` sees this process's
     /// own writes.
@@ -100,7 +96,7 @@ impl Shouci {
         }
         Ok(Self {
             config,
-            user: Mutex::new(conn),
+            writer: Mutex::new(conn),
             reader: Mutex::new(reader),
             dictionaries: RwLock::new(DictState::NotLoaded),
             load: LoadControl::default(),
@@ -129,7 +125,7 @@ impl Shouci {
     ///
     /// Storage errors.
     pub fn data_version(&self) -> Result<i64> {
-        vocab_db::data_version(&*self.read()?)
+        vocab_db::data_version(&*self.reader()?)
     }
 
     /// Brings words, tags, and transfer history over from a
@@ -140,19 +136,19 @@ impl Shouci {
     ///
     /// When the file is missing or not a POC database, or writing fails.
     pub fn import_poc(&self, legacy_db: &Path) -> Result<LegacyImport> {
-        let mut conn = self.db()?;
+        let mut conn = self.writer()?;
         Ok(vocab_db::import_poc_database(&mut conn, &expand_tilde(legacy_db)?)?.into())
     }
 
     /// The connection for writes.
-    pub(crate) fn db(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.user
+    pub(crate) fn writer(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.writer
             .lock()
             .map_err(|_| Error::new("the library is unavailable after an earlier failure"))
     }
 
     /// The connection for reads.
-    pub(crate) fn read(&self) -> Result<MutexGuard<'_, Connection>> {
+    pub(crate) fn reader(&self) -> Result<MutexGuard<'_, Connection>> {
         self.reader
             .lock()
             .map_err(|_| Error::new("the library is unavailable after an earlier failure"))

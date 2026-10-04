@@ -141,19 +141,23 @@ do_install() {
     "${DICTIONARIES}/cc-cedict.db")
 
   echo "==> building Shouci (Apple silicon and Intel; the first build takes a few minutes)"
-  local stage
-  stage="$(mktemp -d)"
-  trap 'rm -rf "${stage}"' RETURN
-  "${ROOT}/macos/scripts/package.sh" "${stage}/Shouci.app"
+  # Global, and removed on EXIT: a RETURN trap never runs when `set -e`
+  # stops the script mid-function.
+  STAGE="$(mktemp -d)"
+  trap 'rm -rf "${STAGE}"' EXIT
+  "${ROOT}/macos/scripts/package.sh" "${STAGE}/Shouci.app"
 
   echo "==> building shouci and shouci-tui"
   (cd "${ROOT}" && cargo build -q --release -p shouci-cli -p shouci-tui)
 
   quit_shouci
   echo "==> installing to ${MACAPP}"
+  # Copied beside the installed app first, so a failed copy leaves it alone.
   mkdir -p "$(dirname "${MACAPP}")"
+  rm -rf "${MACAPP}.new"
+  ditto "${STAGE}/Shouci.app" "${MACAPP}.new"
   rm -rf "${MACAPP}"
-  ditto "${stage}/Shouci.app" "${MACAPP}"
+  mv "${MACAPP}.new" "${MACAPP}"
   install_tools
   remove_legacy_agent
 

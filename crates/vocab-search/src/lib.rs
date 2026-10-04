@@ -13,9 +13,12 @@ mod ranker;
 
 pub use library::{LibraryDoc, LibraryHit, match_library};
 pub use probes::{SearchProbe, load_search_probes};
-pub use query::{QueryKind, detect, looks_like_pinyin};
+pub use query::{QueryKind, detect, has_han, looks_like_pinyin};
 use ranker::Ranker;
-pub use ranker::{DeterministicRanker, english_has_lemma};
+pub use ranker::{
+    DeterministicRanker, english_has_lemma, english_is_main_sense,
+    english_is_main_sense_ignoring_notes,
+};
 
 use vocab_core::Result;
 use vocab_dictionary::{Candidate, DictionaryProvider};

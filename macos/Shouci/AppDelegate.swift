@@ -20,7 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let application = NSApplication.shared
         let delegate = AppDelegate()
         application.delegate = delegate
-        application.run()
+        // `delegate` is weak, and optimized builds may release a local after
+        // its last use: keep it alive for as long as the app runs.
+        withExtendedLifetime(delegate) { application.run() }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -47,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             app.post("The shortcut \(preferences.hotKey.display) isn’t working: \(problem) Choose another in Settings.")
         }
         app.start()
+        LaunchAtLogin.refresh()
     }
 
     /// Opening Shouci again (from Finder, Spotlight, or the Dock) opens the

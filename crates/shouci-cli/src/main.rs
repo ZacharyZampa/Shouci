@@ -10,7 +10,7 @@ mod words;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
@@ -595,13 +595,15 @@ fn open_maybe_searchable() -> Result<Shouci> {
 
 /// Loads the dictionaries, saying what a long load is doing.
 fn load(shouci: &Shouci) -> Result<()> {
-    let done = AtomicBool::new(false);
+    // Dropping `done` wakes the reporter at once, so a quick load is not
+    // held up by its polling interval.
+    let (done, finished) = mpsc::channel::<()>();
     std::thread::scope(|scope| {
         if std::io::stderr().is_terminal() {
-            scope.spawn(|| report_progress(shouci, &done));
+            scope.spawn(move || report_progress(shouci, &finished));
         }
         let loaded = shouci.load_dictionaries();
-        done.store(true, Ordering::SeqCst);
+        drop(done);
         loaded
     })?;
     if let DictionaryStatus::Ready { notes, .. } = shouci.dictionary_status() {
@@ -612,9 +614,9 @@ fn load(shouci: &Shouci) -> Result<()> {
     Ok(())
 }
 
-fn report_progress(shouci: &Shouci, done: &AtomicBool) {
+fn report_progress(shouci: &Shouci, finished: &mpsc::Receiver<()>) {
     let mut last = None;
-    while !done.load(Ordering::SeqCst) {
+    loop {
         let now = match shouci.dictionary_status() {
             DictionaryStatus::Loading { stage, dictionary } => {
                 progress(stage, dictionary.as_deref())
@@ -629,7 +631,10 @@ fn report_progress(shouci: &Shouci, done: &AtomicBool) {
             note(now.as_deref().unwrap_or_default());
             last = now;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        if finished.recv_timeout(Duration::from_millis(200)) != Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            return;
+        }
     }
 }
 
@@ -645,14 +650,6 @@ fn progress(stage: LoadingStage, dictionary: Option<&str>) -> Option<String> {
         )),
         LoadingStage::Building => Some(format!("building {name}…")),
     }
-}
-
-fn format_name(shouci: &Shouci, connector: &str) -> String {
-    shouci
-        .connectors()
-        .into_iter()
-        .find(|view| view.id == connector)
-        .map_or_else(|| connector.to_owned(), |view| view.name)
 }
 
 /// `学校`, `学校 and 猫`, `学校, 猫, and 米饭`.
@@ -675,7 +672,7 @@ fn search(args: &SearchArgs, out: Out) -> Result<ExitCode> {
     out.show(&found, || {
         let mut lines = text::numbered(&found.candidates);
         let strong = found.candidates.iter().any(|candidate| !candidate.inferred);
-        if !strong && found.kind == QueryKind::Chinese && text::has_han(&found.query) {
+        if !strong && found.kind == QueryKind::Chinese && shouci_core::text::has_han(&found.query) {
             lines.insert(
                 0,
                 format!(
@@ -703,31 +700,30 @@ fn add(args: AddArgs, out: Out) -> Result<ExitCode> {
     } else {
         args.word.join(" ")
     };
-    let result = if args.by_hand() {
+    let result: QuickAdd = if args.by_hand() {
         let shouci = open_maybe_searchable()?;
-        QuickAdd::Saved(Box::new(shouci.add_manual(&ManualWord {
-            simplified: word.clone(),
-            traditional: args.traditional,
-            pinyin: args.pinyin,
-            definition: args.definition,
-            notes: args.notes,
-            tags: args.tags,
-            collections: args.collections,
-        })?))
+        shouci
+            .add_manual(&ManualWord {
+                simplified: word.clone(),
+                traditional: args.traditional,
+                pinyin: args.pinyin,
+                definition: args.definition,
+                notes: args.notes,
+                tags: args.tags,
+                collections: args.collections,
+            })?
+            .into()
     } else {
         let shouci = open_searchable()?;
         let kind = args.kind.map(Into::into);
-        let found = match args.pick {
-            Some(n) => QuickAdd::Saved(Box::new(pick(&shouci, &word, kind, n)?)),
+        let mut found = match args.pick {
+            Some(n) => pick(&shouci, &word, kind, n)?.into(),
             None => shouci.quick_add(&word, kind)?,
         };
-        match found {
-            QuickAdd::Saved(mut saved) => {
-                organize(&shouci, &mut saved, &args.tags, &args.collections)?;
-                QuickAdd::Saved(saved)
-            }
-            ambiguous @ QuickAdd::Ambiguous { .. } => ambiguous,
+        if let QuickAdd::Saved(saved) = &mut found {
+            organize(&shouci, saved, &args.tags, &args.collections)?;
         }
+        found
     };
     out.show(&result, || add_text(&result, &word))?;
     Ok(match result {
@@ -759,14 +755,13 @@ fn organize(
     if tags.is_empty() && collections.is_empty() {
         return Ok(());
     }
-    let ids = [saved.item.id];
+    let mut actions = Vec::with_capacity(collections.len() + 1);
     if !tags.is_empty() {
-        shouci.bulk(&ids, &BulkAction::AddTags(tags.to_vec()))?;
+        actions.push(BulkAction::AddTags(tags.to_vec()));
     }
-    for collection in collections {
-        shouci.bulk(&ids, &BulkAction::AddToCollection(collection.clone()))?;
-    }
-    saved.item = shouci.item(saved.item.id)?;
+    actions.extend(collections.iter().cloned().map(BulkAction::AddToCollection));
+    // All of them or none: a refused name leaves no partial set behind.
+    saved.item = shouci.edit_item(saved.item.id, &ItemPatch::default(), &actions)?;
     Ok(())
 }
 
@@ -1061,7 +1056,7 @@ fn import(args: &ImportArgs, out: Out) -> Result<ExitCode> {
         Some(format) => shouci.preview_import(&args.file, format, policy, args.force)?,
         None => shouci.detect_import(&args.file, policy, args.force)?.plan,
     };
-    let format = format_name(&shouci, &plan.connector_id);
+    let format = shouci.connector_name(&plan.connector_id);
     if args.dry_run {
         return out.show(&plan, || text::import_preview(&plan, &format));
     }
@@ -1104,7 +1099,7 @@ fn export(args: ExportArgs, out: Out) -> Result<ExitCode> {
         deck: args.deck,
     };
     let plan = shouci.preview_export(&args.file, &args.to, &request)?;
-    let format = format_name(&shouci, &plan.connector_id);
+    let format = shouci.connector_name(&plan.connector_id);
     if args.dry_run {
         return out.show(&plan, || text::export_preview(&plan, &format));
     }

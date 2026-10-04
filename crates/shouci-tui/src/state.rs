@@ -85,7 +85,7 @@ impl Row {
 pub(crate) fn rows(found: &DictionaryResults) -> Vec<Row> {
     let strong = found.candidates.iter().any(|candidate| !candidate.inferred);
     let mut rows = Vec::with_capacity(found.candidates.len() + 1);
-    if !strong && found.kind == QueryKind::Chinese && has_han(&found.query) {
+    if !strong && found.kind == QueryKind::Chinese && shouci_core::text::has_han(&found.query) {
         rows.push(Row::AsTyped(found.query.clone()));
     }
     rows.extend(
@@ -95,19 +95,6 @@ pub(crate) fn rows(found: &DictionaryResults) -> Vec<Row> {
             .map(|candidate| Row::Candidate(Box::new(candidate.clone()))),
     );
     rows
-}
-
-/// Whether `text` has a Chinese character: only then can it be kept as a
-/// word to fill in later. (Read as Hanzi, `mao` matches nothing, but it is
-/// no word either.)
-pub(crate) fn has_han(text: &str) -> bool {
-    text.chars().any(|c| {
-        matches!(c,
-            '\u{3400}'..='\u{4dbf}'
-            | '\u{4e00}'..='\u{9fff}'
-            | '\u{f900}'..='\u{faff}'
-            | '\u{20000}'..='\u{3134f}')
-    })
 }
 
 /// How a query kind is named on screen.
@@ -126,15 +113,6 @@ pub(crate) fn next_kind(kind: Option<QueryKind>) -> Option<QueryKind> {
         Some(QueryKind::Chinese) => Some(QueryKind::Pinyin),
         Some(QueryKind::Pinyin) => Some(QueryKind::English),
         Some(QueryKind::English) => None,
-    }
-}
-
-/// `1 item`, `3 items`: the count with its noun, singular when it is one.
-#[must_use]
-pub(crate) fn counted(count: impl Into<u64>, singular: &str, plural: &str) -> String {
-    match count.into() {
-        1 => format!("1 {singular}"),
-        count => format!("{count} {plural}"),
     }
 }
 
@@ -252,15 +230,6 @@ mod tests {
         // CJK is double-width: 6 chars = 12 cells = 2 rows at width 10.
         assert_eq!(wrap_row_count("学校学校学校", 10), 2);
         assert_eq!(wrap_row_count("", 10), 1);
-    }
-
-    #[test]
-    fn only_chinese_characters_are_kept_as_typed() {
-        assert!(has_han("蚌埠住了"));
-        assert!(has_han("卡拉OK"));
-        assert!(has_han("𠮷"));
-        assert!(!has_han("mao"));
-        assert!(!has_han("ニャー"));
     }
 
     #[test]

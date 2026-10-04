@@ -67,9 +67,28 @@ pub struct Incoming {
     pub collections: Vec<String>,
 }
 
+/// A text field an import can change on a saved word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportField {
+    Definition,
+    Notes,
+}
+
+impl ImportField {
+    /// The field's name for people: `definition`, `notes`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Definition => "definition",
+            Self::Notes => "notes",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldChange {
-    pub field: String,
+    pub field: ImportField,
     pub from: String,
     pub to: String,
 }
@@ -77,7 +96,7 @@ pub struct FieldChange {
 /// Both sides have a value and they differ; the saved one is kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldConflict {
-    pub field: String,
+    pub field: ImportField,
     pub kept: String,
     pub incoming: String,
 }
@@ -204,6 +223,21 @@ impl ImportPlan {
     }
 }
 
+/// Where one line of the file ended up while reading it.
+enum LineOutcome {
+    /// The first line of a word: an index into the words to plan.
+    Word(usize),
+    /// Decided already: a line that could not be read as a word, or a repeat
+    /// folded into an earlier line.
+    Decided(ImportAction),
+}
+
+struct InputLine {
+    line: u32,
+    raw: String,
+    outcome: LineOutcome,
+}
+
 /// One word from the file, after resolution and folding repeated lines.
 struct Word {
     line: u32,
@@ -253,75 +287,19 @@ pub fn plan_import(
         );
     }
 
-    // Resolve every record, folding repeats into the first line of the word.
-    let mut words: Vec<Word> = Vec::new();
-    let mut first: HashMap<(String, String, String), usize> = HashMap::new();
-    // (line, raw, what happened) in file order; `Ok(index)` points into `words`.
-    let mut order: Vec<(u32, String, std::result::Result<usize, ImportAction>)> = Vec::new();
-    for record in &parsed.records {
-        let hits = match dict {
-            Some(dict) => dict.entries_by_headword(record.headword.trim())?,
-            None => Vec::new(),
-        };
-        let resolved = match resolve(record, &hits) {
-            Ok(resolved) => resolved,
-            Err(reason) => {
-                order.push((
-                    record.line,
-                    record.raw.clone(),
-                    Err(ImportAction::Drop { reason }),
-                ));
-                continue;
-            }
-        };
-        let tags = names(record, &record.tags, "tag", &mut issues);
-        let collections = names(record, &record.collections, "collection", &mut issues);
-        let key = (
-            resolved.simplified.to_lowercase(),
-            resolved.traditional.to_lowercase(),
-            reading_key(&resolved.pinyin),
-        );
-        if let Some(&index) = first.get(&key) {
-            fold(&mut words[index], record, tags, collections, &mut issues);
-            order.push((
-                record.line,
-                record.raw.clone(),
-                Err(ImportAction::Skip {
-                    item_id: None,
-                    simplified: resolved.simplified,
-                    expected_rev: None,
-                    reason: SkipReason::RepeatedInFile,
-                    conflicts: Vec::new(),
-                }),
-            ));
-            continue;
-        }
-        first.insert(key, words.len());
-        order.push((record.line, record.raw.clone(), Ok(words.len())));
-        words.push(Word {
-            line: record.line,
-            definition: record.definition.text().map(str::to_owned),
-            notes: record.notes.text().map(str::to_owned),
-            resolved,
-            tags,
-            collections,
-        });
-    }
-
-    let mut planned: Vec<Option<ImportAction>> = Vec::with_capacity(words.len());
-    for word in &words {
-        planned.push(Some(plan_word(conn, word, policy)?));
-    }
-    let lines = order
+    let (words, input) = read_words(&parsed.records, dict, &mut issues)?;
+    let actions = words
+        .iter()
+        .map(|word| plan_word(conn, word, policy))
+        .collect::<Result<Vec<_>>>()?;
+    let lines = input
         .into_iter()
-        .map(|(line, raw, action)| PlannedLine {
-            line,
-            raw,
-            action: match action {
-                Ok(index) => planned[index].take().unwrap_or(ImportAction::Drop {
-                    reason: "planned twice".to_owned(),
-                }),
-                Err(action) => action,
+        .map(|input| PlannedLine {
+            line: input.line,
+            raw: input.raw,
+            action: match input.outcome {
+                LineOutcome::Word(index) => actions[index].clone(),
+                LineOutcome::Decided(action) => action,
             },
         })
         .collect();
@@ -337,6 +315,63 @@ pub fn plan_import(
         lines,
         notes,
     })
+}
+
+/// Resolves every record, folding a repeated word into its first line.
+/// Returns the words to plan, and every line in file order.
+fn read_words(
+    records: &[ExchangeRecord],
+    dict: Option<&dyn DictionaryProvider>,
+    issues: &mut Vec<Issue>,
+) -> Result<(Vec<Word>, Vec<InputLine>)> {
+    let mut words: Vec<Word> = Vec::new();
+    let mut first: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut input = Vec::with_capacity(records.len());
+    for record in records {
+        let hits = match dict {
+            Some(dict) => dict.entries_by_headword(record.headword.trim())?,
+            None => Vec::new(),
+        };
+        let outcome = match resolve(record, &hits) {
+            Err(reason) => LineOutcome::Decided(ImportAction::Drop { reason }),
+            Ok(resolved) => {
+                let tags = names(record, &record.tags, "tag", issues);
+                let collections = names(record, &record.collections, "collection", issues);
+                let key = (
+                    resolved.simplified.to_lowercase(),
+                    resolved.traditional.to_lowercase(),
+                    reading_key(&resolved.pinyin),
+                );
+                if let Some(&index) = first.get(&key) {
+                    fold(&mut words[index], record, tags, collections, issues);
+                    LineOutcome::Decided(ImportAction::Skip {
+                        item_id: None,
+                        simplified: resolved.simplified,
+                        expected_rev: None,
+                        reason: SkipReason::RepeatedInFile,
+                        conflicts: Vec::new(),
+                    })
+                } else {
+                    first.insert(key, words.len());
+                    words.push(Word {
+                        line: record.line,
+                        definition: record.definition.text().map(str::to_owned),
+                        notes: record.notes.text().map(str::to_owned),
+                        resolved,
+                        tags,
+                        collections,
+                    });
+                    LineOutcome::Word(words.len() - 1)
+                }
+            }
+        };
+        input.push(InputLine {
+            line: record.line,
+            raw: record.raw.clone(),
+            outcome,
+        });
+    }
+    Ok((words, input))
 }
 
 /// Valid, de-duplicated names from a record; invalid ones become warnings.
@@ -450,14 +485,18 @@ fn plan_word(conn: &Connection, word: &Word, policy: ImportPolicy) -> Result<Imp
 fn provided<'a>(
     existing: &'a VocabItem,
     word: &'a Word,
-) -> [(&'static str, &'a str, Option<&'a str>); 2] {
+) -> [(ImportField, &'a str, Option<&'a str>); 2] {
     [
         (
-            "definition",
+            ImportField::Definition,
             existing.definition.as_str(),
             word.definition.as_deref(),
         ),
-        ("notes", existing.notes.as_str(), word.notes.as_deref()),
+        (
+            ImportField::Notes,
+            existing.notes.as_str(),
+            word.notes.as_deref(),
+        ),
     ]
 }
 
@@ -473,7 +512,7 @@ fn plan_existing(
         .filter_map(|(field, kept, incoming)| {
             let incoming = incoming?;
             (!kept.is_empty() && !same_text(kept, incoming)).then(|| FieldConflict {
-                field: field.to_owned(),
+                field,
                 kept: kept.to_owned(),
                 incoming: incoming.to_owned(),
             })
@@ -503,7 +542,7 @@ fn plan_existing(
                 ImportPolicy::Merge | ImportPolicy::Skip => from.is_empty(),
             };
             wanted.then(|| FieldChange {
-                field: field.to_owned(),
+                field,
                 from: from.to_owned(),
                 to: to.to_owned(),
             })
@@ -695,6 +734,7 @@ fn check_fresh(conn: &Connection, plan: &ImportPlan) -> Result<()> {
     Ok(())
 }
 
+/// Applies one planned line and records it in the run's ledger.
 fn apply_line(
     conn: &Connection,
     run_id: i64,
@@ -703,28 +743,12 @@ fn apply_line(
 ) -> Result<()> {
     let at = Some(line.line);
     let raw = Some(line.raw.as_str());
-    match &line.action {
-        ImportAction::Insert { word } => {
-            let id = insert_item(
-                conn,
-                &NewItem {
-                    simplified: word.simplified.clone(),
-                    traditional: word.traditional.clone(),
-                    pinyin: word.pinyin.clone(),
-                    definition: word.definition.clone(),
-                    notes: word.notes.clone(),
-                    verification: word.verification,
-                    source: source.clone(),
-                },
-            )?;
-            for tag in &word.tags {
-                add_tag(conn, id, tag)?;
-            }
-            for collection in &word.collections {
-                add_to_collection(conn, id, collection)?;
-            }
-            record_item(conn, run_id, Some(id), at, raw, Outcome::Inserted, "")
-        }
+    let (item_id, outcome, detail) = match &line.action {
+        ImportAction::Insert { word } => (
+            Some(apply_insert(conn, word, source)?),
+            Outcome::Inserted,
+            String::new(),
+        ),
         ImportAction::Update {
             item_id,
             changes,
@@ -733,33 +757,11 @@ fn apply_line(
             restore,
             ..
         } => {
-            let mut patch = ItemPatch::default();
-            for change in changes {
-                match change.field.as_str() {
-                    "definition" => patch.definition = Some(change.to.clone()),
-                    "notes" => patch.notes = Some(change.to.clone()),
-                    _ => {}
-                }
-            }
-            update_item(conn, *item_id, &patch)?;
-            if *restore {
-                set_trashed(conn, *item_id, false)?;
-            }
-            for tag in &tags.add {
-                add_tag(conn, *item_id, tag)?;
-            }
-            for collection in &collections.add {
-                add_to_collection(conn, *item_id, collection)?;
-            }
-            let detail = update_detail(changes, tags, collections, *restore);
-            record_item(
-                conn,
-                run_id,
+            apply_update(conn, *item_id, changes, tags, collections, *restore)?;
+            (
                 Some(*item_id),
-                at,
-                raw,
                 Outcome::Updated,
-                &detail,
+                update_detail(changes, tags, collections, *restore),
             )
         }
         ImportAction::Skip {
@@ -767,31 +769,75 @@ fn apply_line(
             reason,
             conflicts,
             ..
-        } => {
-            let mut detail = vec![
-                match reason {
-                    SkipReason::AlreadySaved => "already saved",
-                    SkipReason::InTrash => "in the trash",
-                    SkipReason::Unchanged => "unchanged",
-                    SkipReason::RepeatedInFile => "repeats an earlier line",
-                }
-                .to_owned(),
-            ];
-            detail.extend(conflicts.iter().map(|c| format!("{} kept", c.field)));
-            record_item(
-                conn,
-                run_id,
-                *item_id,
-                at,
-                raw,
-                Outcome::Skipped,
-                &detail.join("; "),
-            )
-        }
-        ImportAction::Drop { reason } => {
-            record_item(conn, run_id, None, at, raw, Outcome::Dropped, reason)
+        } => (*item_id, Outcome::Skipped, skip_detail(*reason, conflicts)),
+        ImportAction::Drop { reason } => (None, Outcome::Dropped, reason.clone()),
+    };
+    record_item(conn, run_id, item_id, at, raw, outcome, &detail)
+}
+
+fn apply_insert(conn: &Connection, word: &Incoming, source: &ItemSource) -> Result<i64> {
+    let id = insert_item(
+        conn,
+        &NewItem {
+            simplified: word.simplified.clone(),
+            traditional: word.traditional.clone(),
+            pinyin: word.pinyin.clone(),
+            definition: word.definition.clone(),
+            notes: word.notes.clone(),
+            verification: word.verification,
+            source: source.clone(),
+        },
+    )?;
+    for tag in &word.tags {
+        add_tag(conn, id, tag)?;
+    }
+    for collection in &word.collections {
+        add_to_collection(conn, id, collection)?;
+    }
+    Ok(id)
+}
+
+fn apply_update(
+    conn: &Connection,
+    item_id: i64,
+    changes: &[FieldChange],
+    tags: &NameChange,
+    collections: &NameChange,
+    restore: bool,
+) -> Result<()> {
+    let mut patch = ItemPatch::default();
+    for change in changes {
+        let to = Some(change.to.clone());
+        match change.field {
+            ImportField::Definition => patch.definition = to,
+            ImportField::Notes => patch.notes = to,
         }
     }
+    update_item(conn, item_id, &patch)?;
+    if restore {
+        set_trashed(conn, item_id, false)?;
+    }
+    for tag in &tags.add {
+        add_tag(conn, item_id, tag)?;
+    }
+    for collection in &collections.add {
+        add_to_collection(conn, item_id, collection)?;
+    }
+    Ok(())
+}
+
+fn skip_detail(reason: SkipReason, conflicts: &[FieldConflict]) -> String {
+    let mut detail = vec![
+        match reason {
+            SkipReason::AlreadySaved => "already saved",
+            SkipReason::InTrash => "in the trash",
+            SkipReason::Unchanged => "unchanged",
+            SkipReason::RepeatedInFile => "repeats an earlier line",
+        }
+        .to_owned(),
+    ];
+    detail.extend(conflicts.iter().map(|c| format!("{} kept", c.field.name())));
+    detail.join("; ")
 }
 
 fn update_detail(
@@ -800,7 +846,7 @@ fn update_detail(
     collections: &NameChange,
     restore: bool,
 ) -> String {
-    let mut parts: Vec<String> = changes.iter().map(|c| c.field.clone()).collect();
+    let mut parts: Vec<String> = changes.iter().map(|c| c.field.name().to_owned()).collect();
     parts.extend(tags.add.iter().map(|t| format!("+tag {t}")));
     parts.extend(collections.add.iter().map(|c| format!("+collection {c}")));
     if restore {

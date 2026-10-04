@@ -6,10 +6,11 @@
 use shouci_core::{
     BulkAction, BulkResult, CandidateView, ConnectorView, DictionaryEntryView, DictionaryResults,
     DictionaryStatus, DictionaryView, ErrorKind, ExportRequest, ExportScope, FieldChange,
-    FieldConflict, GroupView, ImportAction, ImportCounts, ImportPolicy, Incoming, ItemPatch,
-    ItemView, LegacyImport, LibraryFilter, LibraryResults, LibraryView, Lifecycle, LoadingStage,
-    ManualWord, MatchBasis, NameChange, PlannedLine, QueryKind, SaveOutcome, SaveResult, SavedRef,
-    Severity, SkipReason, SourceKind, SourceView, TransferSummary, Verification,
+    FieldConflict, GroupView, ImportAction, ImportCounts, ImportField, ImportPolicy, Incoming,
+    ItemPatch, ItemView, LegacyImport, LibraryFilter, LibraryResults, LibraryView, Lifecycle,
+    LoadingStage, ManualWord, MatchBasis, NameChange, PlannedLine, QueryKind, SaveOutcome,
+    SaveResult, SavedRef, Severity, SkipReason, SourceKind, SourceView, TransferSummary,
+    Verification,
 };
 
 #[uniffi::remote(Enum)]
@@ -316,16 +317,22 @@ pub struct Incoming {
     pub collections: Vec<String>,
 }
 
+#[uniffi::remote(Enum)]
+pub enum ImportField {
+    Definition,
+    Notes,
+}
+
 #[uniffi::remote(Record)]
 pub struct FieldChange {
-    pub field: String,
+    pub field: ImportField,
     pub from: String,
     pub to: String,
 }
 
 #[uniffi::remote(Record)]
 pub struct FieldConflict {
-    pub field: String,
+    pub field: ImportField,
     pub kept: String,
     pub incoming: String,
 }

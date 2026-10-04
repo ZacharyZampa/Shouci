@@ -11,9 +11,14 @@ final class ImportModel {
     let library: LibraryModel
 
     private(set) var file: URL?
-    /// The format reading the file.
+    /// The format reading the file. Choosing another previews again.
     var connector: String? {
-        didSet { if connector != oldValue { refresh() } }
+        get { readAs }
+        set {
+            guard newValue != readAs else { return }
+            readAs = newValue
+            refresh()
+        }
     }
     /// True when no other format reads the file as well.
     private(set) var detected = false
@@ -21,8 +26,13 @@ final class ImportModel {
         didSet { if policy != oldValue { refresh() } }
     }
     /// Import the readable lines of a file with error lines.
-    var skipErrors = false {
-        didSet { if skipErrors != oldValue { refresh() } }
+    var skipErrors: Bool {
+        get { forced }
+        set {
+            guard newValue != forced else { return }
+            forced = newValue
+            refresh()
+        }
     }
     private(set) var preview: ImportPreview?
     private(set) var plan: ImportPlanView?
@@ -30,8 +40,14 @@ final class ImportModel {
     private(set) var isWorking = false
     private(set) var summary: TransferSummary?
 
+    // What `connector` and `skipErrors` show. Detecting the format sets
+    // these directly, so it doesn't start a second preview.
+    private var readAs: String?
+    private var forced = false
+
     @ObservationIgnored private var previewing: Task<Void, Never>?
-    @ObservationIgnored private var adopting = false
+    /// Counts previews, so only the newest one clears `isWorking`.
+    @ObservationIgnored private var generation = 0
 
     init(library: LibraryModel) {
         self.library = library
@@ -61,7 +77,9 @@ final class ImportModel {
     /// Words that change: added or updated.
     var changing: Int { Int((plan?.counts.inserts ?? 0) + (plan?.counts.updates ?? 0)) }
     var errorLines: [IssueView] { plan?.issues.filter { $0.severity == .error } ?? [] }
-    var canImport: Bool { plan != nil && plan?.refused == false && changing > 0 && !isWorking }
+    var canImport: Bool {
+        plan != nil && plan?.refused == false && changing > 0 && !isWorking && summary == nil
+    }
 
     // MARK: Steps
 
@@ -83,9 +101,7 @@ final class ImportModel {
         preview = nil
         summary = nil
         problem = nil
-        adopting = true
-        skipErrors = false
-        adopting = false
+        forced = false
         detect()
     }
 
@@ -96,8 +112,10 @@ final class ImportModel {
         let policy = self.policy
         previewing?.cancel()
         isWorking = true
+        generation += 1
+        let mine = generation
         previewing = Task {
-            defer { isWorking = false }
+            defer { if generation == mine { isWorking = false } }
             do {
                 let found = try await library.app.call {
                     try $0.detectImport(path: path, policy: policy, force: false)
@@ -105,9 +123,7 @@ final class ImportModel {
                 guard !Task.isCancelled else { return }
                 let plan = found.preview.view()
                 detected = found.unambiguous
-                adopting = true
-                connector = plan.connectorId
-                adopting = false
+                readAs = plan.connectorId
                 preview = found.preview
                 self.plan = plan
             } catch {
@@ -118,14 +134,17 @@ final class ImportModel {
     }
 
     private func refresh() {
-        guard !adopting, let file, let connector else { return }
+        guard let file, let connector else { return }
         let path = file.path
         let policy = self.policy
         let force = skipErrors
         previewing?.cancel()
         isWorking = true
         problem = nil
+        generation += 1
+        let mine = generation
         previewing = Task {
+            defer { if generation == mine { isWorking = false } }
             do {
                 let preview = try await library.app.call {
                     try $0.previewImport(path: path, connector: connector, policy: policy, force: force)
@@ -139,7 +158,6 @@ final class ImportModel {
                 plan = nil
                 problem = describe(error)
             }
-            isWorking = false
         }
     }
 
@@ -202,8 +220,11 @@ final class ExportModel {
     private(set) var isWorking = false
     private(set) var summary: TransferSummary?
 
+    /// Chosen in the save panel, which already asked before replacing a file.
     @ObservationIgnored private var destinationChosen = false
     @ObservationIgnored private var previewing: Task<Void, Never>?
+    /// Counts previews, so only the newest one clears `isWorking`.
+    @ObservationIgnored private var generation = 0
 
     init(library: LibraryModel) {
         self.library = library
@@ -234,7 +255,11 @@ final class ExportModel {
 
     var formatName: String { formats.first { $0.id == connector }?.name ?? connector }
     var count: Int { plan?.itemIds.count ?? 0 }
-    var canExport: Bool { count > 0 && !isWorking && problem == nil }
+    var canExport: Bool { count > 0 && !isWorking && problem == nil && summary == nil }
+
+    /// Exporting would replace a file nobody has agreed to replace: the
+    /// suggested destination, already there from an earlier export.
+    var needsReplaceConfirmation: Bool { plan?.replacesExisting == true && !destinationChosen }
 
     private static func suggestedFile(for connector: String) -> URL {
         let folder = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -283,29 +308,36 @@ final class ExportModel {
         let requests = choices.map { ($0, request(for: $0)) }
         previewing?.cancel()
         isWorking = true
+        generation += 1
+        let mine = generation
         previewing = Task {
+            defer { if generation == mine { isWorking = false } }
             if delay > .zero { try? await Task.sleep(for: delay) }
             guard !Task.isCancelled else { return }
-            let results = (try? await library.app.call { core in
-                requests.map { choice, request -> Outcome in
-                    do {
-                        return Outcome(choice: choice, preview: try core.previewExport(path: path, connector: connector, request: request), problem: nil)
-                    } catch {
-                        return Outcome(choice: choice, preview: nil, problem: describe(error))
+            // One call per preview, so a newer refresh stops this one between
+            // them instead of after all of them.
+            var results: [Outcome] = []
+            for (choice, request) in requests {
+                do {
+                    let preview = try await library.app.call {
+                        try $0.previewExport(path: path, connector: connector, request: request)
                     }
+                    results.append(Outcome(choice: choice, preview: preview, problem: nil))
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    results.append(Outcome(choice: choice, preview: nil, problem: describe(error)))
                 }
-            }) ?? []
+            }
             guard !Task.isCancelled else { return }
             var counts: [ExportChoice: Int] = [:]
             for result in results {
                 if let preview = result.preview { counts[result.choice] = preview.view().itemIds.count }
             }
             self.counts = counts
-            let mine = results.first { $0.choice == chosen }
-            preview = mine?.preview
-            plan = mine?.preview?.view()
-            problem = mine?.problem
-            isWorking = false
+            let chosenOutcome = results.first { $0.choice == chosen }
+            preview = chosenOutcome?.preview
+            plan = chosenOutcome?.preview?.view()
+            problem = chosenOutcome?.problem
         }
     }
 

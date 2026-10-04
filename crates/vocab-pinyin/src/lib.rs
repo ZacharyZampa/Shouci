@@ -110,13 +110,14 @@ const MAX_SEGMENTATIONS: usize = 64;
 /// Input must already be normalized (lowercase, `ü`/`u:` as `v`, tone marks as
 /// digits, as produced by [`normalize`]). Each whitespace token is split at
 /// apostrophes into hard-boundary segments, each segment is split every valid
-/// way using [`syllables::SYLLABLES`], and the results are joined. Tone digits
+/// way using the syllable table, and the results are joined. Tone digits
 /// stay bound to their syllable; no tones are guessed; existing spacing and
 /// apostrophes are preserved as boundaries.
 ///
-/// Returns variants in deterministic order (fewer syllables first, then
-/// lexicographic), deduplicated, capped at [`MAX_SEGMENTATIONS`]. The caller
-/// may prepend the raw (unspaced) spelling if it wants it retained.
+/// Returns variants sorted lexicographically and deduplicated, at most
+/// 64 of them: when there are more, the ones with the
+/// fewest syllables are kept. The caller may prepend the raw (unspaced)
+/// spelling if it wants it retained.
 #[must_use]
 pub fn segment(input: &str) -> Vec<String> {
     if input.trim().is_empty() {

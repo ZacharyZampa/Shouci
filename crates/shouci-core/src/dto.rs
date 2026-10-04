@@ -197,6 +197,12 @@ pub enum QuickAdd {
     },
 }
 
+impl From<SaveResult> for QuickAdd {
+    fn from(saved: SaveResult) -> Self {
+        Self::Saved(Box::new(saved))
+    }
+}
+
 /// A word typed in by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]

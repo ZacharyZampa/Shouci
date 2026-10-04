@@ -9,7 +9,9 @@
 //! confirmed word archived when it was last modified. Tags stay tags.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use vocab_core::{ItemSource, Result, SourceKind, Verification, VocabError};
@@ -109,39 +111,83 @@ pub fn import_poc_database(conn: &mut Connection, legacy_path: &Path) -> Result<
     })
 }
 
-fn open_legacy(path: &Path) -> Result<Connection> {
+/// The old database, opened for reading.
+struct Legacy {
+    conn: Connection,
+    /// Declared after `conn`, so the connection closes before the copy goes.
+    _copy: Option<TempCopy>,
+}
+
+impl Deref for Legacy {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+/// A private copy of the old database, removed when dropped.
+struct TempCopy(PathBuf);
+
+impl Drop for TempCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn open_legacy(path: &Path) -> Result<Legacy> {
     if !path.is_file() {
         return Err(VocabError::not_found(format!(
             "no database at {}",
             path.display()
         )));
     }
-    let mut header = [0u8; 16];
+    // The file header: the magic string, then (byte 18) the journal mode
+    // readers need.
+    let mut header = [0u8; 20];
     let is_sqlite = std::fs::File::open(path)
         .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
-        .is_ok_and(|()| &header == b"SQLite format 3\0");
+        .is_ok_and(|()| header.starts_with(b"SQLite format 3\0"));
     if !is_sqlite {
         return Err(VocabError::format(format!(
             "{} is not a SQLite database",
             path.display()
         )));
     }
-    // A WAL database without its shared-memory file cannot be opened
-    // read-only; opening it normally only ever reads here.
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|conn| {
-            conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
-            Ok(conn)
-        })
-        .or_else(|_| {
-            Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-        })
-        .map_err(|err| VocabError::storage(format!("cannot read {}: {err}", path.display())))
+    let wal = header[18] == 2;
+    if wal {
+        // Even a read-only connection to a WAL database creates its
+        // shared-memory file, and a read-write one checkpoints into it. Read
+        // a copy instead.
+        open_copy(path)
+    } else {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map(|conn| Legacy { conn, _copy: None })
+            .map_err(|err| err.to_string())
+    }
+    .map_err(|err| VocabError::storage(format!("cannot read {}: {err}", path.display())))
+}
+
+fn open_copy(path: &Path) -> std::result::Result<Legacy, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("shouci-poc-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let copy = TempCopy(dir);
+    let target = copy.0.join("user.db");
+    std::fs::copy(path, &target).map_err(|err| err.to_string())?;
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
+    if wal.is_file() {
+        std::fs::copy(&wal, copy.0.join("user.db-wal")).map_err(|err| err.to_string())?;
+    }
+    let conn = Connection::open(&target).map_err(|err| err.to_string())?;
+    Ok(Legacy {
+        conn,
+        _copy: Some(copy),
+    })
 }
 
 fn has_table(conn: &Connection, name: &str) -> Result<bool> {
@@ -384,13 +430,24 @@ fn insert_legacy_run(conn: &Connection, run: &LegacyRun, ids: &HashMap<i64, i64>
     )?;
     let run_id = conn.last_insert_rowid();
     for (item_id, line, raw, outcome, detail) in &run.items {
-        let outcome = match outcome.as_str() {
-            "inserted" => "inserted",
-            "skipped_duplicate" => "skipped",
-            "dropped" => "dropped",
-            "rejected" => "rejected",
-            "written" => "written",
-            _ => continue,
+        let (outcome, detail) = match outcome.as_str() {
+            "inserted" => ("inserted", detail.clone().unwrap_or_default()),
+            "updated" => ("updated", detail.clone().unwrap_or_default()),
+            "skipped" | "skipped_duplicate" => ("skipped", detail.clone().unwrap_or_default()),
+            "dropped" => ("dropped", detail.clone().unwrap_or_default()),
+            "rejected" => ("rejected", detail.clone().unwrap_or_default()),
+            "written" => ("written", detail.clone().unwrap_or_default()),
+            // Kept, not lost, but not taken to mean the destination has the
+            // word: at worst it is exported there again.
+            other => (
+                "dropped",
+                format!(
+                    "proof-of-concept outcome `{other}` {}",
+                    detail.as_deref().unwrap_or_default()
+                )
+                .trim_end()
+                .to_owned(),
+            ),
         };
         conn.execute(
             "INSERT INTO transfer_items (run_id, item_id, simplified, traditional, reading_key, \
@@ -403,7 +460,7 @@ fn insert_legacy_run(conn: &Connection, run: &LegacyRun, ids: &HashMap<i64, i64>
                 line,
                 raw,
                 outcome,
-                detail.clone().unwrap_or_default(),
+                detail,
             ],
         )?;
     }
@@ -460,6 +517,70 @@ INSERT INTO transfer_items VALUES (1, 1, 1, NULL, NULL, 'written', '');
             .execute_batch(POC)
             .unwrap();
         path
+    }
+
+    /// A WAL database whose shared-memory file is gone (the POC quit
+    /// without checkpointing) is read from a copy, never written to.
+    #[test]
+    fn a_wal_database_is_read_without_touching_it() {
+        let dir = std::env::temp_dir().join(format!("shouci-legacy-wal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live.db");
+        let writer = rusqlite::Connection::open(&live).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        writer.execute_batch(POC).unwrap();
+        // Snapshot the files as a crash would leave them: words only in the
+        // WAL, no shared-memory file.
+        let path = dir.join("user.db");
+        std::fs::copy(&live, &path).unwrap();
+        std::fs::copy(dir.join("live.db-wal"), dir.join("user.db-wal")).unwrap();
+        drop(writer);
+        let before = (
+            std::fs::read(&path).unwrap(),
+            std::fs::read(dir.join("user.db-wal")).unwrap(),
+        );
+
+        let mut conn = open_in_memory().unwrap();
+        let report = import_poc_database(&mut conn, &path).unwrap();
+        assert_eq!(report.items_added, 3);
+        assert_eq!(
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::read(dir.join("user.db-wal")).unwrap(),
+            ),
+            before
+        );
+        assert!(!dir.join("user.db-shm").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_outcomes_are_kept_but_not_trusted() {
+        let path = legacy_file("outcomes");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO transfer_runs VALUES (2, 'out', 'anki', 'anki/v1', 'anki', \
+                 '/tmp/a.txt', NULL, 1, 0, 0, 0, 0, 0, 0, 'committed', '2026-09-22 10:00:00'); \
+                 INSERT INTO transfer_items VALUES (2, 2, 1, NULL, NULL, 'mystery', 'x');",
+            )
+            .unwrap();
+        let mut conn = open_in_memory().unwrap();
+        import_poc_database(&mut conn, &path).unwrap();
+        let (outcome, detail): (String, String) = conn
+            .query_row(
+                "SELECT ti.outcome, ti.detail FROM transfer_items ti \
+                 JOIN transfer_runs tr ON tr.id = ti.run_id WHERE tr.connector_id = 'anki'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "dropped");
+        assert_eq!(detail, "proof-of-concept outcome `mystery` x");
+        assert!(items_at(&conn, "anki").unwrap().is_empty());
     }
 
     #[test]

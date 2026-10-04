@@ -48,6 +48,16 @@ private func library() throws -> (Core, URL) {
     let edited = try core.updateItem(id: saved.item.id, patch: ItemPatch(notes: "came up in class"))
     #expect(edited.notes == "came up in class")
 
+    let both = try core.editItem(
+        id: saved.item.id, patch: ItemPatch(definition: "a school"),
+        actions: [.addTags(["hsk"])])
+    #expect(both.definition == "a school")
+    #expect(both.tags == ["class", "hsk"])
+    #expect(throws: ShouciError.self) {
+        try core.editItem(id: saved.item.id, patch: ItemPatch(notes: "lost"), actions: [.addTags(["bad\tname"])])
+    }
+    #expect(try core.item(id: saved.item.id).notes == "came up in class", "all or nothing")
+
     _ = try core.bulk(ids: [saved.item.id], action: .addToCollection("Week 1"))
     #expect(try core.collections().map(\.name) == ["Week 1"])
     #expect(try core.tags().first?.count == 1)

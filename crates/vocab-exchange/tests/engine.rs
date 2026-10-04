@@ -14,8 +14,8 @@ use vocab_db::{
 };
 use vocab_dictionary::{CedictSource, SqliteDictionary, build_dictionary_db};
 use vocab_exchange::{
-    ExportRequest, ExportScope, ImportAction, ImportPolicy, SkipReason, apply_export, apply_import,
-    content_hash, plan_export, plan_import,
+    ExportRequest, ExportScope, ImportAction, ImportField, ImportPolicy, SkipReason, apply_export,
+    apply_import, content_hash, plan_export, plan_import,
 };
 use vocab_pleco::Pleco;
 
@@ -187,7 +187,7 @@ fn merge_fills_blanks_adds_groups_and_lists_conflicts() {
         panic!("expected an update: {:?}", plan.lines[0].action);
     };
     assert_eq!(changes.len(), 1, "notes were blank");
-    assert_eq!(changes[0].field, "notes");
+    assert_eq!(changes[0].field, ImportField::Notes);
     assert_eq!(conflicts.len(), 1, "definitions differ");
     assert_eq!(conflicts[0].kept, "hi there");
     apply_import(&mut conn, &plan, &content_hash(anki.as_bytes())).unwrap();
@@ -611,6 +611,29 @@ fn an_existing_file_is_flagged_and_an_empty_plan_never_truncates() {
     let err = apply_export(&mut conn, &plan).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Invalid);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+}
+
+#[test]
+fn a_file_that_appears_after_the_preview_is_not_replaced() {
+    let mut conn = open_in_memory().unwrap();
+    save(&conn, "学校", "xue2 xiao4", "school");
+    let path = scratch("appeared.txt");
+    let _ = std::fs::remove_file(&path);
+    let all = ExportRequest {
+        scope: ExportScope::All,
+        ..ExportRequest::default()
+    };
+    let plan = plan_export(&conn, None, &Pleco, path.to_str().unwrap(), &all).unwrap();
+    assert!(!plan.replaces_existing);
+    std::fs::write(&path, "someone else's").unwrap();
+    let err = apply_export(&mut conn, &plan).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Conflict);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "someone else's");
+    // Previewed again, the replacement is known and allowed.
+    let plan = plan_export(&conn, None, &Pleco, path.to_str().unwrap(), &all).unwrap();
+    assert!(plan.replaces_existing);
+    apply_export(&mut conn, &plan).unwrap();
+    assert_ne!(std::fs::read_to_string(&path).unwrap(), "someone else's");
 }
 
 #[test]

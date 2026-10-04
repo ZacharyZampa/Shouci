@@ -84,10 +84,22 @@ pub fn detect(query: &str) -> QueryKind {
     }
 }
 
-/// CJK Unified Ideographs and Extension A.
+/// A Chinese character: CJK Unified Ideographs, Extensions A to H, and the
+/// compatibility ideographs.
 pub(crate) fn is_han(c: char) -> bool {
-    let n = u32::from(c);
-    (0x3400..=0x4dbf).contains(&n) || (0x4e00..=0x9fff).contains(&n)
+    matches!(c,
+        '\u{3400}'..='\u{4dbf}'
+        | '\u{4e00}'..='\u{9fff}'
+        | '\u{f900}'..='\u{faff}'
+        | '\u{20000}'..='\u{3134f}')
+}
+
+/// Whether `text` has a Chinese character: only then can it be saved as a
+/// word to fill in later. (Read as Hanzi, `mao` matches nothing, but it is
+/// no word either.)
+#[must_use]
+pub fn has_han(text: &str) -> bool {
+    text.chars().any(is_han)
 }
 
 /// Letters only, and they spell pinyin syllables: `wo`, `jingzi`, `nihao`,
@@ -107,7 +119,22 @@ pub fn looks_like_pinyin(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryKind, detect, looks_like_pinyin};
+    use super::{QueryKind, detect, has_han, looks_like_pinyin};
+
+    #[test]
+    fn only_chinese_characters_count_as_han() {
+        assert!(has_han("蚌埠住了"));
+        assert!(has_han("卡拉OK"));
+        assert!(has_han("𠮷"), "Extension B");
+        assert!(has_han("\u{f900}"), "a compatibility ideograph");
+        assert!(!has_han("mao"));
+        assert!(!has_han("ニャー"));
+    }
+
+    #[test]
+    fn extension_b_reads_as_chinese() {
+        assert_eq!(detect("𠮷"), QueryKind::Chinese);
+    }
 
     #[test]
     fn detects_common_queries() {

@@ -18,7 +18,10 @@ xcodebuild -project "${MACOS}/Shouci.xcodeproj" -scheme Shouci -configuration Re
   -destination 'generic/platform=macOS' \
   -derivedDataPath "${BUILD}" -quiet build
 
+# Copied beside the installed app first, so a failed copy leaves it alone.
 mkdir -p "$(dirname "${OUT}")"
+rm -rf "${OUT}.new"
+ditto "${BUILD}/Build/Products/Release/Shouci.app" "${OUT}.new"
 rm -rf "${OUT}"
-ditto "${BUILD}/Build/Products/Release/Shouci.app" "${OUT}"
+mv "${OUT}.new" "${OUT}"
 echo "installed: ${OUT}"

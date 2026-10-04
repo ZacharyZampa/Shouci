@@ -91,15 +91,46 @@ impl Outcome {
     }
 }
 
-/// Outcomes that mean the destination has the word.
-const AT_DESTINATION: &str = "('inserted', 'updated', 'skipped', 'written')";
+/// Every (word id, destination) pair the ledger says the destination has.
+///
+/// A ledger row is about a saved word by id or, for a word purged and saved
+/// again, by identity. Each case is its own branch so each can use an index
+/// (`idx_transfer_items_item`, then the items identity index); joining on
+/// `item_id = i.id OR (identity)` instead makes SQLite scan the whole ledger
+/// once per word.
+macro_rules! pairs {
+    () => {
+        "SELECT ti.item_id AS item_id, tr.connector_id AS connector_id \
+         FROM transfer_items ti JOIN transfer_runs tr ON tr.id = ti.run_id \
+         JOIN items i ON i.id = ti.item_id \
+         WHERE ti.item_id IS NOT NULL AND tr.status = 'committed' \
+         AND ti.outcome IN ('inserted', 'updated', 'skipped', 'written') \
+         UNION \
+         SELECT i.id, tr.connector_id \
+         FROM transfer_items ti JOIN transfer_runs tr ON tr.id = ti.run_id \
+         JOIN items i ON i.simplified = ti.simplified COLLATE NOCASE \
+         AND i.traditional = ti.traditional COLLATE NOCASE \
+         AND i.reading_key = ti.reading_key \
+         WHERE ti.item_id IS NULL AND tr.status = 'committed' \
+         AND ti.outcome IN ('inserted', 'updated', 'skipped', 'written')"
+    };
+}
 
-/// Joins a ledger row to the saved word it is about: by id, or, for a word
-/// purged and saved again, by identity.
-const SAME_WORD: &str = "(ti.item_id = i.id OR (ti.item_id IS NULL \
-     AND ti.simplified = i.simplified COLLATE NOCASE \
-     AND ti.traditional = i.traditional COLLATE NOCASE \
-     AND ti.reading_key = i.reading_key))";
+const ITEMS_AT: &str = concat!(
+    "SELECT item_id FROM (",
+    pairs!(),
+    ") WHERE connector_id = ?1"
+);
+const ITEM_DESTINATIONS: &str = concat!(
+    "SELECT DISTINCT connector_id FROM (",
+    pairs!(),
+    ") WHERE item_id = ?1 ORDER BY connector_id"
+);
+const DESTINATIONS_BY_ITEM: &str = concat!(
+    "SELECT item_id, connector_id FROM (",
+    pairs!(),
+    ") ORDER BY connector_id"
+);
 
 /// Records a run and returns its id.
 ///
@@ -179,12 +210,7 @@ pub fn import_sources(conn: &Connection) -> Result<Vec<String>> {
 ///
 /// Returns an error if the query fails.
 pub fn items_at(conn: &Connection, connector_id: &str) -> Result<HashSet<i64>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT DISTINCT i.id FROM items i JOIN transfer_items ti ON {SAME_WORD} \
-         JOIN transfer_runs tr ON tr.id = ti.run_id \
-         WHERE tr.connector_id = ?1 AND tr.status = 'committed' \
-         AND ti.outcome IN {AT_DESTINATION}"
-    ))?;
+    let mut stmt = conn.prepare(ITEMS_AT)?;
     let rows = stmt.query_map([connector_id], |row| row.get(0))?;
     Ok(rows.collect::<rusqlite::Result<HashSet<i64>>>()?)
 }
@@ -195,12 +221,7 @@ pub fn items_at(conn: &Connection, connector_id: &str) -> Result<HashSet<i64>> {
 ///
 /// Returns an error if the query fails.
 pub fn item_destinations(conn: &Connection, item_id: i64) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT DISTINCT tr.connector_id FROM items i JOIN transfer_items ti ON {SAME_WORD} \
-         JOIN transfer_runs tr ON tr.id = ti.run_id \
-         WHERE i.id = ?1 AND tr.status = 'committed' \
-         AND ti.outcome IN {AT_DESTINATION} ORDER BY tr.connector_id"
-    ))?;
+    let mut stmt = conn.prepare(ITEM_DESTINATIONS)?;
     let rows = stmt.query_map([item_id], |row| row.get(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
 }
@@ -211,12 +232,7 @@ pub fn item_destinations(conn: &Connection, item_id: i64) -> Result<Vec<String>>
 ///
 /// Returns an error if the query fails.
 pub fn destinations_by_item(conn: &Connection) -> Result<HashMap<i64, Vec<String>>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT DISTINCT i.id, tr.connector_id FROM items i JOIN transfer_items ti ON {SAME_WORD} \
-         JOIN transfer_runs tr ON tr.id = ti.run_id \
-         WHERE tr.status = 'committed' \
-         AND ti.outcome IN {AT_DESTINATION} ORDER BY tr.connector_id"
-    ))?;
+    let mut stmt = conn.prepare(DESTINATIONS_BY_ITEM)?;
     let mut rows = stmt.query([])?;
     let mut out: HashMap<i64, Vec<String>> = HashMap::new();
     while let Some(row) = rows.next()? {
@@ -229,9 +245,12 @@ pub fn destinations_by_item(conn: &Connection) -> Result<HashMap<i64, Vec<String
 mod tests {
     use vocab_core::{ItemSource, Verification};
 
+    use rusqlite::StatementStatus;
+
     use super::{
-        Direction, Outcome, RunCounts, RunRecord, RunStatus, import_sources, items_at, record_item,
-        record_run,
+        DESTINATIONS_BY_ITEM, Direction, ITEM_DESTINATIONS, ITEMS_AT, Outcome, RunCounts,
+        RunRecord, RunStatus, destinations_by_item, import_sources, item_destinations, items_at,
+        record_item, record_run,
     };
     use crate::items::{NewItem, save_item};
     use crate::open_in_memory;
@@ -301,6 +320,130 @@ mod tests {
         let again = save_item(&conn, &word).unwrap().item().id;
         assert_ne!(again, id, "ids are never reused");
         assert!(items_at(&conn, "pleco").unwrap().contains(&again));
+        assert_eq!(item_destinations(&conn, again).unwrap(), vec!["pleco"]);
+        assert_eq!(
+            destinations_by_item(&conn).unwrap().get(&again),
+            Some(&vec!["pleco".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_word_matched_both_ways_is_listed_once() {
+        let conn = open_in_memory().unwrap();
+        let word = NewItem {
+            simplified: "学校".to_owned(),
+            traditional: String::new(),
+            pinyin: "xue2 xiao4".to_owned(),
+            definition: "school".to_owned(),
+            notes: String::new(),
+            verification: Verification::Confirmed,
+            source: ItemSource::manual(),
+        };
+        let first = save_item(&conn, &word).unwrap().item().id;
+        let out = record_run(
+            &conn,
+            &run(Direction::Out, "pleco", "/tmp/p.txt", RunStatus::Committed),
+        )
+        .unwrap();
+        record_item(&conn, out, Some(first), None, None, Outcome::Written, "").unwrap();
+        crate::set_trashed(&conn, first, true).unwrap();
+        crate::purge_item(&conn, first).unwrap();
+        let again = save_item(&conn, &word).unwrap().item().id;
+        // Exported again: one row by id, one by identity.
+        let out = record_run(
+            &conn,
+            &run(Direction::Out, "pleco", "/tmp/p.txt", RunStatus::Committed),
+        )
+        .unwrap();
+        record_item(&conn, out, Some(again), None, None, Outcome::Written, "").unwrap();
+        assert_eq!(item_destinations(&conn, again).unwrap(), vec!["pleco"]);
+        assert_eq!(
+            destinations_by_item(&conn).unwrap().get(&again),
+            Some(&vec!["pleco".to_owned()])
+        );
+    }
+
+    #[test]
+    fn rejected_runs_and_dropped_lines_are_not_at_the_destination() {
+        let conn = open_in_memory().unwrap();
+        let id = save_item(
+            &conn,
+            &NewItem {
+                simplified: "学校".to_owned(),
+                traditional: String::new(),
+                pinyin: "xue2 xiao4".to_owned(),
+                definition: "school".to_owned(),
+                notes: String::new(),
+                verification: Verification::Confirmed,
+                source: ItemSource::manual(),
+            },
+        )
+        .unwrap()
+        .item()
+        .id;
+        let rejected = record_run(
+            &conn,
+            &run(Direction::In, "pleco", "/tmp/in.txt", RunStatus::Rejected),
+        )
+        .unwrap();
+        record_item(&conn, rejected, Some(id), None, None, Outcome::Skipped, "").unwrap();
+        let committed = record_run(
+            &conn,
+            &run(Direction::In, "anki", "/tmp/in.txt", RunStatus::Committed),
+        )
+        .unwrap();
+        record_item(&conn, committed, Some(id), None, None, Outcome::Dropped, "").unwrap();
+        record_item(
+            &conn,
+            committed,
+            None,
+            Some(3),
+            Some("x"),
+            Outcome::Rejected,
+            "",
+        )
+        .unwrap();
+        assert!(destinations_by_item(&conn).unwrap().is_empty());
+        assert_eq!(item_destinations(&conn, id).unwrap(), [] as [String; 0]);
+    }
+
+    /// Listing a library asks for every word's destinations, so the cost must
+    /// grow with the ledger, not with words × ledger rows. Counted in SQLite
+    /// VM steps, which unlike time do not depend on the machine.
+    #[test]
+    fn ledger_queries_stay_linear() {
+        const WORDS: usize = 2_000;
+        let conn = open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {WORDS}) \
+             INSERT INTO items (simplified, traditional, reading_key) \
+             SELECT 'w' || x, 'w' || x, 'k' || x FROM n; \
+             INSERT INTO transfer_runs (direction, connector_id, format, path, status) \
+             VALUES ('out', 'pleco', 'f', '/p', 'committed'), ('out', 'anki', 'f', '/a', 'committed'); \
+             INSERT INTO transfer_items (run_id, item_id, simplified, traditional, reading_key, outcome) \
+             SELECT 1, id, simplified, traditional, reading_key, 'written' FROM items; \
+             INSERT INTO transfer_items (run_id, item_id, simplified, traditional, reading_key, outcome) \
+             SELECT 2, NULL, simplified, traditional, reading_key, 'written' FROM items;"
+        ))
+        .unwrap();
+        for (sql, param) in [
+            (DESTINATIONS_BY_ITEM, None),
+            (
+                ITEMS_AT,
+                Some(rusqlite::types::Value::from("pleco".to_owned())),
+            ),
+            (ITEM_DESTINATIONS, Some(rusqlite::types::Value::from(7_i64))),
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let rows = match param {
+                Some(value) => stmt.query_map([value], |_| Ok(())).unwrap().count(),
+                None => stmt.query_map([], |_| Ok(())).unwrap().count(),
+            };
+            assert!(rows > 0, "{sql}");
+            let steps = usize::try_from(stmt.get_status(StatementStatus::VmStep)).unwrap();
+            // Linear is a few dozen steps per row; words × rows is millions.
+            assert!(steps < 200 * WORDS, "{steps} VM steps for {sql}");
+        }
     }
 
     #[test]

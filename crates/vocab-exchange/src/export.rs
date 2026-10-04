@@ -1,5 +1,6 @@
 //! Export: library → plan → file.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use rusqlite::Connection;
@@ -91,17 +92,11 @@ pub fn plan_export(
     if request.filter.view == LibraryView::Trash {
         return Err(VocabError::invalid("the trash is never exported"));
     }
-    if import_sources(conn)?
-        .iter()
-        .any(|source| Path::new(source) == Path::new(path))
-    {
-        return Err(VocabError::invalid(format!(
-            "{path} was imported from; export to a different file so it is never overwritten"
-        )));
-    }
+    refuse_import_source(conn, path)?;
     let mut items = list_items(conn, &request.filter)?;
     items.reverse(); // oldest first: the order words were collected
     if let ExportScope::Selected(ids) = &request.scope {
+        let ids: HashSet<i64> = ids.iter().copied().collect();
         items.retain(|item| ids.contains(&item.id));
     }
     let before = items.len();
@@ -150,6 +145,19 @@ pub fn plan_export(
     })
 }
 
+/// Exports never overwrite a file that was imported from.
+fn refuse_import_source(conn: &Connection, path: &str) -> Result<()> {
+    if import_sources(conn)?
+        .iter()
+        .any(|source| Path::new(source) == Path::new(path))
+    {
+        return Err(VocabError::invalid(format!(
+            "{path} was imported from; export to a different file so it is never overwritten"
+        )));
+    }
+    Ok(())
+}
+
 /// The word's definition is exactly what a dictionary says for its reading.
 fn is_dictionary_default(dict: Option<&dyn DictionaryProvider>, item: &VocabItem) -> Result<bool> {
     let Some(dict) = dict else {
@@ -170,7 +178,10 @@ fn is_dictionary_default(dict: Option<&dyn DictionaryProvider>, item: &VocabItem
 ///
 /// # Errors
 ///
-/// I/O errors writing the file (then nothing is recorded), or storage errors.
+/// [`vocab_core::ErrorKind::Conflict`] if a file appeared at the path since
+/// the preview (which promised not to replace one), or the path has been
+/// imported from since; I/O errors writing the file (then nothing is
+/// recorded), or storage errors.
 pub fn apply_export(conn: &mut Connection, plan: &ExportPlan) -> Result<TransferSummary> {
     let mut summary = TransferSummary {
         connector_id: plan.connector_id.clone(),
@@ -187,6 +198,14 @@ pub fn apply_export(conn: &mut Connection, plan: &ExportPlan) -> Result<Transfer
             "this export plan has no file contents; preview the export again",
         ));
     }
+    // What was previewed may no longer hold.
+    if !plan.replaces_existing && Path::new(&plan.path).exists() {
+        return Err(VocabError::conflict(format!(
+            "{} appeared after the preview; preview the export again to replace it",
+            plan.path
+        )));
+    }
+    refuse_import_source(conn, &plan.path)?;
     atomic_write(Path::new(&plan.path), &plan.bytes)?;
     let run = RunRecord {
         direction: Direction::Out,
