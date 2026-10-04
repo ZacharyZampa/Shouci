@@ -4,13 +4,6 @@ Collect Chinese vocabulary without leaving what you're doing. Press a
 shortcut, type English, pinyin, or characters, pick the word, press Return.
 Later, study the words in Pleco or Anki.
 
-<p align="center">
-  <img src="docs/screenshots/library.png" alt="The Shouci library window: a list of saved words, with the selected word's definition, notes, tags and collections beside it" width="860">
-</p>
-<p align="center">
-  <img src="docs/screenshots/quick-search.png" alt="Quick search over another app: results for “to travel”, with a word you already have marked Saved" width="400">
-</p>
-
 Free and open source (MIT). Your words stay on your Mac: Shouci has no
 account and goes online only to download its dictionary.
 
@@ -61,6 +54,13 @@ words from `~/Library/Application Support/pleco-companion/` into its new
 library. The old folder is left as it was.
 
 ## Using Shouci
+
+<p align="center">
+  <img src="docs/screenshots/library.png" alt="The Shouci library window: a list of saved words, with the selected word's definition, notes, tags and collections beside it" width="860">
+</p>
+<p align="center">
+  <img src="docs/screenshots/quick-search.png" alt="Quick search over another app: results for “to travel”, with a word you already have marked Saved" width="400">
+</p>
 
 ### Quick search
 
