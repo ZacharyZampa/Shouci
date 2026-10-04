@@ -18,6 +18,7 @@ fi
 
 echo "==> architecture boundaries"
 "${ROOT}/scripts/check-deps.sh"
+"${ROOT}/scripts/check-deps-test.sh"
 
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check

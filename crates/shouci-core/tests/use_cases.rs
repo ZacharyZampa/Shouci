@@ -595,6 +595,33 @@ fn a_file_changed_after_the_preview_is_not_imported() {
 }
 
 #[test]
+fn a_word_changed_after_the_preview_is_not_imported() {
+    let shouci = sandbox();
+    let id = saved(shouci.quick_add("你好", None).unwrap()).item.id;
+    let dir = scratch_dir("word-changed");
+    let source = dir.join("in.txt");
+    std::fs::write(&source, "// Lesson 1\n你好\tni3 hao3\thello\n").unwrap();
+    let plan = shouci
+        .preview_import(&source, "pleco", ImportPolicy::Merge, false)
+        .unwrap();
+    shouci
+        .update_item(
+            id,
+            &ItemPatch {
+                notes: Some("edited meanwhile".to_owned()),
+                ..ItemPatch::default()
+            },
+        )
+        .unwrap();
+    let err = shouci.apply_import(&plan).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Conflict);
+    let word = shouci.item(id).unwrap();
+    assert_eq!(word.notes, "edited meanwhile");
+    assert!(word.collections.is_empty(), "nothing was imported");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn an_import_file_is_read_as_the_format_that_fits() {
     // Given an Anki export and a Pleco file
     let shouci = sandbox();
@@ -744,6 +771,43 @@ fn another_process_writing_is_noticed() {
         .unwrap();
     assert_ne!(shouci.data_version().unwrap(), before);
     assert_eq!(heads(&shouci, &active()), vec!["生词"]);
+}
+
+/// The app and the CLI write at the same moment: each waits its turn, and
+/// nothing is lost. (A transaction that reads before taking the write lock
+/// fails here at once instead of waiting.)
+#[test]
+fn writers_in_other_processes_wait_their_turn() {
+    let shouci = empty_sandbox();
+    let mut config = shouci.config().clone();
+    config.legacy_dir = None;
+    let writers: Vec<_> = (0..6u32)
+        .map(|writer| {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let other = Shouci::open(config).unwrap();
+                for n in 0..25u32 {
+                    let word = char::from_u32(0x4E00 + writer * 100 + n).unwrap();
+                    let id = other
+                        .add_manual(&ManualWord {
+                            simplified: word.to_string(),
+                            ..ManualWord::default()
+                        })
+                        .unwrap()
+                        .item
+                        .id;
+                    other
+                        .bulk(&[id], &BulkAction::AddTags(vec!["busy".to_owned()]))
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    assert_eq!(shouci.list_items(&active()).unwrap().len(), 150);
+    assert_eq!(shouci.tags().unwrap()[0].count, 150);
 }
 
 // --- Contract shape -------------------------------------------------------

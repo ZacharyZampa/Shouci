@@ -53,7 +53,9 @@ flowchart TB
 ```
 
 Two boundaries, checked on every run of `scripts/check.sh`
-(`scripts/check-deps.sh`):
+(`scripts/check-deps.sh`, which reads `cargo metadata`, so no way of
+declaring a dependency slips past; `scripts/check-deps-test.sh` proves it
+refuses each one):
 
 - **Frontends depend on `shouci-core` only.** The CLI, the TUI, and the FFI
   crate never reach past it, so every UI is a projection of the same core

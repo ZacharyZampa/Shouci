@@ -5,26 +5,24 @@
 #     new format never sees storage;
 #   - frontends (shouci-cli, shouci-tui, shouci-ffi) depend on
 #     shouci-core only, so every UI is a projection of the same core.
+#
+# Dependencies come from `cargo metadata`, so every way a Cargo.toml can
+# declare one counts: inline, as a `[dependencies.name]` table, for one
+# target only, or renamed. An argument names another workspace to check
+# (scripts/check-deps-test.sh uses it).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 status=0
 
-# Prints the dependency names in a crate's [dependencies] table.
-deps() {
-  awk '/^\[dependencies\]/{on=1; next} /^\[/{on=0} on && /^[a-zA-Z0-9_-]+ *=/{print $1}' "$1"
-}
-
-# Workspace members only; a crate outside the workspace is not built.
-MEMBERS="$(awk '/^members = \[/{on=1; next} on && /\]/{on=0} on{print}' "${ROOT}/Cargo.toml")"
+# One line per workspace member: its name, then its normal dependencies. A
+# crate outside the workspace is not built, so it isn't listed.
+GRAPH="$(cargo metadata --format-version 1 --no-deps --offline --manifest-path "${ROOT}/Cargo.toml" |
+  jq -r '.packages[] | [.name, (.dependencies[] | select(.kind == null) | .name)] | join(" ")')"
 
 check() {
-  local crate="$1" allowed="$2"
-  local manifest="${ROOT}/crates/${crate}/Cargo.toml"
-  [ -f "${manifest}" ] || return 0
-  grep -q "\"crates/${crate}\"" <<<"${MEMBERS}" || return 0
-  local dep
-  for dep in $(deps "${manifest}"); do
+  local crate="$1" allowed="$2" dep
+  for dep in $(awk -v crate="${crate}" '$1 == crate { $1 = ""; print }' <<<"${GRAPH}"); do
     case "${dep}" in
       vocab-*|shouci-*|rusqlite)
         if ! grep -qw -- "${dep}" <<<"${allowed}"; then
