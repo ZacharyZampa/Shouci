@@ -14,6 +14,8 @@ From Pleco's manual (Flashcards → plain text format,
   `characters <tab><tab> definition`); Pleco fills them in from its
   dictionaries. A supplied definition is always used.
 - Pinyin: tone numbers after each syllable (tone marks also accepted).
+  Pleco's own exports write `//` where a separable word splits
+  (`liu2//xia4`); it is read as a syllable boundary.
 - Category: a line starting with `//` begins a new category.
 
 Also accepted on import, never written: the Shouci proof of concept's
@@ -28,3 +30,5 @@ Also accepted on import, never written: the Shouci proof of concept's
 | `v1/valid/headword-only.txt` | characters only, `simplified[traditional]`, missing pinyin |
 | `v1/valid/poc-brackets.txt` | proof-of-concept `[Category]` and `%` comment lines |
 | `v1/malformed/empty-headword.txt` | a record with no characters |
+| `v1/samples/` | real Pleco text, XML and `.pqb` exports, trimmed; see `FORMATS.md` |
+| `v1/samples/export-flashcards-android-defn.xml` | Android XML with `<defn>`, reconstructed from a public README |

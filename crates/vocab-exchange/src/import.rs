@@ -3,7 +3,11 @@
 //! Rules that keep imports from losing data:
 //! - an omitted or blank field never changes a saved word;
 //! - tags and collections are only ever added, never removed (files hold
-//!   one category or deck per word, so they cannot say a word left one);
+//!   one category or deck per word, so they cannot say a word left one),
+//!   whatever the policy: the policy decides a saved word's text only;
+//! - a tag or collection is the library's own when only case, spaces, or
+//!   underscores differ (`week 1`, `Week_1` → `Week 1`), so a file never
+//!   splits one group in two;
 //! - a word repeated in one file is folded into its first line: tags and
 //!   collections combined, the first definition kept, differences reported.
 
@@ -24,17 +28,21 @@ use vocab_dictionary::DictionaryProvider;
 use crate::resolve::{Resolved, resolve};
 use crate::{TransferSummary, content_hash, count, reading_key, strip_bom};
 
-/// What to do when a file has a word that is already saved.
+/// What to do with the text of a word that is already saved. Every policy
+/// adds the tags and collections the file gives the word.
+///
+/// The default is the one every frontend starts with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportPolicy {
-    /// Leave the saved word alone.
-    #[default]
+    /// Keep the saved word's text. A word in the trash stays there,
+    /// untouched.
     Skip,
     /// Replace each text field the file fills in.
     Overwrite,
     /// Fill blank text fields. Where both sides have different values, keep
-    /// the saved one and report the conflict.
+    /// the saved one and report the conflict. A word in the trash comes back.
+    #[default]
     Merge,
 }
 
@@ -110,6 +118,8 @@ pub struct NameChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
+    /// Skip kept the saved word's text, and the file adds no tags or
+    /// collections to it.
     AlreadySaved,
     /// Saved, but in the trash. Skip leaves it there.
     InTrash,
@@ -287,7 +297,11 @@ pub fn plan_import(
         );
     }
 
-    let (words, input) = read_words(&parsed.records, dict, &mut issues)?;
+    let mut groups = LibraryNames {
+        tags: Names::new(vocab_db::tags(conn)?),
+        collections: Names::new(vocab_db::collections(conn)?),
+    };
+    let (words, input) = read_words(&parsed.records, dict, &mut groups, &mut issues)?;
     let actions = words
         .iter()
         .map(|word| plan_word(conn, word, policy))
@@ -322,6 +336,7 @@ pub fn plan_import(
 fn read_words(
     records: &[ExchangeRecord],
     dict: Option<&dyn DictionaryProvider>,
+    groups: &mut LibraryNames,
     issues: &mut Vec<Issue>,
 ) -> Result<(Vec<Word>, Vec<InputLine>)> {
     let mut words: Vec<Word> = Vec::new();
@@ -335,8 +350,17 @@ fn read_words(
         let outcome = match resolve(record, &hits) {
             Err(reason) => LineOutcome::Decided(ImportAction::Drop { reason }),
             Ok(resolved) => {
-                let tags = names(record, &record.tags, "tag", issues);
-                let collections = names(record, &record.collections, "collection", issues);
+                if let Some(written) = &resolved.as_written {
+                    issues.push(Issue::warning(record.line, written.note.clone()));
+                }
+                let tags = names(record, &record.tags, "tag", issues)
+                    .into_iter()
+                    .map(|name| groups.tags.canonical(name))
+                    .collect();
+                let collections = names(record, &record.collections, "collection", issues)
+                    .into_iter()
+                    .map(|name| groups.collections.canonical(name))
+                    .collect();
                 let key = (
                     resolved.simplified.to_lowercase(),
                     resolved.traditional.to_lowercase(),
@@ -456,6 +480,57 @@ fn name_key(name: &str) -> String {
         .join("_")
 }
 
+struct LibraryNames {
+    tags: Names,
+    collections: Names,
+}
+
+/// The spelling each tag or collection name takes: the library's own when it
+/// has the name, else the first spelling in the file. The library compares
+/// names ignoring ASCII case only, so without this `Week_1` in a file would
+/// go to a new collection beside `Week 1` for new words, while words already
+/// in `Week 1` were counted as in it.
+struct Names {
+    /// By name as the library compares names (`COLLATE NOCASE`).
+    exact: HashMap<String, String>,
+    /// By [`name_key`].
+    loose: HashMap<String, String>,
+}
+
+impl Names {
+    /// Seeded with the library's names, in its order, so the first wins
+    /// when two of them differ only in spacing (from before this rule).
+    fn new(library: Vec<vocab_db::NameCount>) -> Self {
+        let mut names = Self {
+            exact: HashMap::new(),
+            loose: HashMap::new(),
+        };
+        for group in library {
+            names.learn(group.name);
+        }
+        names
+    }
+
+    fn learn(&mut self, name: String) {
+        self.loose
+            .entry(name_key(&name))
+            .or_insert_with(|| name.clone());
+        self.exact.entry(name.to_ascii_lowercase()).or_insert(name);
+    }
+
+    fn canonical(&mut self, name: String) -> String {
+        if let Some(known) = self
+            .exact
+            .get(&name.to_ascii_lowercase())
+            .or_else(|| self.loose.get(&name_key(&name)))
+        {
+            return known.clone();
+        }
+        self.learn(name.clone());
+        name
+    }
+}
+
 /// Equal apart from spacing and line breaks, which formats may flatten.
 fn same_text(a: &str, b: &str) -> bool {
     a.split_whitespace().eq(b.split_whitespace())
@@ -463,7 +538,18 @@ fn same_text(a: &str, b: &str) -> bool {
 
 fn plan_word(conn: &Connection, word: &Word, policy: ImportPolicy) -> Result<ImportAction> {
     let r = &word.resolved;
-    match find_by_identity(conn, &r.simplified, &r.traditional, &r.pinyin)? {
+    let saved = match find_by_identity(conn, &r.simplified, &r.traditional, &r.pinyin)? {
+        // A word saved the way the file writes it (an earlier import) is
+        // the same word too.
+        None => match &r.as_written {
+            Some(written) => {
+                find_by_identity(conn, &r.simplified, &written.traditional, &written.pinyin)?
+            }
+            None => None,
+        },
+        found => found,
+    };
+    match saved {
         None => Ok(ImportAction::Insert {
             word: Incoming {
                 simplified: r.simplified.clone(),
@@ -525,13 +611,8 @@ fn plan_existing(
         reason,
         conflicts,
     };
-    if policy == ImportPolicy::Skip {
-        let reason = if trashed {
-            SkipReason::InTrash
-        } else {
-            SkipReason::AlreadySaved
-        };
-        return Ok(skip(reason, conflicts));
+    if policy == ImportPolicy::Skip && trashed {
+        return Ok(skip(SkipReason::InTrash, conflicts));
     }
     let changes: Vec<FieldChange> = provided(existing, word)
         .into_iter()
@@ -539,7 +620,8 @@ fn plan_existing(
             let to = to?;
             let wanted = match policy {
                 ImportPolicy::Overwrite => !same_text(from, to),
-                ImportPolicy::Merge | ImportPolicy::Skip => from.is_empty(),
+                ImportPolicy::Merge => from.is_empty(),
+                ImportPolicy::Skip => false,
             };
             wanted.then(|| FieldChange {
                 field,
@@ -572,7 +654,12 @@ fn plan_existing(
             .collect(),
     };
     if changes.is_empty() && tags.add.is_empty() && collections.add.is_empty() && !trashed {
-        return Ok(skip(SkipReason::Unchanged, conflicts));
+        let reason = if policy == ImportPolicy::Skip {
+            SkipReason::AlreadySaved
+        } else {
+            SkipReason::Unchanged
+        };
+        return Ok(skip(reason, conflicts));
     }
     Ok(ImportAction::Update {
         item_id: existing.id,

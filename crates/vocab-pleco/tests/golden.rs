@@ -108,6 +108,33 @@ fn byte_order_mark_and_crlf_are_ignored() {
     );
 }
 
+/// A real iOS export: BOM, CRLF, `// Category` with a space, the bracket
+/// written even when the forms match, unspaced pinyin, and `//` splitting
+/// separable words.
+#[test]
+fn a_real_pleco_text_export_reads_as_written() {
+    let parsed = Pleco.parse(&fixture("v1/samples/export-text.txt")).unwrap();
+    assert!(parsed.issues.is_empty(), "{:?}", parsed.issues);
+    assert_eq!(parsed.records.len(), 12);
+    assert!(
+        parsed
+            .records
+            .iter()
+            .all(|record| record.collections == Field::Present(vec!["Class Words".to_owned()]))
+    );
+    let impression = &parsed.records[0];
+    assert_eq!(impression.headword, "印象");
+    assert_eq!(impression.traditional, text("印象"));
+    assert_eq!(impression.pinyin, text("yin4xiang4"));
+    assert_eq!(impression.definition, Field::Omitted, "Pleco exports none");
+    let stay = &parsed.records[1];
+    assert_eq!(stay.headword, "留下");
+    assert_eq!(stay.pinyin, text("liu2 xia4"), "the split mark is dropped");
+    let around = &parsed.records[6];
+    assert_eq!(around.headword, "周围");
+    assert_eq!(around.traditional, text("週圍"));
+}
+
 #[test]
 fn non_utf8_input_is_rejected_with_message() {
     let err = Pleco.parse(b"\xff\xfe garbage").unwrap_err();

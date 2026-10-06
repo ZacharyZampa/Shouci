@@ -97,7 +97,7 @@ impl App<'_> {
             kind,
             path: default_transfer_path(&format),
             format,
-            policy: ImportPolicy::Skip,
+            policy: ImportPolicy::default(),
             only_new: true,
             typing: false,
         });

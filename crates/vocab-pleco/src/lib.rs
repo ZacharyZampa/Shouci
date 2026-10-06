@@ -4,6 +4,9 @@
 //! - A `//Category` line becomes a collection.
 //! - Characters written `简体[繁體]` carry their traditional form; exports
 //!   write it the same way.
+//! - Pleco writes `//` where a separable word splits (`liu2//xia4`, 留下).
+//!   It is read as a syllable boundary, so the reading matches the same word
+//!   saved from anywhere else.
 //! - Pleco fills in what a card leaves out, and always uses a definition it
 //!   is given. So a missing definition is omitted on import, and on export a
 //!   definition identical to the dictionary's is left out so Pleco shows its
@@ -36,7 +39,7 @@ impl Connector for Pleco {
             if let Some(traditional) = traditional {
                 exchange.traditional = Field::Present(traditional);
             }
-            if let Some(pinyin) = record.pinyin {
+            if let Some(pinyin) = record.pinyin.as_deref().and_then(without_split_marks) {
                 exchange.pinyin = Field::Present(pinyin);
             }
             if let Some(definition) = record.definition {
@@ -132,9 +135,33 @@ fn split_headword(headword: &str) -> (String, Option<String>) {
     (headword.to_owned(), None)
 }
 
+/// `liu2//xia4` → `liu2 xia4`. `None` when nothing but marks is left.
+fn without_split_marks(pinyin: &str) -> Option<String> {
+    let reading = pinyin
+        .split("//")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!reading.is_empty()).then_some(reading)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split_headword;
+    use super::{split_headword, without_split_marks};
+
+    #[test]
+    fn split_marks_become_syllable_boundaries() {
+        assert_eq!(
+            without_split_marks("liu2//xia4").as_deref(),
+            Some("liu2 xia4")
+        );
+        assert_eq!(
+            without_split_marks("yin4xiang4").as_deref(),
+            Some("yin4xiang4")
+        );
+        assert_eq!(without_split_marks("//"), None);
+    }
 
     #[test]
     fn bracketed_traditional_is_split_off() {

@@ -133,7 +133,7 @@ struct ImportSheet: View {
             VStack(spacing: 0) {
                 PolicyRow(
                     policy: .skip, selection: $model.policy, title: "Skip",
-                    detail: "Keep my version. Imported duplicates are ignored.")
+                    detail: "Keep my version, and add the file’s tags and collections.")
                 Divider()
                 PolicyRow(
                     policy: .merge, selection: $model.policy, title: "Merge",
@@ -204,7 +204,12 @@ struct ImportSheet: View {
         var parts: [String] = []
         if model.newWords > 0 { parts.append("\(model.newWords) will be added") }
         if model.updates > 0 {
-            parts.append(model.policy == .overwrite ? "\(model.updates) updated" : "\(model.updates) merged")
+            let updated = switch model.policy {
+            case .overwrite: "\(model.updates) updated"
+            case .merge: "\(model.updates) merged"
+            case .skip: "\(model.updates) get the file’s tags and collections"
+            }
+            parts.append(updated)
         }
         if model.needsReview > 0 { parts.append("\(model.needsReview) added as needs review") }
         if parts.isEmpty { return "Nothing in this file changes your vocabulary." }

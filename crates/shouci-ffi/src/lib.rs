@@ -118,6 +118,14 @@ pub fn display_definition(definition: &str) -> String {
     shouci_core::text::display_definition(definition)
 }
 
+/// What an import does with words already saved until someone chooses,
+/// the same in every frontend.
+#[uniffi::export]
+#[must_use]
+pub fn default_import_policy() -> ImportPolicy {
+    ImportPolicy::default()
+}
+
 /// What [`Core::quick_add`] did. (The core's `QuickAdd`, unboxed.)
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 #[allow(clippy::large_enum_variant)] // `UniFFI` cannot pass a `Box`; it copies the value anyway

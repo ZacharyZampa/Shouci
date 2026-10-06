@@ -370,8 +370,9 @@ struct ImportArgs {
     /// The file's format, `pleco` or `anki` (default: whichever reads it).
     #[arg(long, value_name = "FORMAT")]
     from: Option<String>,
-    /// What to do with words you already have.
-    #[arg(long, value_enum, default_value_t = Existing::Skip)]
+    /// What to do with the text of words you already have. Every choice
+    /// adds the file's tags and collections to them.
+    #[arg(long, value_enum, default_value_t = Existing::from(ImportPolicy::default()))]
     existing: Existing,
     /// Import even when some lines have errors; those lines are skipped.
     #[arg(long)]
@@ -383,12 +384,23 @@ struct ImportArgs {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Existing {
-    /// Leave them as they are.
+    /// Keep their text; leave words in the trash there.
     Skip,
-    /// Fill in what they are missing; keep what differs.
+    /// Fill in what they are missing; keep what differs; bring words back
+    /// from the trash.
     Merge,
     /// Replace each field the file fills in.
     Overwrite,
+}
+
+impl From<ImportPolicy> for Existing {
+    fn from(policy: ImportPolicy) -> Self {
+        match policy {
+            ImportPolicy::Skip => Self::Skip,
+            ImportPolicy::Merge => Self::Merge,
+            ImportPolicy::Overwrite => Self::Overwrite,
+        }
+    }
 }
 
 impl From<Existing> for ImportPolicy {

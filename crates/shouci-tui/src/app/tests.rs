@@ -501,13 +501,13 @@ fn only_new_and_policy_toggles_belong_to_their_direction() {
     press(&mut app, KeyCode::Esc);
     ctrl(&mut app, KeyCode::Char('o'));
     assert!(
-        app.status.contains("words you have: skip"),
-        "{:?}",
+        app.status.contains("words you have: merge"),
+        "the core's default: {:?}",
         app.status
     );
     ctrl(&mut app, KeyCode::Char('p'));
     assert!(
-        app.status.contains("words you have: merge"),
+        app.status.contains("words you have: overwrite"),
         "{:?}",
         app.status
     );

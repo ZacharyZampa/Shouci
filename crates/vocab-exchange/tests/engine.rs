@@ -9,8 +9,8 @@ use vocab_core::{
     ErrorKind, ItemPatch, ItemSource, LibraryFilter, LibraryView, Verification, VocabItem,
 };
 use vocab_db::{
-    NewItem, add_tag, item_collections, item_tags, list_items, open_in_memory, save_item,
-    set_trashed, update_item,
+    NewItem, add_tag, add_to_collection, item_collections, item_tags, list_items, open_in_memory,
+    save_item, set_trashed, update_item,
 };
 use vocab_dictionary::{CedictSource, SqliteDictionary, build_dictionary_db};
 use vocab_exchange::{
@@ -24,8 +24,13 @@ fn dictionary() -> SqliteDictionary {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/dictionary/cedict-sample.u8"),
     )
     .expect("fixture");
+    dictionary_of(&artifact)
+}
+
+/// A dictionary of CC-CEDICT lines.
+fn dictionary_of(cedict: &[u8]) -> SqliteDictionary {
     let mut conn = Connection::open_in_memory().expect("memory");
-    build_dictionary_db(&mut conn, &CedictSource::default(), &artifact).expect("build");
+    build_dictionary_db(&mut conn, &CedictSource::default(), cedict).expect("build");
     SqliteDictionary::from_connection(conn).expect("provider")
 }
 
@@ -136,14 +141,17 @@ fn pleco_import_resolves_words_and_categories_become_collections() {
 }
 
 #[test]
-fn skip_leaves_saved_words_alone_and_reports_differences() {
+fn skip_keeps_saved_text_but_adds_the_file_s_collections() {
     let mut conn = open_in_memory().unwrap();
     let id = save(&conn, "你好", "ni3 hao3", "hi there");
     let summary = import(&mut conn, &Pleco, PLECO, ImportPolicy::Skip);
     assert_eq!(summary.inserted, 1);
-    assert_eq!(summary.skipped, 1);
+    assert_eq!(summary.updated, 1, "joined Greetings");
     assert_eq!(find(&conn, "你好").definition, "hi there");
-    assert_eq!(item_collections(&conn, id).unwrap(), [] as [String; 0]);
+    assert_eq!(item_collections(&conn, id).unwrap(), vec!["Greetings"]);
+
+    let again = import(&mut conn, &Pleco, PLECO, ImportPolicy::Skip);
+    assert_eq!((again.inserted, again.updated, again.skipped), (0, 0, 2));
     assert!(
         summary
             .notes
@@ -245,6 +253,160 @@ fn trashed_words_stay_trashed_on_skip_and_come_back_on_merge() {
     ));
     import(&mut conn, &Pleco, PLECO, ImportPolicy::Merge);
     assert!(find(&conn, "你好").deleted_at.is_none());
+}
+
+#[test]
+fn every_frontend_starts_from_merge() {
+    assert_eq!(ImportPolicy::default(), ImportPolicy::Merge);
+}
+
+/// The words of `fixtures/pleco/v1/samples/export-text.txt` that tell, as
+/// CC-CEDICT has them: Pleco writes 週圍 for 周圍, `liu2//xia4` for 留下,
+/// and `deng3deng5` for 等等.
+const SAMPLE_WORDS: &str = "印象 印象 [yin4 xiang4] /impression/
+留下 留下 [liu2 xia4] /to leave behind/to stay behind/
+周圍 周围 [zhou1 wei2] /environs/surroundings/
+等等 等等 [deng3 deng3] /etc./and so on/
+";
+
+fn pleco_sample() -> Vec<u8> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/pleco/v1/samples/export-text.txt"),
+    )
+    .expect("fixture")
+}
+
+fn saved_as(conn: &Connection, simplified: &str) -> Vec<VocabItem> {
+    all(conn)
+        .into_iter()
+        .filter(|item| item.simplified == simplified)
+        .collect()
+}
+
+#[test]
+fn a_real_pleco_export_finds_the_words_already_saved() {
+    let mut conn = open_in_memory().unwrap();
+    let dict = dictionary_of(SAMPLE_WORDS.as_bytes());
+    for (simplified, traditional, pinyin) in [
+        ("印象", "印象", "yin4 xiang4"),
+        ("留下", "留下", "liu2 xia4"),
+        ("周围", "周圍", "zhou1 wei2"),
+    ] {
+        save_traditional(&conn, simplified, traditional, pinyin, "");
+    }
+    let bytes = pleco_sample();
+    let plan = plan_import(
+        &conn,
+        Some(&dict),
+        &Pleco,
+        &bytes,
+        "/tmp/export-text.txt",
+        ImportPolicy::default(),
+        false,
+    )
+    .unwrap();
+    let notes: Vec<&str> = plan.issues.iter().map(|i| i.message.as_str()).collect();
+    assert_eq!(
+        notes,
+        [
+            "the file writes 週圍; the dictionary's 周圍 is used",
+            "the file reads 等等 děngdeng; the dictionary's děng děng is used",
+        ]
+    );
+    let summary = apply_import(&mut conn, &plan, &content_hash(&bytes)).unwrap();
+    assert_eq!(
+        summary.updated, 3,
+        "印象, 留下, and 周围 joined Class Words"
+    );
+    for word in ["印象", "留下", "周围"] {
+        let saved = saved_as(&conn, word);
+        assert_eq!(saved.len(), 1, "one {word}: {saved:?}");
+        assert_eq!(
+            item_collections(&conn, saved[0].id).unwrap(),
+            vec!["Class Words"]
+        );
+    }
+    let etc = find(&conn, "等等");
+    assert_eq!(etc.pinyin, "deng3 deng3");
+    assert_eq!(etc.verification, Verification::Confirmed);
+    assert_eq!(etc.definition, "etc.; and so on");
+
+    let again = import_bytes(&mut conn, &dict, &bytes);
+    assert_eq!((again.inserted, again.updated), (0, 0), "nothing new");
+}
+
+/// An earlier import saved 周围 as the file wrote it, 週圍, unresolved.
+#[test]
+fn a_word_saved_as_the_file_writes_it_is_the_same_word() {
+    let mut conn = open_in_memory().unwrap();
+    let dict = dictionary_of(SAMPLE_WORDS.as_bytes());
+    let earlier = save_traditional(&conn, "周围", "週圍", "zhou1wei2", "");
+    let summary = import_bytes(
+        &mut conn,
+        &dict,
+        "//Places\n周围[週圍]\tzhou1wei2\n".as_bytes(),
+    );
+    assert_eq!(summary.inserted, 0);
+    assert_eq!(saved_as(&conn, "周围").len(), 1);
+    assert_eq!(item_collections(&conn, earlier).unwrap(), vec!["Places"]);
+}
+
+fn import_bytes(
+    conn: &mut Connection,
+    dict: &SqliteDictionary,
+    bytes: &[u8],
+) -> vocab_exchange::TransferSummary {
+    let plan = plan_import(
+        conn,
+        Some(dict),
+        &Pleco,
+        bytes,
+        "/tmp/in.txt",
+        ImportPolicy::default(),
+        false,
+    )
+    .unwrap();
+    apply_import(conn, &plan, &content_hash(bytes)).unwrap()
+}
+
+#[test]
+fn names_differing_in_case_spacing_or_underscores_are_one_group() {
+    let mut conn = open_in_memory().unwrap();
+    let hello = save(&conn, "你好", "ni3 hao3", "hello");
+    add_to_collection(&conn, hello, "Week 1").unwrap();
+    add_tag(&conn, hello, "my tag").unwrap();
+    import(
+        &mut conn,
+        &Pleco,
+        "//Week_1\n你好\tni3 hao3\n米饭\tmi3 fan4\n//week 1\n学校\txue2 xiao4\tschool\n",
+        ImportPolicy::default(),
+    );
+    let names: Vec<String> = vocab_db::collections(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|group| group.name)
+        .collect();
+    assert_eq!(names, ["Week 1"]);
+    assert_eq!(
+        item_collections(&conn, find(&conn, "米饭").id).unwrap(),
+        ["Week 1"]
+    );
+
+    // Anki writes spaces in tags as underscores; new names in one file
+    // agree with each other too.
+    let anki = "#separator:tab\n#deck:Lesson_2\n\
+                米饭\t米飯\tmi3 fan4\t\t\tmy_tag\n\
+                学校\t學校\txue2 xiao4\t\t\tMY_TAG new_one\n\
+                你好\t你好\tni3 hao3\t\t\tNew_One\n";
+    import(&mut conn, &Anki, anki, ImportPolicy::default());
+    let tags: Vec<String> = vocab_db::tags(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|group| group.name)
+        .collect();
+    assert_eq!(tags, ["my tag", "new_one"]);
+    assert_eq!(item_tags(&conn, hello).unwrap(), ["my tag", "new_one"]);
 }
 
 #[test]

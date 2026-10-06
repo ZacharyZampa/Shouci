@@ -22,7 +22,7 @@ final class ImportModel {
     }
     /// True when no other format reads the file as well.
     private(set) var detected = false
-    var policy: ImportPolicy = .merge {
+    var policy: ImportPolicy = defaultImportPolicy() {
         didSet { if policy != oldValue { refresh() } }
     }
     /// Import the readable lines of a file with error lines.

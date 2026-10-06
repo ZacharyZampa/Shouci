@@ -198,11 +198,25 @@ apply_import(plan)
 ```
 
 - **Error lines refuse the whole import** unless `force`, which skips them.
-- **Existing words** follow the policy: `skip` (default), `merge` (fill
-  blanks; differences are reported and the saved value kept), `overwrite`
-  (replace each field the file fills in).
+- **The same word** is the same characters and reading, however the tones
+  are written or spaced. When the file writes a word differently from the
+  one dictionary entry it can be, the entry is used and the line gets a
+  warning: a variant traditional form (Pleco's 週圍 for 周圍), or a neutral
+  tone where the entry has a full one (`deng3deng5` for 等等, `deng3 deng3`).
+  Only the file's neutral tones give way, and only when exactly one entry
+  fits. A word saved the way the file writes it still counts as the same
+  word.
+- **Existing words** follow the policy for their text: `merge` (the default
+  in every frontend, `ImportPolicy::default()`: fill blanks; differences are
+  reported and the saved value kept; a word in the trash comes back),
+  `skip` (keep the text; a word in the trash stays there), `overwrite`
+  (replace each field the file fills in). Every policy adds the file's tags
+  and collections.
 - **Nothing is lost**: a blank or missing field never changes a saved word,
   and tags and collections are only ever added.
+- **Names** are the library's own when only case, spaces, or underscores
+  differ (`week 1`, `Week_1` → `Week 1`; Anki writes spaces in tags as
+  `_`), so a file never splits one tag or collection in two.
 - **Format detection** (`detect_import`) previews with every connector and
   keeps the one with the fewest error lines, then the fewest unresolved or
   dropped words. It also says whether the choice was unambiguous (no other

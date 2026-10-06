@@ -110,7 +110,9 @@ Shouci moves words in and out as plain-text files.
 - **Import** (⇧⌘I): export from Pleco (Import/Export › Export Cards) or Anki
   (File › Export › Notes in Plain Text), then choose the file. Shouci detects
   the format and shows what each line would do before anything changes. For
-  words you already have, choose Skip, Merge, or Overwrite.
+  words you already have, choose Merge (fill in what's missing), Skip (keep
+  yours as it is), or Overwrite. Each choice adds the file's categories and
+  tags to them.
 - **Export** (⇧⌘E): choose Pleco or Anki and which words (new since the last
   export, everything, the selection, or the current view). The file goes to
   Downloads unless you choose another place. Then import it in Anki (File ›
