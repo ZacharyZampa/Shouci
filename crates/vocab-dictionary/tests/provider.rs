@@ -331,6 +331,16 @@ fn enrichment_writes_frequency_and_hsk_ranks() {
     assert!(stats.frequency_updated > 0);
     assert!(stats.hsk_updated > 0);
     let dictionary = SqliteDictionary::from_connection(conn).expect("open");
+    let ranked = dictionary.headword_ranks().expect("headword ranks");
+    let cat = ranked.iter().find(|e| e.simplified == "猫").expect("猫");
+    assert_eq!((cat.frequency_rank, cat.hsk_rank), (Some(3), Some(2)));
+    assert!(
+        ranked
+            .iter()
+            .all(|e| e.frequency_rank.is_some() || e.hsk_rank.is_some()),
+        "only headwords with a rank"
+    );
+    assert!(!ranked.iter().any(|e| e.simplified == "世界"), "unranked");
     let svc = SearchService::new(dictionary, vocab_search::DeterministicRanker::default());
     let ranked = svc.search_english("cat").expect("search");
     let cat = ranked

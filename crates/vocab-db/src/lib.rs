@@ -1,5 +1,5 @@
-//! `user.db`: saved words, their tags and collections, the transfer ledger,
-//! and settings.
+//! `user.db`: saved words, their tags and collections, smart collections,
+//! the transfer ledger, and settings.
 //!
 //! Plain SQLite and plain functions over a [`rusqlite::Connection`]; a
 //! [`rusqlite::Transaction`] works anywhere a connection does. The schema is
@@ -11,21 +11,27 @@ mod legacy;
 mod migrate;
 mod organize;
 mod settings;
+mod smart;
 mod transfer;
 
 pub use items::{
-    NewItem, Saved, find_by_identity, get_item, insert_item, list_items, purge_item, reading_key,
-    require_item, save_item, set_archived, set_source, set_trashed, set_verification, update_item,
+    NewItem, Saved, find_by_identity, find_saved, get_item, insert_item, list_headwords,
+    list_items, purge_item, reading_key, reinsert_item, require_item, restore_item, save_item,
+    set_archived, set_source, set_trashed, set_verification, update_item,
 };
 pub use legacy::{IMPORTED_SETTING as LEGACY_IMPORTED_SETTING, LegacyReport, import_poc_database};
 pub use migrate::SCHEMA_VERSION;
 pub use organize::{
-    NameCount, add_tag, add_to_collection, collection_from_tag, collections, collections_by_item,
-    create_collection, delete_collection, delete_tag, item_collections, item_tags,
-    remove_from_collection, remove_tag, rename_collection, rename_tag, set_collections, set_tags,
-    tags, tags_by_item,
+    NameCount, add_tag, add_to_collection, collection_from_tag, collection_in_use, collections,
+    collections_by_item, create_collection, create_tag, delete_collection, delete_tag,
+    item_collections, item_tags, merge_collections, merge_tags, remove_from_collection, remove_tag,
+    rename_collection, rename_tag, set_collections, set_tags, tag_in_use, tags, tags_by_item,
 };
 pub use settings::{get_setting, set_setting};
+pub use smart::{
+    SmartCollection, create_smart_collection, delete_smart_collection, rename_smart_collection,
+    smart_collection, smart_collections, update_smart_collection,
+};
 pub use transfer::{
     Direction, Outcome, RunCounts, RunRecord, RunStatus, destinations_by_item, import_sources,
     item_destinations, items_at, record_item, record_run,

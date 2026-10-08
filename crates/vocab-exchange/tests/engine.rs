@@ -597,7 +597,7 @@ fn needs_review_and_trash_stay_home() {
         &ExportRequest::default(),
     )
     .unwrap();
-    assert_eq!(plan.item_ids, []);
+    assert_eq!(plan.item_ids, Vec::<i64>::new());
     assert_eq!(plan.left_out_needs_review, 1);
     let with_review = ExportRequest {
         include_needs_review: true,

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -242,8 +243,89 @@ impl FromStr for LibraryView {
     }
 }
 
-/// Narrows a library listing, search, or export. Every condition must hold.
-/// Every field is optional in JSON.
+/// Where a word stands in the dictionaries' frequency list, in the bands
+/// the library sorts and filters by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum FrequencyBand {
+    /// The 1,000 most common words.
+    Top1000,
+    /// Ranks 1,001–5,000.
+    To5000,
+    /// Ranks 5,001–10,000.
+    To10000,
+    /// Past rank 10,000.
+    Beyond10000,
+    /// Not in the list at all.
+    Unlisted,
+}
+
+impl FrequencyBand {
+    /// Most common first.
+    pub const ALL: [Self; 5] = [
+        Self::Top1000,
+        Self::To5000,
+        Self::To10000,
+        Self::Beyond10000,
+        Self::Unlisted,
+    ];
+
+    /// The band of a frequency rank (1 the most common); `None` is a word
+    /// not in the list.
+    #[must_use]
+    pub fn of(rank: Option<u64>) -> Self {
+        match rank {
+            None => Self::Unlisted,
+            Some(rank) => Self::ALL
+                .into_iter()
+                .find(|band| band.ceiling().is_some_and(|ceiling| rank <= ceiling))
+                .unwrap_or(Self::Beyond10000),
+        }
+    }
+
+    /// The last rank in the band; `None` for the open-ended bands.
+    #[must_use]
+    pub fn ceiling(self) -> Option<u64> {
+        match self {
+            Self::Top1000 => Some(1_000),
+            Self::To5000 => Some(5_000),
+            Self::To10000 => Some(10_000),
+            Self::Beyond10000 | Self::Unlisted => None,
+        }
+    }
+
+    /// Form for people: `Top 1,000`, `1,001–5,000`.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Top1000 => "Top 1,000",
+            Self::To5000 => "1,001–5,000",
+            Self::To10000 => "5,001–10,000",
+            Self::Beyond10000 => "Beyond 10,000",
+            Self::Unlisted => "Not in the frequency list",
+        }
+    }
+
+    /// Form for people where space is short: `Top 1k`, `1k–5k`.
+    #[must_use]
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Top1000 => "Top 1k",
+            Self::To5000 => "1k–5k",
+            Self::To10000 => "5k–10k",
+            Self::Beyond10000 => "10k+",
+            Self::Unlisted => "Unlisted",
+        }
+    }
+}
+
+/// Narrows a library listing, search, or export. Every condition must hold;
+/// within one that names several values, any of them will do. Every field
+/// is optional in JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(
     feature = "serde",
@@ -256,11 +338,100 @@ pub struct LibraryFilter {
     /// Items carrying every one of these tags.
     pub tags: Vec<String>,
     pub collection: Option<String>,
+    /// Only items in no collection: the ones not yet sorted into one.
+    pub no_collection: bool,
+    /// Items carrying at least one of these tags.
+    pub any_tags: Vec<String>,
+    /// Items carrying none of these tags.
+    pub without_tags: Vec<String>,
+    /// Items in at least one of these collections.
+    pub any_collections: Vec<String>,
+    /// Items in none of these collections.
+    pub without_collections: Vec<String>,
+    /// Items added in the last this many days.
+    pub added_within_days: Option<u32>,
+    /// Items at any of these HSK levels: 1–6, 7 for the advanced band
+    /// (7–9), and 0 for words at none. Levels come from the dictionaries,
+    /// so the core checks this, not the database ([`Self::admits_ranks`]).
+    pub hsk_levels: Vec<u64>,
+    /// Items in any of these bands of the frequency list. Checked by the
+    /// core, like `hsk_levels`.
+    pub frequency_bands: Vec<FrequencyBand>,
+}
+
+impl LibraryFilter {
+    /// Whether anything narrows the words, besides which of them (active,
+    /// archived, or both) the filter covers.
+    #[must_use]
+    pub fn has_conditions(&self) -> bool {
+        *self
+            != Self {
+                view: self.view,
+                ..Self::default()
+            }
+    }
+
+    /// Whether two filters ask for the same words: values in any order, and
+    /// names compared as the library compares them (trimmed, ignoring ASCII
+    /// case).
+    #[must_use]
+    pub fn same_conditions(&self, other: &Self) -> bool {
+        self.normalized() == other.normalized()
+    }
+
+    /// Every value once, in order, and names lowercased.
+    fn normalized(&self) -> Self {
+        fn names(names: &[String]) -> Vec<String> {
+            let names: BTreeSet<String> = names
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .collect();
+            names.into_iter().collect()
+        }
+        fn sorted<T: Ord + Copy>(values: &[T]) -> Vec<T> {
+            let values: BTreeSet<T> = values.iter().copied().collect();
+            values.into_iter().collect()
+        }
+        Self {
+            tags: names(&self.tags),
+            collection: self
+                .collection
+                .as_deref()
+                .map(|name| name.trim().to_ascii_lowercase()),
+            any_tags: names(&self.any_tags),
+            without_tags: names(&self.without_tags),
+            any_collections: names(&self.any_collections),
+            without_collections: names(&self.without_collections),
+            hsk_levels: sorted(&self.hsk_levels),
+            frequency_bands: sorted(&self.frequency_bands),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the filter asks for HSK levels or frequency bands, which only
+    /// the dictionaries can answer.
+    #[must_use]
+    pub fn asks_ranks(&self) -> bool {
+        !self.hsk_levels.is_empty() || !self.frequency_bands.is_empty()
+    }
+
+    /// Whether a word with these ranks meets the HSK and frequency
+    /// conditions. `hsk` is the dictionaries' level (7 and up is the
+    /// advanced band); `frequency` its place in the frequency list.
+    #[must_use]
+    pub fn admits_ranks(&self, hsk: Option<u64>, frequency: Option<u64>) -> bool {
+        let level = hsk.map_or(0, |level| level.min(7));
+        (self.hsk_levels.is_empty() || self.hsk_levels.contains(&level))
+            && (self.frequency_bands.is_empty()
+                || self.frequency_bands.contains(&FrequencyBand::of(frequency)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemSource, Lifecycle, Verification, VocabItem};
+    use super::{
+        FrequencyBand, ItemSource, LibraryFilter, LibraryView, Lifecycle, Verification, VocabItem,
+    };
 
     fn item() -> VocabItem {
         VocabItem {
@@ -296,5 +467,61 @@ mod tests {
             assert_eq!(value.as_str().parse::<Verification>().unwrap(), value);
         }
         assert!("exported".parse::<Verification>().is_err());
+    }
+
+    #[test]
+    fn frequency_bands_end_at_their_ceilings() {
+        assert_eq!(FrequencyBand::of(Some(1)), FrequencyBand::Top1000);
+        assert_eq!(FrequencyBand::of(Some(1_000)), FrequencyBand::Top1000);
+        assert_eq!(FrequencyBand::of(Some(1_001)), FrequencyBand::To5000);
+        assert_eq!(FrequencyBand::of(Some(10_000)), FrequencyBand::To10000);
+        assert_eq!(FrequencyBand::of(Some(10_001)), FrequencyBand::Beyond10000);
+        assert_eq!(FrequencyBand::of(None), FrequencyBand::Unlisted);
+    }
+
+    #[test]
+    fn rank_conditions_take_any_of_their_values() {
+        let filter = LibraryFilter {
+            hsk_levels: vec![4, 0],
+            frequency_bands: vec![FrequencyBand::Top1000, FrequencyBand::Unlisted],
+            ..LibraryFilter::default()
+        };
+        assert!(filter.asks_ranks());
+        assert!(filter.admits_ranks(Some(4), Some(900)));
+        assert!(filter.admits_ranks(None, None), "no level, not listed");
+        assert!(!filter.admits_ranks(Some(3), Some(900)));
+        assert!(!filter.admits_ranks(Some(4), Some(2_000)));
+        let advanced = LibraryFilter {
+            hsk_levels: vec![7],
+            ..LibraryFilter::default()
+        };
+        assert!(advanced.admits_ranks(Some(9), None), "7–9 is one band");
+        assert!(!LibraryFilter::default().asks_ranks());
+        assert!(LibraryFilter::default().admits_ranks(None, None));
+    }
+
+    #[test]
+    fn conditions_compare_whatever_their_order() {
+        let archived = LibraryFilter {
+            view: LibraryView::Archived,
+            ..LibraryFilter::default()
+        };
+        assert!(!archived.has_conditions(), "which words, not a condition");
+        let filter = LibraryFilter {
+            any_tags: vec!["Pets".to_owned(), "food".to_owned()],
+            hsk_levels: vec![4, 1],
+            ..LibraryFilter::default()
+        };
+        assert!(filter.has_conditions());
+        let reordered = LibraryFilter {
+            any_tags: vec!["food".to_owned(), " pets".to_owned(), "FOOD".to_owned()],
+            hsk_levels: vec![1, 4],
+            ..LibraryFilter::default()
+        };
+        assert!(filter.same_conditions(&reordered));
+        assert!(!filter.same_conditions(&LibraryFilter {
+            view: LibraryView::All,
+            ..reordered
+        }));
     }
 }

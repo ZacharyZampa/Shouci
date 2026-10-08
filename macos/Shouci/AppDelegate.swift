@@ -101,6 +101,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         libraryModel.transfer = .exporting
     }
 
+    @objc func fileInCollection(_ sender: Any?) {
+        openLibrary()
+        libraryModel.startFiling()
+    }
+
     @objc func findInLibrary(_ sender: Any?) {
         openLibrary()
         libraryModel.focusSearch()
@@ -219,6 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         edit.addItem(item("Paste", #selector(NSText.paste(_:)), key: "v"))
         edit.addItem(item("Select All", #selector(NSText.selectAll(_:)), key: "a"))
         edit.addItem(.separator())
+        edit.addItem(item("File in Collection…", #selector(fileInCollection(_:)), key: "C", target: self))
         edit.addItem(item("Find", #selector(findInLibrary(_:)), key: "f", target: self))
         let window = NSMenu(title: "Window")
         window.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), key: "m"))

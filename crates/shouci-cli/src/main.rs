@@ -16,9 +16,10 @@ use std::time::Duration;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use shouci_core::{
-    BulkAction, Config, DictionaryEntryView, DictionaryStatus, Error, ExportRequest, ExportScope,
-    ImportPolicy, ItemPatch, ItemView, LibraryFilter, LibraryView, LoadingStage, ManualWord,
-    QueryKind, QuickAdd, Result, SaveOutcome, SaveResult, Shouci, TransferSummary, Verification,
+    BulkAction, Config, DictionaryEntryView, DictionaryStatus, Error, ErrorKind, ExportRequest,
+    ExportScope, FrequencyBand, ImportPolicy, ItemPatch, ItemView, LibraryFilter, LibraryView,
+    LoadingStage, ManualWord, QueryKind, QuickAdd, Result, SaveOutcome, SaveResult, Shouci,
+    TransferSummary, Verification,
 };
 
 use crate::text::counted;
@@ -78,6 +79,12 @@ enum Command {
     Collections {
         #[command(subcommand)]
         action: Option<CollectionAction>,
+    },
+    /// List smart collections (saved filters), or save, rename, and delete
+    /// them.
+    Smart {
+        #[command(subcommand)]
+        action: Option<SmartAction>,
     },
     /// List dictionaries, choose which to search, or update them.
     Dictionaries {
@@ -194,6 +201,22 @@ struct ListArgs {
 
 #[derive(Args)]
 struct FilterArgs {
+    #[command(flatten)]
+    conditions: Conditions,
+    /// The words of this smart collection (`shouci smart list`). Listed
+    /// one by one rather than as the `Conditions` group, so the error names
+    /// the option given; `smart_takes_no_other_condition` checks the list.
+    #[arg(long, value_name = "NAME", conflicts_with_all = [
+        "view", "needs_review", "confirmed", "tags", "any_tags", "without_tags", "collection",
+        "any_collections", "without_collections", "no_collection", "hsk", "frequency",
+        "added_within",
+    ])]
+    smart: Option<String>,
+}
+
+/// What the words must be.
+#[derive(Args)]
+struct Conditions {
     /// Which words.
     #[arg(long, value_enum, default_value_t = View::Active)]
     view: View,
@@ -206,9 +229,78 @@ struct FilterArgs {
     /// Only words with this tag (repeat to require several).
     #[arg(long = "tag", value_name = "TAG")]
     tags: Vec<String>,
+    /// Only words with any of these tags (repeat).
+    #[arg(long = "any-tag", value_name = "TAG")]
+    any_tags: Vec<String>,
+    /// Leave out words with this tag (repeat).
+    #[arg(long = "without-tag", value_name = "TAG")]
+    without_tags: Vec<String>,
     /// Only words in this collection.
     #[arg(long, value_name = "NAME")]
     collection: Option<String>,
+    /// Only words in any of these collections (repeat).
+    #[arg(long = "any-collection", value_name = "NAME")]
+    any_collections: Vec<String>,
+    /// Leave out words in this collection (repeat).
+    #[arg(long = "without-collection", value_name = "NAME")]
+    without_collections: Vec<String>,
+    /// Only words in no collection yet.
+    #[arg(long, conflicts_with_all = ["collection", "any_collections"])]
+    no_collection: bool,
+    /// Only words at this HSK level: 1 to 6, 7-9, or none (repeat for any
+    /// of several). Needs the dictionary.
+    #[arg(long = "hsk", value_name = "LEVEL", value_parser = parse_hsk)]
+    hsk: Vec<u64>,
+    /// Only words in this band of the frequency list (repeat for any of
+    /// several). Needs the dictionary.
+    #[arg(long = "frequency", value_enum, value_name = "BAND")]
+    frequency: Vec<Band>,
+    /// Only words added in the last DAYS days.
+    #[arg(long = "added-within", value_name = "DAYS")]
+    added_within: Option<u32>,
+}
+
+/// A band of the frequency list.
+#[derive(Clone, Copy, ValueEnum)]
+enum Band {
+    /// The 1,000 most common words.
+    #[value(name = "top-1000")]
+    Top1000,
+    /// Ranks 1,001 to 5,000.
+    #[value(name = "to-5000")]
+    To5000,
+    /// Ranks 5,001 to 10,000.
+    #[value(name = "to-10000")]
+    To10000,
+    /// Past rank 10,000.
+    #[value(name = "beyond-10000")]
+    Beyond10000,
+    /// Not in the frequency list.
+    Unlisted,
+}
+
+impl From<Band> for FrequencyBand {
+    fn from(band: Band) -> Self {
+        match band {
+            Band::Top1000 => Self::Top1000,
+            Band::To5000 => Self::To5000,
+            Band::To10000 => Self::To10000,
+            Band::Beyond10000 => Self::Beyond10000,
+            Band::Unlisted => Self::Unlisted,
+        }
+    }
+}
+
+/// `4`, `7-9` (stored as 7), or `none` (0).
+fn parse_hsk(level: &str) -> std::result::Result<u64, String> {
+    match level.trim().to_lowercase().as_str() {
+        "none" | "0" => Ok(0),
+        "7-9" | "7–9" | "7" | "8" | "9" => Ok(7),
+        other => match other.parse::<u64>() {
+            Ok(level @ 1..=6) => Ok(level),
+            _ => Err("expected 1 to 6, 7-9, or none".to_owned()),
+        },
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -222,6 +314,16 @@ enum View {
 }
 
 impl FilterArgs {
+    /// The filter the options ask for, or the smart collection's.
+    fn filter(&self, shouci: &Shouci) -> Result<LibraryFilter> {
+        if let Some(name) = &self.smart {
+            return Ok(shouci.smart_collection(name)?.filter);
+        }
+        Ok(self.conditions.filter())
+    }
+}
+
+impl Conditions {
     fn filter(&self) -> LibraryFilter {
         LibraryFilter {
             view: match self.view {
@@ -239,6 +341,14 @@ impl FilterArgs {
             },
             tags: self.tags.clone(),
             collection: self.collection.clone(),
+            no_collection: self.no_collection,
+            any_tags: self.any_tags.clone(),
+            without_tags: self.without_tags.clone(),
+            any_collections: self.any_collections.clone(),
+            without_collections: self.without_collections.clone(),
+            added_within_days: self.added_within,
+            hsk_levels: self.hsk.clone(),
+            frequency_bands: self.frequency.iter().copied().map(Into::into).collect(),
         }
     }
 }
@@ -315,6 +425,11 @@ enum TagAction {
         from: String,
         to: String,
     },
+    /// Give every word tagged FROM the tag INTO instead, and delete FROM.
+    Merge {
+        from: String,
+        into: String,
+    },
     /// Delete a tag. Its words stay.
     Delete {
         tag: String,
@@ -345,7 +460,35 @@ enum CollectionAction {
         from: String,
         to: String,
     },
+    /// Put every word of FROM into INTO, and delete FROM.
+    Merge {
+        from: String,
+        into: String,
+    },
     /// Delete a collection. Its words stay.
+    Delete {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+// Parsed once, at startup: the size of `Save` costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum SmartAction {
+    /// List smart collections, what each asks for, and how many words match.
+    List,
+    /// Save the filter the options ask for as a smart collection, or give
+    /// one a new filter. `shouci list --smart NAME` lists its words.
+    Save {
+        name: String,
+        #[command(flatten)]
+        conditions: Conditions,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Delete a smart collection. Its words stay.
     Delete {
         name: String,
     },
@@ -502,6 +645,7 @@ fn run(command: Command, out: Out) -> Result<ExitCode> {
         Command::Collections { action } => {
             collections(action.unwrap_or(CollectionAction::List), out)
         }
+        Command::Smart { action } => smart(action.unwrap_or(SmartAction::List), out),
         Command::Dictionaries { action } => {
             dictionaries(action.unwrap_or(DictionaryAction::List), out)
         }
@@ -597,12 +741,19 @@ fn open_searchable() -> Result<Shouci> {
 /// that work without them.
 fn open_maybe_searchable() -> Result<Shouci> {
     let shouci = open(false)?;
+    load_if_installed(&shouci)?;
+    Ok(shouci)
+}
+
+/// Loads the dictionaries when any are installed. A failed load is noted,
+/// not an error.
+fn load_if_installed(shouci: &Shouci) -> Result<()> {
     if !shouci.dictionaries()?.is_empty() {
-        if let Err(err) = load(&shouci) {
+        if let Err(err) = load(shouci) {
             note(&format!("{err}; going on without the dictionary"));
         }
     }
-    Ok(shouci)
+    Ok(())
 }
 
 /// Loads the dictionaries, saying what a long load is doing.
@@ -833,7 +984,14 @@ fn clipboard() -> Result<String> {
 fn list(args: &ListArgs, out: Out) -> Result<ExitCode> {
     let shouci = open(false)?;
     let query = args.query.join(" ");
-    let found = shouci.search_library(&query, &args.filter.filter(), None, args.limit)?;
+    let filter = args.filter.filter(&shouci)?;
+    // With the dictionaries, words carry their HSK level and frequency:
+    // what the filter or `--json` needs, but not the lines printed.
+    if out.json || filter.asks_ranks() {
+        load_if_installed(&shouci)?;
+    }
+    note_unranked(&shouci, &filter);
+    let found = shouci.search_library(&query, &filter, None, args.limit)?;
     out.show(&found, || {
         if found.items.is_empty() {
             return if query.trim().is_empty() {
@@ -867,7 +1025,7 @@ struct Lookup {
 }
 
 fn show(args: &WordArg, out: Out) -> Result<ExitCode> {
-    let shouci = open(false)?;
+    let shouci = open_maybe_searchable()?;
     let item = Words::load(&shouci)?
         .find(&args.word, Among::Saved)?
         .clone();
@@ -990,6 +1148,10 @@ fn tags(action: TagAction, out: Out) -> Result<ExitCode> {
             shouci.rename_tag(&from, &to)?;
             out.show(&shouci.tags()?, || format!("renamed tag {from} to {to}"))
         }
+        TagAction::Merge { from, into } => {
+            shouci.merge_tags(&from, &into)?;
+            out.show(&shouci.tags()?, || format!("merged tag {from} into {into}"))
+        }
         TagAction::Delete { tag } => {
             shouci.delete_tag(&tag)?;
             out.show(&shouci.tags()?, || {
@@ -1032,6 +1194,12 @@ fn collections(action: CollectionAction, out: Out) -> Result<ExitCode> {
             shouci.rename_collection(&from, &to)?;
             out.show(&shouci.collections()?, || {
                 format!("renamed collection {from} to {to}")
+            })
+        }
+        CollectionAction::Merge { from, into } => {
+            shouci.merge_collections(&from, &into)?;
+            out.show(&shouci.collections()?, || {
+                format!("merged collection {from} into {into}")
             })
         }
         CollectionAction::Delete { name } => {
@@ -1092,6 +1260,73 @@ fn import(args: &ImportArgs, out: Out) -> Result<ExitCode> {
     })
 }
 
+fn smart(action: SmartAction, out: Out) -> Result<ExitCode> {
+    // Counts need the dictionary for HSK levels and frequency.
+    let shouci = open_maybe_searchable()?;
+    match action {
+        SmartAction::List => {
+            let smart = shouci.smart_collections()?;
+            if let Some(ranked) = smart.iter().find(|smart| smart.filter.asks_ranks()) {
+                note_unranked(&shouci, &ranked.filter);
+            }
+            out.show(&smart, || text::smart_lines(&smart))
+        }
+        SmartAction::Save { name, conditions } => {
+            let filter = conditions.filter();
+            note_unranked(&shouci, &filter);
+            let (saved, done) = match shouci.smart_collection(&name) {
+                Ok(existing) => (
+                    shouci.update_smart_collection(&existing.name, &filter)?,
+                    "changed",
+                ),
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    (shouci.create_smart_collection(&name, &filter)?, "saved")
+                }
+                Err(err) => return Err(err),
+            };
+            out.show(&saved, || {
+                format!(
+                    "{done} smart collection {} ({}): {}",
+                    saved.name,
+                    counted(text::count(saved.item_ids.len()), "word", "words"),
+                    text::filter_description(&saved.filter)
+                )
+            })
+        }
+        SmartAction::Rename { from, to } => {
+            shouci.rename_smart_collection(&from, &to)?;
+            out.show(&shouci.smart_collections()?, || {
+                format!("renamed smart collection {from} to {to}")
+            })
+        }
+        SmartAction::Delete { name } => {
+            shouci.delete_smart_collection(&name)?;
+            out.show(&shouci.smart_collections()?, || {
+                format!("deleted smart collection {name}; its words are still saved")
+            })
+        }
+    }
+}
+
+/// Says why a filter on HSK levels or frequency finds what it does when
+/// the dictionary that gives them isn't loaded.
+fn note_unranked(shouci: &Shouci, filter: &LibraryFilter) {
+    if !filter.asks_ranks() || matches!(shouci.dictionary_status(), DictionaryStatus::Ready { .. })
+    {
+        return;
+    }
+    let installed = shouci
+        .dictionaries()
+        .is_ok_and(|installed| !installed.is_empty());
+    note(if installed {
+        "HSK levels and frequency come from the dictionary, which couldn't be loaded, so no word \
+         has them"
+    } else {
+        "HSK levels and frequency come from the dictionary, which isn't installed, so no word \
+         has them; `shouci dictionaries update` installs it"
+    });
+}
+
 fn export(args: ExportArgs, out: Out) -> Result<ExitCode> {
     let shouci = open_maybe_searchable()?;
     let scope = if !args.words.is_empty() {
@@ -1102,7 +1337,8 @@ fn export(args: ExportArgs, out: Out) -> Result<ExitCode> {
     } else {
         ExportScope::New
     };
-    let filter = args.filter.filter();
+    let filter = args.filter.filter(&shouci)?;
+    note_unranked(&shouci, &filter);
     let request = ExportRequest {
         scope,
         include_needs_review: args.include_needs_review
@@ -1177,7 +1413,7 @@ fn migrate(args: MigrateArgs, out: Out) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     use super::{Cli, ItemView, names};
 
@@ -1187,8 +1423,45 @@ mod tests {
     }
 
     #[test]
+    fn smart_takes_no_other_condition() {
+        let mut command = Cli::command();
+        command.build();
+        let list = command.find_subcommand("list").unwrap();
+        let smart = list
+            .get_arguments()
+            .find(|arg| arg.get_id() == "smart")
+            .unwrap();
+        let conflicts: Vec<String> = list
+            .get_arg_conflicts_with(smart)
+            .iter()
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        let conditions = list
+            .get_groups()
+            .find(|group| group.get_id() == "Conditions")
+            .unwrap();
+        for condition in conditions.get_args() {
+            assert!(
+                conflicts.contains(&condition.to_string()),
+                "--smart must conflict with {condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_smart_collection_is_saved_from_conditions_only() {
+        let save = |extra: &[&str]| {
+            let args = ["shouci", "smart", "save", "Mine"].iter().chain(extra);
+            Cli::try_parse_from(args).map(|_| ())
+        };
+        assert!(save(&["--hsk", "4"]).is_ok());
+        assert!(save(&["--smart", "Other"]).is_err());
+    }
+
+    #[test]
     fn names_read_as_a_list() {
-        let item = |simplified: &str| ItemView {
+        let item = |simplified: &str| {
+            ItemView {
             simplified: simplified.to_owned(),
             ..serde_json::from_value(serde_json::json!({
                 "id": 1, "simplified": "", "traditional": "", "pinyin": "",
@@ -1196,10 +1469,11 @@ mod tests {
                 "notes": "", "verification": "confirmed", "lifecycle": "active",
                 "source": { "kind": "manual", "id": null, "version": null, "import_origin": null },
                 "tags": [], "collections": [], "destinations": [],
-                "created_at": "", "modified_at": "", "archived_at": null, "deleted_at": null,
+                "frequency_band": "unlisted", "created_at": "", "modified_at": "", "archived_at": null, "deleted_at": null,
                 "rev": 1
             }))
             .unwrap()
+        }
         };
         let (a, b, c) = (item("学校"), item("猫"), item("米饭"));
         assert_eq!(names(&[&a]), "学校");

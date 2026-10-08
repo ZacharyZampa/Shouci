@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use shouci_core::{
     BulkAction, BulkResult, CandidateView, Config, ConnectorView, DictionaryEntryView,
-    DictionaryResults, DictionaryStatus, DictionaryView, ErrorKind, ExportRequest, GroupView,
-    ImportPolicy, ItemPatch, ItemView, LegacyImport, LibraryFilter, LibraryResults, ManualWord,
-    QueryKind, QuickAdd, SaveResult, Shouci, TransferSummary,
+    DictionaryResults, DictionaryStatus, DictionaryView, ErrorKind, ExportRequest,
+    FilterConditionView, FrequencyBandView, GroupView, HskLevelView, ImportPolicy, ItemPatch,
+    ItemView, LegacyImport, LibraryFilter, LibraryResults, LibrarySnapshot, ManualWord, QueryKind,
+    QuickAdd, SaveResult, Shouci, SmartCollectionView, TransferSummary,
 };
 
 mod remote;
@@ -116,6 +117,54 @@ pub fn tone_marks(pinyin: &str) -> String {
 #[must_use]
 pub fn display_definition(definition: &str) -> String {
     shouci_core::text::display_definition(definition)
+}
+
+/// `HSK 3`, or `HSK 7–9` for the advanced band (stored as 7).
+#[uniffi::export]
+#[must_use]
+pub fn hsk_level(rank: u64) -> String {
+    shouci_core::text::hsk_level(rank)
+}
+
+/// The bands of the frequency list, most common first, with their names.
+#[uniffi::export]
+#[must_use]
+pub fn frequency_bands() -> Vec<FrequencyBandView> {
+    shouci_core::text::frequency_bands()
+}
+
+/// The HSK levels a filter can ask for, in order, with their names.
+#[uniffi::export]
+#[must_use]
+pub fn hsk_levels() -> Vec<HskLevelView> {
+    shouci_core::text::hsk_levels()
+}
+
+/// A filter's conditions, worded for people, each with the filter that
+/// taking it off leaves.
+#[uniffi::export]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)] // `UniFFI` hands every argument over owned
+pub fn filter_conditions(filter: LibraryFilter) -> Vec<FilterConditionView> {
+    shouci_core::text::filter_conditions(&filter)
+}
+
+/// Whether anything narrows the words, besides which of them (active,
+/// archived, or both) the filter covers.
+#[uniffi::export]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)] // `UniFFI` hands every argument over owned
+pub fn filter_has_conditions(filter: LibraryFilter) -> bool {
+    filter.has_conditions()
+}
+
+/// Whether two filters ask for the same words, whatever order their values
+/// are in.
+#[uniffi::export]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)] // `UniFFI` hands every argument over owned
+pub fn same_conditions(a: LibraryFilter, b: LibraryFilter) -> bool {
+    a.same_conditions(&b)
 }
 
 /// What an import does with words already saved until someone chooses,
@@ -240,6 +289,10 @@ impl Core {
         Ok(self.shouci.add_manual(&word)?)
     }
 
+    pub fn manual_match(&self, word: ManualWord) -> Result<Option<i64>> {
+        Ok(self.shouci.manual_match(&word)?)
+    }
+
     pub fn list_items(&self, filter: LibraryFilter) -> Result<Vec<ItemView>> {
         Ok(self.shouci.list_items(&filter)?)
     }
@@ -277,6 +330,21 @@ impl Core {
         Ok(self.shouci.rename_tag(&from, &to)?)
     }
 
+    /// The words `ids` as they are now, for an undo.
+    pub fn snapshot(&self, ids: Vec<i64>) -> Result<LibrarySnapshot> {
+        Ok(self.shouci.snapshot(&ids)?)
+    }
+
+    /// Puts words back as `target` has them, unless they differ from
+    /// `current` now.
+    pub fn restore(&self, target: LibrarySnapshot, current: LibrarySnapshot) -> Result<()> {
+        Ok(self.shouci.restore(&target, &current)?)
+    }
+
+    pub fn merge_tags(&self, from: String, into: String) -> Result<()> {
+        Ok(self.shouci.merge_tags(&from, &into)?)
+    }
+
     pub fn delete_tag(&self, name: String) -> Result<()> {
         Ok(self.shouci.delete_tag(&name)?)
     }
@@ -293,12 +361,48 @@ impl Core {
         Ok(self.shouci.rename_collection(&from, &to)?)
     }
 
+    pub fn merge_collections(&self, from: String, into: String) -> Result<()> {
+        Ok(self.shouci.merge_collections(&from, &into)?)
+    }
+
     pub fn delete_collection(&self, name: String) -> Result<()> {
         Ok(self.shouci.delete_collection(&name)?)
     }
 
     pub fn collection_from_tag(&self, tag: String) -> Result<GroupView> {
         Ok(self.shouci.collection_from_tag(&tag)?)
+    }
+
+    pub fn matching_ids(&self, filter: LibraryFilter) -> Result<Vec<i64>> {
+        Ok(self.shouci.matching_ids(&filter)?)
+    }
+
+    pub fn smart_collections(&self) -> Result<Vec<SmartCollectionView>> {
+        Ok(self.shouci.smart_collections()?)
+    }
+
+    pub fn create_smart_collection(
+        &self,
+        name: String,
+        filter: LibraryFilter,
+    ) -> Result<SmartCollectionView> {
+        Ok(self.shouci.create_smart_collection(&name, &filter)?)
+    }
+
+    pub fn update_smart_collection(
+        &self,
+        name: String,
+        filter: LibraryFilter,
+    ) -> Result<SmartCollectionView> {
+        Ok(self.shouci.update_smart_collection(&name, &filter)?)
+    }
+
+    pub fn rename_smart_collection(&self, from: String, to: String) -> Result<()> {
+        Ok(self.shouci.rename_smart_collection(&from, &to)?)
+    }
+
+    pub fn delete_smart_collection(&self, name: String) -> Result<()> {
+        Ok(self.shouci.delete_smart_collection(&name)?)
     }
 
     #[must_use]

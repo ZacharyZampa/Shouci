@@ -163,12 +163,14 @@ impl Shouci {
         let connector = self.connectors.get(connector)?;
         let path = absolute(path)?;
         let loaded = self.loaded_opt();
-        vocab_exchange::plan_export(
+        let ranks = loaded.as_deref().map(crate::dictionaries::Loaded::ranks);
+        vocab_exchange::plan_export_where(
             &*self.reader()?,
             loaded.as_deref().map(crate::dictionaries::Loaded::provider),
             connector,
             &text(&path),
             request,
+            &|item| crate::library::admits(&request.filter, ranks, &item.simplified),
         )
     }
 

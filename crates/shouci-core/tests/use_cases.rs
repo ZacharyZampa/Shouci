@@ -5,9 +5,10 @@ use std::path::Path;
 
 use shouci_core::testing::{empty_sandbox, install_dictionary, sandbox, scratch_dir};
 use shouci_core::{
-    BulkAction, Config, DictionaryStatus, ErrorKind, ExportRequest, ExportScope, ImportAction,
-    ImportPolicy, ItemPatch, LibraryFilter, LibraryView, Lifecycle, ManualWord, MatchBasis,
-    QueryKind, QuickAdd, SaveOutcome, Shouci, SourceKind, Verification,
+    BulkAction, Config, DictionaryStatus, ErrorKind, ExportRequest, ExportScope, FrequencyBand,
+    ImportAction, ImportPolicy, ItemPatch, LibraryFilter, LibraryView, Lifecycle, ManualWord,
+    MatchBasis, QueryKind, QuickAdd, SaveOutcome, Shouci, SmartCollectionView, SourceKind,
+    Verification,
 };
 
 fn saved(found: QuickAdd) -> shouci_core::SaveResult {
@@ -394,6 +395,268 @@ fn collections_organize_words() {
 }
 
 #[test]
+fn words_not_yet_in_a_collection_have_a_view_of_their_own() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    saved(shouci.quick_add("旅行", None).unwrap());
+    shouci
+        .bulk(
+            &[school],
+            &BulkAction::AddToCollection("Lesson 1".to_owned()),
+        )
+        .unwrap();
+    let unsorted = LibraryFilter {
+        no_collection: true,
+        ..LibraryFilter::default()
+    };
+    assert_eq!(heads(&shouci, &unsorted), ["旅行"]);
+}
+
+#[test]
+fn a_tag_or_collection_merges_into_another() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let travel = saved(shouci.quick_add("旅行", None).unwrap()).item.id;
+    shouci
+        .bulk(&[school], &BulkAction::AddToCollection("Week_1".to_owned()))
+        .unwrap();
+    shouci
+        .bulk(&[travel], &BulkAction::AddToCollection("Week 1".to_owned()))
+        .unwrap();
+    shouci
+        .bulk(
+            &[school, travel],
+            &BulkAction::AddTags(vec!["HSK1".to_owned()]),
+        )
+        .unwrap();
+    shouci
+        .bulk(&[school], &BulkAction::AddTags(vec!["HSK 1".to_owned()]))
+        .unwrap();
+    assert_eq!(
+        shouci
+            .rename_collection("Week_1", "week 1")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict,
+        "renaming onto a name in use is a merge, asked for as one"
+    );
+
+    shouci.merge_collections("Week_1", "Week 1").unwrap();
+    shouci.merge_tags("hsk1", "HSK 1").unwrap();
+
+    let collections = shouci.collections().unwrap();
+    assert_eq!(collections.len(), 1);
+    assert_eq!(
+        (collections[0].name.as_str(), collections[0].count),
+        ("Week 1", 2)
+    );
+    assert_eq!(shouci.item(travel).unwrap().tags, ["HSK 1"]);
+    assert_eq!(shouci.tags().unwrap().len(), 1);
+    assert_eq!(
+        shouci.merge_tags("missing", "HSK 1").unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// Installs the fixture dictionary with frequency and HSK layers: 水 and
+/// 学校 are HSK 1, 猫 and 旅行 HSK 2, and all four are in the top 1,000.
+fn install_ranked_dictionary(shouci: &Shouci) {
+    let fixture = |name: &str| {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/dictionary")
+                .join(name),
+        )
+        .unwrap()
+    };
+    let (frequency, hsk) = (fixture("frequency-sample.txt"), fixture("hsk-sample.txt"));
+    let path =
+        vocab_dictionary::catalog::dictionary_path(&shouci.config().dictionaries_dir, "cc-cedict");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    vocab_dictionary::build_dictionary_db_with_layers(
+        &mut rusqlite::Connection::open(&path).unwrap(),
+        &vocab_dictionary::CedictSource::new("cc-cedict", "test"),
+        &fixture("cedict-sample.u8"),
+        &[
+            (
+                &vocab_dictionary::FrequencySource::default(),
+                frequency.as_slice(),
+            ),
+            (&vocab_dictionary::HskSource::default(), hsk.as_slice()),
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn saved_words_show_how_common_they_are_once_the_dictionary_loads() {
+    let shouci = empty_sandbox();
+    install_ranked_dictionary(&shouci);
+    let cat = shouci
+        .add_manual(&ManualWord {
+            simplified: "猫".to_owned(),
+            pinyin: Some("mao1".to_owned()),
+            definition: Some("cat".to_owned()),
+            ..ManualWord::default()
+        })
+        .unwrap()
+        .item;
+    assert_eq!(
+        (cat.frequency_rank, cat.hsk_rank),
+        (None, None),
+        "no dictionary yet"
+    );
+
+    shouci.load_dictionaries().unwrap();
+
+    let cat = shouci.item(cat.id).unwrap();
+    assert_eq!((cat.frequency_rank, cat.hsk_rank), (Some(3), Some(2)));
+    assert_eq!(cat.frequency_band, FrequencyBand::Top1000);
+    let listed = shouci.list_items(&active()).unwrap();
+    assert_eq!(listed[0].hsk_rank, Some(2));
+    let world = saved(shouci.quick_add("世界", None).unwrap()).item;
+    assert_eq!(
+        (world.frequency_rank, world.hsk_rank),
+        (None, None),
+        "in neither list"
+    );
+    assert_eq!(world.frequency_band, FrequencyBand::Unlisted);
+}
+
+#[test]
+fn words_are_filtered_by_hsk_level_and_frequency() {
+    let shouci = empty_sandbox();
+    install_ranked_dictionary(&shouci);
+    shouci.load_dictionaries().unwrap();
+    for word in ["水", "猫", "旅行", "世界"] {
+        saved(shouci.quick_add(word, None).unwrap());
+    }
+    let by = |hsk_levels: Vec<u64>, frequency_bands: Vec<FrequencyBand>| LibraryFilter {
+        hsk_levels,
+        frequency_bands,
+        ..LibraryFilter::default()
+    };
+    assert_eq!(heads(&shouci, &by(vec![2], vec![])), ["旅行", "猫"]);
+    assert_eq!(
+        heads(&shouci, &by(vec![1, 2], vec![])),
+        ["旅行", "猫", "水"]
+    );
+    assert_eq!(heads(&shouci, &by(vec![0], vec![])), ["世界"], "no level");
+    assert_eq!(
+        heads(&shouci, &by(vec![], vec![FrequencyBand::Unlisted])),
+        ["世界"]
+    );
+    assert_eq!(
+        heads(&shouci, &by(vec![2], vec![FrequencyBand::Top1000])),
+        ["旅行", "猫"]
+    );
+    let found = shouci
+        .search_library("lv3", &by(vec![2], vec![]), None, None)
+        .unwrap();
+    assert_eq!(found.items.len(), 1, "search narrows by level too");
+
+    let ids = shouci.matching_ids(&by(vec![2], vec![])).unwrap();
+    let listed: Vec<i64> = shouci
+        .list_items(&by(vec![2], vec![]))
+        .unwrap()
+        .iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(ids, listed, "the same words, newest first");
+
+    let dir = scratch_dir("ranked-export");
+    let request = ExportRequest {
+        scope: ExportScope::New,
+        filter: by(vec![1], vec![]),
+        ..ExportRequest::default()
+    };
+    let plan = shouci
+        .preview_export(&dir.join("hsk1.txt"), "pleco", &request)
+        .unwrap();
+    assert_eq!(plan.words, ["水"], "exports keep to the level");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn smart_collections_keep_a_filter_and_find_its_words_each_time() {
+    let shouci = empty_sandbox();
+    install_ranked_dictionary(&shouci);
+    shouci.load_dictionaries().unwrap();
+    let cat = saved(shouci.quick_add("猫", None).unwrap()).item.id;
+    let water = saved(shouci.quick_add("水", None).unwrap()).item.id;
+    let hsk2 = LibraryFilter {
+        hsk_levels: vec![2],
+        without_tags: vec!["drilled".to_owned()],
+        ..LibraryFilter::default()
+    };
+
+    let smart = shouci.create_smart_collection("To Drill", &hsk2).unwrap();
+    assert_eq!(smart.item_ids, vec![cat]);
+    let travel = saved(shouci.quick_add("旅行", None).unwrap()).item.id;
+    shouci
+        .bulk(&[cat], &BulkAction::AddTags(vec!["Drilled".to_owned()]))
+        .unwrap();
+    let smart = shouci.smart_collection("to drill").unwrap();
+    assert_eq!(smart.item_ids, vec![travel], "worked out when looked at");
+
+    shouci.rename_tag("Drilled", "done").unwrap();
+    let followed = shouci.smart_collection("To Drill").unwrap().filter;
+    assert_eq!(
+        followed.without_tags,
+        ["done"],
+        "the filter follows the tag"
+    );
+    let smart = shouci
+        .update_smart_collection(
+            "To Drill",
+            &LibraryFilter {
+                hsk_levels: vec![1, 2],
+                ..followed
+            },
+        )
+        .unwrap();
+    assert_eq!(smart.item_ids, vec![travel, water]);
+    shouci
+        .rename_smart_collection("To Drill", "Review")
+        .unwrap();
+    assert_eq!(
+        shouci
+            .smart_collections()
+            .unwrap()
+            .iter()
+            .map(|smart| smart.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Review"]
+    );
+
+    let taken = shouci.create_smart_collection("review", &hsk2).unwrap_err();
+    assert_eq!(taken.kind(), ErrorKind::Conflict);
+    let trash = LibraryFilter {
+        view: LibraryView::Trash,
+        ..LibraryFilter::default()
+    };
+    let refused = shouci.create_smart_collection("Bin", &trash).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::Invalid);
+    let level = LibraryFilter {
+        hsk_levels: vec![8],
+        ..LibraryFilter::default()
+    };
+    let refused = shouci.create_smart_collection("Eight", &level).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::Invalid);
+
+    shouci.delete_smart_collection("Review").unwrap();
+    assert_eq!(
+        shouci.smart_collections().unwrap(),
+        Vec::<SmartCollectionView>::new()
+    );
+    assert_eq!(heads(&shouci, &active()).len(), 3, "its words stay");
+    assert_eq!(
+        shouci.smart_collection("Review").unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
+
+#[test]
 fn bulk_changes_are_all_or_nothing() {
     let shouci = sandbox();
     let a = saved(shouci.quick_add("学校", None).unwrap()).item.id;
@@ -411,6 +674,411 @@ fn bulk_changes_are_all_or_nothing() {
         shouci.item(a).unwrap().verification,
         Verification::NeedsReview
     );
+}
+
+// --- Undo -----------------------------------------------------------------
+
+/// Runs `change` on `ids` as a frontend does for ⌘Z: snapshots before and
+/// after, returned in that order.
+fn recorded(
+    shouci: &Shouci,
+    ids: &[i64],
+    change: impl FnOnce(&Shouci),
+) -> (shouci_core::LibrarySnapshot, shouci_core::LibrarySnapshot) {
+    let before = shouci.snapshot(ids).unwrap();
+    change(shouci);
+    (before, shouci.snapshot(ids).unwrap())
+}
+
+#[test]
+fn a_bulk_change_is_undone_and_redone() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let travel = saved(shouci.quick_add("旅行", None).unwrap()).item.id;
+    shouci
+        .bulk(&[school], &BulkAction::AddTags(vec!["places".to_owned()]))
+        .unwrap();
+    let (before, after) = recorded(&shouci, &[school, travel], |shouci| {
+        shouci
+            .bulk(&[school, travel], &BulkAction::Archive)
+            .unwrap();
+        shouci
+            .bulk(
+                &[school, travel],
+                &BulkAction::AddTags(vec!["week 3".to_owned()]),
+            )
+            .unwrap();
+    });
+
+    shouci.restore(&before, &after).unwrap();
+    let school_now = shouci.item(school).unwrap();
+    assert_eq!(school_now.lifecycle, Lifecycle::Active);
+    assert_eq!(school_now.tags, ["places"]);
+    assert!(
+        shouci
+            .tags()
+            .unwrap()
+            .iter()
+            .all(|tag| tag.name != "week 3"),
+        "the tag the change created goes with it"
+    );
+
+    shouci.restore(&after, &before).unwrap();
+    let travel_now = shouci.item(travel).unwrap();
+    assert_eq!(travel_now.lifecycle, Lifecycle::Archived);
+    assert_eq!(travel_now.tags, ["week 3"]);
+    assert_eq!(
+        travel_now.archived_at,
+        after
+            .words
+            .iter()
+            .find(|w| w.id == travel)
+            .unwrap()
+            .archived_at,
+        "the archive date comes back too"
+    );
+}
+
+#[test]
+fn edits_merges_renames_and_deletes_are_undone() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let travel = saved(shouci.quick_add("旅行", None).unwrap()).item.id;
+    shouci
+        .bulk(&[school], &BulkAction::AddTags(vec!["HSK1".to_owned()]))
+        .unwrap();
+    shouci
+        .bulk(&[travel], &BulkAction::AddTags(vec!["HSK 1".to_owned()]))
+        .unwrap();
+    shouci
+        .bulk(
+            &[school, travel],
+            &BulkAction::AddToCollection("Week 1".to_owned()),
+        )
+        .unwrap();
+    shouci.create_collection("Empty").unwrap();
+    let ids = [school, travel];
+
+    let (before, after) = recorded(&shouci, &[school], |shouci| {
+        shouci
+            .update_item(
+                school,
+                &ItemPatch {
+                    definition: Some("my school".to_owned()),
+                    notes: Some("near home".to_owned()),
+                    verification: Some(Verification::NeedsReview),
+                    ..ItemPatch::default()
+                },
+            )
+            .unwrap();
+    });
+    shouci.restore(&before, &after).unwrap();
+    let school_now = shouci.item(school).unwrap();
+    assert_eq!(school_now.definition, "school");
+    assert_eq!(school_now.notes, "");
+    assert_eq!(school_now.verification, Verification::Confirmed);
+
+    let (before, after) = recorded(&shouci, &[travel], |shouci| {
+        shouci.merge_tags("HSK 1", "HSK1").unwrap();
+    });
+    shouci.restore(&before, &after).unwrap();
+    assert_eq!(shouci.item(travel).unwrap().tags, ["HSK 1"]);
+    assert_eq!(shouci.item(school).unwrap().tags, ["HSK1"]);
+    shouci.restore(&after, &before).unwrap();
+    assert_eq!(shouci.tags().unwrap().len(), 1, "merged again");
+    shouci.restore(&before, &after).unwrap();
+
+    let (before, after) = recorded(&shouci, &ids, |shouci| {
+        shouci.rename_collection("Week 1", "week 1").unwrap();
+    });
+    shouci.restore(&before, &after).unwrap();
+    assert_eq!(
+        shouci.item(school).unwrap().collections,
+        ["Week 1"],
+        "case and all"
+    );
+
+    let (before, after) = recorded(&shouci, &ids, |shouci| {
+        shouci.delete_collection("Week 1").unwrap();
+        shouci.delete_collection("Empty").unwrap();
+    });
+    shouci.restore(&before, &after).unwrap();
+    let names: Vec<String> = shouci
+        .collections()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        names,
+        ["Empty", "Week 1"],
+        "an empty collection comes back too"
+    );
+    assert_eq!(shouci.item(travel).unwrap().collections, ["Week 1"]);
+
+    let (before, after) = recorded(&shouci, &ids, |shouci| {
+        shouci.create_collection("Week 2").unwrap();
+        shouci
+            .bulk(&ids, &BulkAction::AddToCollection("Week 2".to_owned()))
+            .unwrap();
+    });
+    shouci.restore(&before, &after).unwrap();
+    assert!(
+        shouci
+            .collections()
+            .unwrap()
+            .iter()
+            .all(|c| c.name != "Week 2"),
+        "a collection the change made goes"
+    );
+}
+
+#[test]
+fn undoing_several_changes_in_turn_works() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let first = recorded(&shouci, &[school], |shouci| {
+        shouci.bulk(&[school], &BulkAction::Archive).unwrap();
+    });
+    let second = recorded(&shouci, &[school], |shouci| {
+        shouci
+            .bulk(&[school], &BulkAction::AddTags(vec!["later".to_owned()]))
+            .unwrap();
+    });
+    shouci.restore(&second.0, &second.1).unwrap();
+    shouci.restore(&first.0, &first.1).unwrap();
+    assert_eq!(shouci.item(school).unwrap().lifecycle, Lifecycle::Active);
+    shouci.restore(&first.1, &first.0).unwrap();
+    shouci.restore(&second.1, &second.0).unwrap();
+    let redone = shouci.item(school).unwrap();
+    assert_eq!(
+        (redone.lifecycle, redone.tags.as_slice()),
+        (Lifecycle::Archived, &["later".to_owned()][..])
+    );
+}
+
+#[test]
+fn a_word_changed_or_deleted_since_is_never_overwritten() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let (before, after) = recorded(&shouci, &[school], |shouci| {
+        shouci.bulk(&[school], &BulkAction::Archive).unwrap();
+    });
+    shouci
+        .update_item(
+            school,
+            &ItemPatch {
+                notes: Some("written by shouci meanwhile".to_owned()),
+                ..ItemPatch::default()
+            },
+        )
+        .unwrap();
+    let err = shouci.restore(&before, &after).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Conflict);
+    assert!(err.to_string().contains("changed in the meantime"), "{err}");
+    let kept = shouci.item(school).unwrap();
+    assert_eq!(kept.notes, "written by shouci meanwhile");
+    assert_eq!(kept.lifecycle, Lifecycle::Archived, "nothing changed");
+    let unknown = shouci.restore(&before, &shouci_core::LibrarySnapshot::default());
+    assert_eq!(
+        unknown.unwrap_err().kind(),
+        ErrorKind::Conflict,
+        "nor one the change's snapshot doesn't have"
+    );
+
+    let travel = saved(shouci.quick_add("旅行", None).unwrap()).item.id;
+    let (before, after) = recorded(&shouci, &[travel], |shouci| {
+        shouci.bulk(&[travel], &BulkAction::Trash).unwrap();
+    });
+    shouci.empty_trash().unwrap();
+    let err = shouci.restore(&before, &after).unwrap_err();
+    assert!(err.to_string().contains("deleted for good"), "{err}");
+}
+
+#[test]
+fn undoing_a_rename_or_merge_puts_smart_filters_back_too() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let travel = saved(shouci.quick_add("旅行", None).unwrap()).item.id;
+    shouci
+        .bulk(&[school], &BulkAction::AddTags(vec!["drill".to_owned()]))
+        .unwrap();
+    shouci
+        .bulk(&[travel], &BulkAction::AddTags(vec!["Drill 2".to_owned()]))
+        .unwrap();
+    let fresh = LibraryFilter {
+        without_tags: vec!["drill".to_owned(), "Drill 2".to_owned()],
+        ..LibraryFilter::default()
+    };
+    shouci.create_smart_collection("Fresh", &fresh).unwrap();
+    let saved_filter = |shouci: &Shouci| shouci.smart_collection("Fresh").unwrap().filter;
+
+    let (before, after) = recorded(&shouci, &[school], |shouci| {
+        shouci.rename_tag("drill", "drilled").unwrap();
+    });
+    assert_eq!(saved_filter(&shouci).without_tags, ["drilled", "Drill 2"]);
+    shouci.restore(&before, &after).unwrap();
+    assert_eq!(saved_filter(&shouci), fresh, "renamed back");
+    assert_eq!(shouci.item(school).unwrap().tags, ["drill"]);
+    shouci.restore(&after, &before).unwrap();
+    assert_eq!(saved_filter(&shouci).without_tags, ["drilled", "Drill 2"]);
+    shouci.restore(&before, &after).unwrap();
+
+    let (before, after) = recorded(&shouci, &[travel], |shouci| {
+        shouci.merge_tags("Drill 2", "drill").unwrap();
+    });
+    assert_eq!(saved_filter(&shouci).without_tags, ["drill"]);
+    shouci.restore(&before, &after).unwrap();
+    assert_eq!(saved_filter(&shouci), fresh, "the merge is taken back");
+
+    let (before, after) = recorded(&shouci, &[school], |shouci| {
+        shouci.collection_from_tag("drill").unwrap();
+    });
+    assert_eq!(saved_filter(&shouci).without_collections, ["drill"]);
+    shouci.restore(&before, &after).unwrap();
+    assert_eq!(saved_filter(&shouci), fresh, "a tag again");
+
+    let (before, after) = recorded(&shouci, &[school], |shouci| {
+        shouci.rename_tag("drill", "drilled").unwrap();
+    });
+    let edited = LibraryFilter {
+        hsk_levels: vec![1],
+        ..saved_filter(&shouci)
+    };
+    shouci.update_smart_collection("Fresh", &edited).unwrap();
+    let err = shouci.restore(&before, &after).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Conflict, "a filter edited since");
+    assert_eq!(saved_filter(&shouci), edited, "nothing changed");
+    assert_eq!(shouci.item(school).unwrap().tags, ["drilled"]);
+}
+
+#[test]
+fn smart_collection_changes_are_undone_unless_changed_since() {
+    let shouci = sandbox();
+    let hsk = |level| LibraryFilter {
+        hsk_levels: vec![level],
+        ..LibraryFilter::default()
+    };
+    let saved_filters = |shouci: &Shouci| shouci.snapshot(&[]).unwrap().smart_filters;
+
+    // Created, changed, renamed, deleted: each undone and redone
+    let changes: [&dyn Fn(&Shouci); 4] = [
+        &|shouci| drop(shouci.create_smart_collection("Drill", &hsk(1)).unwrap()),
+        &|shouci| drop(shouci.update_smart_collection("Drill", &hsk(2)).unwrap()),
+        &|shouci| shouci.rename_smart_collection("Drill", "drill").unwrap(),
+        &|shouci| shouci.delete_smart_collection("drill").unwrap(),
+    ];
+    for change in changes {
+        let (before, after) = recorded(&shouci, &[], change);
+        shouci.restore(&before, &after).unwrap();
+        assert_eq!(saved_filters(&shouci), before.smart_filters, "undone");
+        shouci.restore(&after, &before).unwrap();
+        assert_eq!(saved_filters(&shouci), after.smart_filters, "redone");
+    }
+
+    // Changed by `shouci` since: the undo changes nothing
+    let (before, after) = recorded(&shouci, &[], |shouci| {
+        shouci.create_smart_collection("Drill", &hsk(1)).unwrap();
+    });
+    shouci.update_smart_collection("Drill", &hsk(3)).unwrap();
+    let err = shouci.restore(&before, &after).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Conflict);
+    assert!(err.to_string().contains("Drill changed"), "{err}");
+    assert_eq!(shouci.smart_collection("Drill").unwrap().filter, hsk(3));
+}
+
+#[test]
+fn an_add_is_taken_back_and_redone_as_the_same_word() {
+    let shouci = sandbox();
+    let (before, after) = {
+        let before = shouci.snapshot(&[]).unwrap();
+        let added = shouci
+            .add_manual(&ManualWord {
+                simplified: "米饭".to_owned(),
+                tags: vec!["new".to_owned()],
+                ..ManualWord::default()
+            })
+            .unwrap();
+        (before, shouci.snapshot(&[added.item.id]).unwrap())
+    };
+    let word = after.words[0].clone();
+
+    // Undone: the word goes for good, and so does the tag it brought
+    shouci.restore(&before, &after).unwrap();
+    assert_eq!(
+        shouci.item(word.id).unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+    assert_eq!(shouci.tags().unwrap(), Vec::new());
+
+    // Redone: the same word, with its id and when it was added
+    shouci.restore(&after, &before).unwrap();
+    let back = shouci.item(word.id).unwrap();
+    assert_eq!(
+        (
+            back.simplified.as_str(),
+            back.created_at.as_str(),
+            back.tags.as_slice()
+        ),
+        ("米饭", word.created_at.as_str(), &["new".to_owned()][..])
+    );
+    assert!(back.rev > word.rev, "a redo is a change too");
+
+    // Edited since: taking the add back would lose the edit
+    shouci
+        .update_item(
+            word.id,
+            &ItemPatch {
+                notes: Some("from shouci".to_owned()),
+                ..ItemPatch::default()
+            },
+        )
+        .unwrap();
+    let err = shouci.restore(&before, &after).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Conflict);
+    assert_eq!(shouci.item(word.id).unwrap().notes, "from shouci");
+}
+
+#[test]
+fn a_word_typed_in_again_is_found_first_so_its_save_can_be_undone() {
+    let shouci = sandbox();
+    let word = ManualWord {
+        simplified: "生词".to_owned(),
+        ..ManualWord::default()
+    };
+    assert_eq!(shouci.manual_match(&word).unwrap(), None);
+    let id = shouci.add_manual(&word).unwrap().item.id;
+    shouci.bulk(&[id], &BulkAction::Trash).unwrap();
+    let trashed = shouci.item(id).unwrap();
+
+    // Typed in again: found in the trash before saving brings it back
+    assert_eq!(shouci.manual_match(&word).unwrap(), Some(id));
+    let (before, after) = recorded(&shouci, &[id], |shouci| {
+        let back = shouci.add_manual(&word).unwrap();
+        assert_eq!(back.outcome, SaveOutcome::Restored);
+    });
+
+    // so undoing puts it back in the trash as it was
+    shouci.restore(&before, &after).unwrap();
+    let undone = shouci.item(id).unwrap();
+    assert_eq!(
+        (undone.lifecycle, undone.deleted_at),
+        (Lifecycle::Trashed, trashed.deleted_at)
+    );
+}
+
+#[test]
+fn a_word_deleted_for_good_while_a_change_ran_is_not_brought_back() {
+    let shouci = sandbox();
+    let school = saved(shouci.quick_add("学校", None).unwrap()).item.id;
+    let (before, after) = recorded(&shouci, &[school], |shouci| {
+        // Emptied from the Trash by `shouci` while the change runs
+        shouci.bulk(&[school], &BulkAction::Trash).unwrap();
+        shouci.empty_trash().unwrap();
+    });
+    let err = shouci.restore(&before, &after).unwrap_err();
+    assert!(err.to_string().contains("deleted for good"), "{err}");
+    assert_eq!(shouci.item(school).unwrap_err().kind(), ErrorKind::NotFound);
 }
 
 // --- Dictionaries ---------------------------------------------------------
@@ -835,6 +1503,18 @@ fn json_shapes_are_stable() {
     assert_eq!(request.scope, ExportScope::Selected(vec![1, 2]));
     let request: ExportRequest = serde_json::from_str(r#"{"scope": "all"}"#).unwrap();
     assert_eq!(request.scope, ExportScope::All);
+    // Smart collections keep filters in this shape in user.db.
+    let filter: LibraryFilter = serde_json::from_str(
+        r#"{"hsk_levels": [4, 0], "frequency_bands": ["top1000", "to5000", "to10000",
+            "beyond10000", "unlisted"], "without_tags": ["drilled"], "added_within_days": 30}"#,
+    )
+    .unwrap();
+    assert_eq!(filter.frequency_bands, FrequencyBand::ALL);
+    assert_eq!(filter.view, LibraryView::Active, "left out, as before");
+    assert_eq!(
+        serde_json::to_value(&filter).unwrap()["frequency_bands"][0],
+        "top1000"
+    );
 }
 
 #[test]
@@ -976,6 +1656,15 @@ fn a_word_captured_offline_is_completed_later() {
     )
     .unwrap();
     shouci.load_dictionaries().unwrap();
+    let typed = ManualWord {
+        simplified: "学校".to_owned(),
+        ..ManualWord::default()
+    };
+    assert_eq!(
+        shouci.manual_match(&typed).unwrap(),
+        Some(placeholder.item.id),
+        "the word typed in now completes it too"
+    );
     let result = saved(shouci.quick_add("学校", None).unwrap());
     assert_eq!(result.outcome, SaveOutcome::Completed);
     assert_eq!(result.item.id, placeholder.item.id);

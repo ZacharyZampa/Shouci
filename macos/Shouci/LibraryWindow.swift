@@ -24,6 +24,13 @@ final class LibraryWindowController: NSWindowController, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
+        model.undoManager = { [weak window] in
+            let manager = window?.undoManager
+            // A snapshot holds every word a change touched; fifty of them is
+            // plenty to go back through.
+            manager?.levelsOfUndo = 50
+            return manager
+        }
     }
 
     @available(*, unavailable)
@@ -75,6 +82,9 @@ struct LibraryView: View {
         .sheet(item: $model.transfer) { transfer in
             TransferSheet(library: model, transfer: transfer)
         }
+        .sheet(item: $model.filing) { _ in
+            FilingSheet(model: model)
+        }
         .alert(namingTitle, isPresented: isNaming, presenting: model.naming) { _ in
             TextField("Name", text: namingText)
             Button("Cancel", role: .cancel) { model.naming = nil }
@@ -82,6 +92,15 @@ struct LibraryView: View {
                 if let naming = model.naming { model.name(naming) }
                 model.naming = nil
             }
+        }
+        .alert(mergingTitle, isPresented: isMerging, presenting: model.merging) { merging in
+            Button("Cancel", role: .cancel) { model.merging = nil }
+            Button("Merge") {
+                model.merge(merging)
+                model.merging = nil
+            }
+        } message: { merging in
+            Text("Its words join “\(merging.into)”, and “\(merging.from)” goes away.")
         }
         .alert("Something went wrong", isPresented: hasProblem) {
             Button("OK") { model.problem = nil }
@@ -91,6 +110,8 @@ struct LibraryView: View {
         .task(id: model.app.core != nil) { await model.reload() }
         .onChange(of: model.app.dictionary) {
             if model.isSearching { model.search() }
+            // Words get their HSK level and frequency from the dictionary.
+            if case .ready = model.app.dictionary { Task { await model.reload() } }
         }
     }
 
@@ -135,8 +156,19 @@ struct LibraryView: View {
         }
     }
 
+    /// Not while a sheet is open: the editor and filing sheets show the
+    /// problem themselves, and the alert waits for the others to close.
     private var hasProblem: Binding<Bool> {
-        Binding(get: { model.problem != nil }, set: { if !$0 { model.problem = nil } })
+        Binding(get: { model.problem != nil && !model.showsSheet }, set: { if !$0 { model.problem = nil } })
+    }
+
+    private var isMerging: Binding<Bool> {
+        Binding(get: { model.merging != nil }, set: { if !$0 { model.merging = nil } })
+    }
+
+    private var mergingTitle: String {
+        guard let merging = model.merging else { return "" }
+        return "Merge “\(merging.from)” into “\(merging.into)”?"
     }
 
     private var isNaming: Binding<Bool> {
@@ -151,6 +183,8 @@ struct LibraryView: View {
         switch model.naming?.purpose {
         case .renameCollection: "Rename Collection"
         case .renameTag: "Rename Tag"
+        case .newSmartCollection: "New Smart Collection"
+        case .renameSmartCollection: "Rename Smart Collection"
         default: "New Collection"
         }
     }

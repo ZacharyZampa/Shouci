@@ -64,16 +64,23 @@ struct NameSuggestions {
     private(set) var preferred: Int?
 
     /// `present` is what the word has now; `limit` caps the names that match
-    /// what was typed.
-    init(query: String, known: [GroupView], present: [String], limit: Int = 6) {
+    /// what was typed. `recent` names, most recent first, lead the list
+    /// before anything is typed, and ↵ picks the first of them.
+    init(query: String, known: [GroupView], present: [String], recent: [String] = [], limit: Int = 6) {
         let typed = query.trimmingCharacters(in: .whitespaces)
         let has = { (name: String) in present.contains { $0.caseInsensitiveCompare(name) == .orderedSame } }
 
         guard !typed.isEmpty else {
-            // Everything that exists, most used first, to browse before typing.
-            rows = known.filter { !has($0.name) }
+            // Everything that exists, recent first, then most used, to
+            // browse before typing.
+            let others = known.filter { !has($0.name) }
+            let lately = recent.compactMap { name in
+                others.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            }
+            let rest = others.filter { group in !lately.contains { $0.name == group.name } }
                 .sorted { $0.count > $1.count }
-                .map { .existing($0.name, count: $0.count) }
+            rows = (lately + rest).map { .existing($0.name, count: $0.count) }
+            preferred = lately.isEmpty ? nil : 0
             return
         }
 
@@ -131,15 +138,20 @@ struct NameInput: View {
     enum Placement { case menu, list }
 
     /// The row the field sits in, which the menu stays inside.
-    static let row = "NameInput.row"
+    nonisolated static let row = "NameInput.row"
 
     let kind: GroupKind
     let known: [GroupView]
     let present: [String]
     var placement: Placement = .menu
     var focusOnAppear = false
+    /// Names chosen lately, most recent first: shown first, and ↵ picks the
+    /// first before anything is typed.
+    var recent: [String] = []
     let choose: (String) -> Void
     var dismiss: (() -> Void)?
+    /// What ⇥ does instead of moving to the next field.
+    var tab: (() -> Void)?
 
     @State private var text = ""
     @State private var focused = false
@@ -150,7 +162,9 @@ struct NameInput: View {
     @State private var row: CGRect = .null
     @State private var focusRequests = 0
 
-    private var suggestions: NameSuggestions { NameSuggestions(query: text, known: known, present: present) }
+    private var suggestions: NameSuggestions {
+        NameSuggestions(query: text, known: known, present: present, recent: recent)
+    }
 
     var body: some View {
         let suggestions = self.suggestions
@@ -205,6 +219,12 @@ struct NameInput: View {
                 onEscape: {
                     text = ""
                     dismiss?()
+                },
+                onTab: tab.map { tab in
+                    {
+                        text = ""
+                        tab()
+                    }
                 })
         }
         .padding(.horizontal, 9)
@@ -339,6 +359,7 @@ private struct NameTextField: NSViewRepresentable {
     var onMove: (Int) -> Void
     var onSubmit: () -> Void
     var onEscape: () -> Void
+    var onTab: (() -> Void)?
 
     func makeNSView(context: Context) -> FocusReportingField {
         let field = FocusReportingField()
@@ -405,6 +426,8 @@ private struct NameTextField: NSViewRepresentable {
             case #selector(NSResponder.cancelOperation(_:)):
                 parent.onEscape()
                 control.window?.makeFirstResponder(nil)
+            case #selector(NSResponder.insertTab(_:)) where parent.onTab != nil:
+                parent.onTab?()
             default:
                 return false
             }

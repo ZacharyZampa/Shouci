@@ -55,6 +55,16 @@ extension GroupView: Identifiable {
     public var id: String { name }
 }
 
+extension SmartCollectionView: Identifiable {
+    public var id: String { name }
+}
+
+extension FilterConditionView: Identifiable {}
+
+extension FrequencyBandView: Identifiable {
+    public var id: FrequencyBand { band }
+}
+
 extension CandidateView: Identifiable {
     /// A dictionary entry is its dictionary, characters, and reading.
     public var id: String { [dictionary, simplified, traditional, pinyin].joined(separator: "\u{1F}") }

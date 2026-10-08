@@ -31,6 +31,14 @@ final class AppModel {
         if case .ready = dictionary { core != nil } else { false }
     }
 
+    init() {}
+
+    /// A model over a library already open, with no dictionary: what the
+    /// tests work with.
+    init(core: Core) {
+        self.core = core
+    }
+
     func start() {
         Task {
             do {

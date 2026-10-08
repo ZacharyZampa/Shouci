@@ -3,7 +3,8 @@
 //! Tags are free labels for finding and filtering words. Collections are
 //! curated groups (a textbook chapter, a week of class) that export as a
 //! Pleco category or an Anki deck. A word can have any number of each. Names
-//! are case-insensitive: `HSK1` and `hsk1` are one tag.
+//! are case-insensitive: `HSK1` and `hsk1` are one tag. Renaming or merging
+//! one renames it in smart collections' filters too (`smart.rs`).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -20,14 +21,14 @@ pub struct NameCount {
 }
 
 #[derive(Clone, Copy)]
-enum Group {
+pub(crate) enum Group {
     Tag,
     Collection,
 }
 
 impl Group {
     /// The table of names.
-    fn table(self) -> &'static str {
+    pub(crate) fn table(self) -> &'static str {
         match self {
             Self::Tag => "tags",
             Self::Collection => "collections",
@@ -35,7 +36,7 @@ impl Group {
     }
 
     /// The table linking words to names.
-    fn join_table(self) -> &'static str {
+    pub(crate) fn join_table(self) -> &'static str {
         match self {
             Self::Tag => "item_tags",
             Self::Collection => "collection_items",
@@ -43,7 +44,7 @@ impl Group {
     }
 
     /// The join table's column naming the tag or collection.
-    fn foreign_key(self) -> &'static str {
+    pub(crate) fn foreign_key(self) -> &'static str {
         match self {
             Self::Tag => "tag_id",
             Self::Collection => "collection_id",
@@ -59,17 +60,19 @@ impl Group {
 }
 
 fn clean_name(group: Group, name: &str) -> Result<String> {
+    checked_name(group.noun(), name)
+}
+
+/// `name` trimmed, for a tag, a collection, or a smart collection (`noun`).
+/// A blank name, or one with tabs or line breaks, is refused.
+pub(crate) fn checked_name(noun: &str, name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(VocabError::invalid(format!(
-            "a {} needs a name",
-            group.noun()
-        )));
+        return Err(VocabError::invalid(format!("a {noun} needs a name")));
     }
     if name.contains(['\n', '\r', '\t']) {
         return Err(VocabError::invalid(format!(
-            "a {} name cannot contain tabs or line breaks",
-            group.noun()
+            "a {noun} name cannot contain tabs or line breaks"
         )));
     }
     Ok(name.to_owned())
@@ -226,11 +229,66 @@ fn rename(conn: &Connection, group: Group, from: &str, to: &str) -> Result<()> {
             )));
         }
     }
+    let from = name_of(conn, group, id)?;
     conn.execute(
         &format!("UPDATE {} SET name = ?1 WHERE id = ?2", group.table()),
         params![to, id],
     )?;
+    crate::smart::follow_rename(conn, group, &from, &to)?;
     mark_members_changed(conn, group, id)
+}
+
+/// The name as the library spells it.
+fn name_of(conn: &Connection, group: Group, id: i64) -> Result<String> {
+    Ok(conn.query_row(
+        &format!("SELECT name FROM {} WHERE id = ?1", group.table()),
+        [id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Whether any word, in the trash or not, has the name.
+fn in_use(conn: &Connection, group: Group, name: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM {links} l JOIN {table} g ON g.id = l.{key} \
+         WHERE g.name = ?1)",
+        links = group.join_table(),
+        table = group.table(),
+        key = group.foreign_key(),
+    );
+    Ok(conn.query_row(&sql, [name.trim()], |row| row.get(0))?)
+}
+
+/// Moves every word of `from` into `into`, then deletes `from`. A word in
+/// both stays in `into` once.
+fn merge(conn: &Connection, group: Group, from: &str, into: &str) -> Result<()> {
+    let from_id = require(conn, group, from.trim())?;
+    let into_id = require(conn, group, into.trim())?;
+    if from_id == into_id {
+        return Err(VocabError::invalid(format!(
+            "a {} cannot be merged into itself",
+            group.noun()
+        )));
+    }
+    mark_members_changed(conn, group, from_id)?;
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO {links} (item_id, {key}) \
+             SELECT item_id, ?1 FROM {links} WHERE {key} = ?2",
+            links = group.join_table(),
+            key = group.foreign_key(),
+        ),
+        params![into_id, from_id],
+    )?;
+    let (from, into) = (
+        name_of(conn, group, from_id)?,
+        name_of(conn, group, into_id)?,
+    );
+    conn.execute(
+        &format!("DELETE FROM {} WHERE id = ?1", group.table()),
+        [from_id],
+    )?;
+    crate::smart::follow_rename(conn, group, &from, &into)
 }
 
 /// Every word in a tag or collection changed with it.
@@ -313,6 +371,53 @@ pub fn set_tags(conn: &Connection, item_id: i64, names: &[String]) -> Result<()>
 /// if the new name is taken, or a storage error.
 pub fn rename_tag(conn: &Connection, from: &str, to: &str) -> Result<()> {
     rename(conn, Group::Tag, from, to)
+}
+
+/// Gives every word tagged `from` the tag `into` instead, then deletes
+/// `from`. The way to fold `HSK1` into `HSK 1`.
+///
+/// # Errors
+///
+/// [`vocab_core::ErrorKind::NotFound`] if either tag is missing,
+/// [`vocab_core::ErrorKind::Invalid`] if they are the same tag, or a storage
+/// error.
+pub fn merge_tags(conn: &Connection, from: &str, into: &str) -> Result<()> {
+    merge(conn, Group::Tag, from, into)
+}
+
+/// Creates a tag no word has yet: how an undo brings back a deleted one.
+///
+/// # Errors
+///
+/// [`vocab_core::ErrorKind::Conflict`] if it exists; an error for a blank
+/// name or a failed write.
+pub fn create_tag(conn: &Connection, name: &str) -> Result<()> {
+    let name = clean_name(Group::Tag, name)?;
+    if find(conn, Group::Tag, &name)?.is_some() {
+        return Err(VocabError::conflict(format!(
+            "a tag named {name} already exists"
+        )));
+    }
+    ensure(conn, Group::Tag, &name)?;
+    Ok(())
+}
+
+/// Whether any word, in the trash or not, has the tag.
+///
+/// # Errors
+///
+/// Storage errors.
+pub fn tag_in_use(conn: &Connection, name: &str) -> Result<bool> {
+    in_use(conn, Group::Tag, name)
+}
+
+/// Whether any word, in the trash or not, is in the collection.
+///
+/// # Errors
+///
+/// Storage errors.
+pub fn collection_in_use(conn: &Connection, name: &str) -> Result<bool> {
+    in_use(conn, Group::Collection, name)
 }
 
 /// Deletes a tag. Its words stay.
@@ -399,6 +504,17 @@ pub fn rename_collection(conn: &Connection, from: &str, to: &str) -> Result<()> 
     rename(conn, Group::Collection, from, to)
 }
 
+/// Puts every word of collection `from` into `into`, then deletes `from`.
+///
+/// # Errors
+///
+/// [`vocab_core::ErrorKind::NotFound`] if either collection is missing,
+/// [`vocab_core::ErrorKind::Invalid`] if they are the same collection, or a
+/// storage error.
+pub fn merge_collections(conn: &Connection, from: &str, into: &str) -> Result<()> {
+    merge(conn, Group::Collection, from, into)
+}
+
 /// Deletes a collection. Its words stay.
 ///
 /// # Errors
@@ -429,6 +545,7 @@ pub fn collection_from_tag(conn: &Connection, tag: &str) -> Result<NameCount> {
         params![collection_id, tag_id],
     )?;
     conn.execute("DELETE FROM tags WHERE id = ?1", [tag_id])?;
+    crate::smart::follow_tag_to_collection(conn, &name)?;
     let (name, count): (String, i64) = conn.query_row(
         "SELECT c.name, count(i.id) FROM collections c \
          LEFT JOIN collection_items ci ON ci.collection_id = c.id \
@@ -448,9 +565,10 @@ mod tests {
     use vocab_core::{ErrorKind, ItemSource, Verification};
 
     use super::{
-        add_tag, add_to_collection, collection_from_tag, collections, delete_tag, item_tags,
-        rename_tag, set_collections, set_tags, tags,
+        add_tag, add_to_collection, collection_from_tag, collections, delete_tag, item_collections,
+        item_tags, merge_collections, merge_tags, rename_tag, set_collections, set_tags, tags,
     };
+    use crate::items::require_item;
     use crate::items::{NewItem, save_item, set_trashed};
     use crate::open_in_memory;
 
@@ -568,5 +686,49 @@ mod tests {
         assert_eq!(made.count, 2);
         assert_eq!(collections(&conn).unwrap().len(), 1);
         assert_eq!(tags(&conn).unwrap(), []);
+    }
+
+    #[test]
+    fn merging_moves_every_word_once_and_removes_the_old_name() {
+        let conn = open_in_memory().unwrap();
+        let both = saved(&conn, "一", "yi1");
+        let only_old = saved(&conn, "二", "er4");
+        let untouched = saved(&conn, "三", "san1");
+        for id in [both, only_old] {
+            add_tag(&conn, id, "HSK1").unwrap();
+            add_to_collection(&conn, id, "Week_1").unwrap();
+        }
+        add_tag(&conn, both, "HSK 1").unwrap();
+        add_to_collection(&conn, both, "Week 1").unwrap();
+        add_to_collection(&conn, untouched, "Week 1").unwrap();
+        let rev = |id| require_item(&conn, id).unwrap().rev;
+        let before = (rev(both), rev(only_old), rev(untouched));
+
+        merge_tags(&conn, "hsk1", "HSK 1").unwrap();
+        merge_collections(&conn, "Week_1", "week 1").unwrap();
+
+        assert_eq!(item_tags(&conn, both).unwrap(), vec!["HSK 1"]);
+        assert_eq!(item_tags(&conn, only_old).unwrap(), vec!["HSK 1"]);
+        assert_eq!(item_collections(&conn, only_old).unwrap(), vec!["Week 1"]);
+        let names: Vec<_> = collections(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name, g.count))
+            .collect();
+        assert_eq!(names, vec![("Week 1".to_owned(), 3)]);
+        assert_eq!(tags(&conn).unwrap().len(), 1);
+        assert!(
+            rev(both) > before.0 && rev(only_old) > before.1,
+            "their groups changed"
+        );
+        assert_eq!(rev(untouched), before.2, "already in Week 1 only");
+        assert_eq!(
+            merge_tags(&conn, "HSK 1", "hsk 1").unwrap_err().kind(),
+            ErrorKind::Invalid
+        );
+        assert_eq!(
+            merge_tags(&conn, "missing", "HSK 1").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
     }
 }

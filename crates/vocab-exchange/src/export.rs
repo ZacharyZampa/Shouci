@@ -68,7 +68,9 @@ pub struct ExportPlan {
     pub bytes: Vec<u8>,
 }
 
-/// Picks the words and renders the file in memory. Writes nothing.
+/// Picks the words and renders the file in memory. Writes nothing. The
+/// filter's HSK and frequency conditions need the dictionaries' ranks and
+/// are not applied here; [`plan_export_where`] applies them.
 ///
 /// # Errors
 ///
@@ -82,6 +84,24 @@ pub fn plan_export(
     path: &str,
     request: &ExportRequest,
 ) -> Result<ExportPlan> {
+    plan_export_where(conn, dict, connector, path, request, &|_| true)
+}
+
+/// As [`plan_export`], keeping only the matching words `admits` lets
+/// through: how the core applies the filter's HSK and frequency conditions,
+/// which need the dictionaries' ranks.
+///
+/// # Errors
+///
+/// As [`plan_export`].
+pub fn plan_export_where(
+    conn: &Connection,
+    dict: Option<&dyn DictionaryProvider>,
+    connector: &dyn Connector,
+    path: &str,
+    request: &ExportRequest,
+    admits: &dyn Fn(&VocabItem) -> bool,
+) -> Result<ExportPlan> {
     let info = connector.info();
     if !info.can_export {
         return Err(VocabError::invalid(format!(
@@ -94,6 +114,7 @@ pub fn plan_export(
     }
     refuse_import_source(conn, path)?;
     let mut items = list_items(conn, &request.filter)?;
+    items.retain(|item| admits(item));
     items.reverse(); // oldest first: the order words were collected
     if let ExportScope::Selected(ids) = &request.scope {
         let ids: HashSet<i64> = ids.iter().copied().collect();

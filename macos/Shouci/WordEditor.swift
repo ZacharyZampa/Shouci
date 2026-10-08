@@ -32,9 +32,15 @@ struct WordEditor: View {
                     .background(Palette.detail)
             }
             Divider()
+            if let problem = model.problem {
+                Notice(text: problem)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 12)
+            }
             footer
         }
         .frame(width: 980, height: 680)
+        .onDisappear { model.problem = nil }
         .task(id: draft.simplified) {
             try? await Task.sleep(for: .milliseconds(250))
             entries = await model.entries(for: draft.simplified)

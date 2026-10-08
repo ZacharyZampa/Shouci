@@ -19,6 +19,7 @@ use vocab_core::{
 };
 
 use crate::NOW;
+use crate::organize::Group;
 
 const COLUMNS: &str = "id, simplified, traditional, pinyin, definition, notes, verification, \
      archived_at, deleted_at, source_kind, source_id, source_version, import_origin, \
@@ -142,6 +143,19 @@ pub fn save_item(conn: &Connection, item: &NewItem) -> Result<Saved> {
             let id = insert_item(conn, item)?;
             Ok(Saved::Inserted(require_item(conn, id)?))
         }
+    }
+}
+
+/// The saved word [`save_item`] would change for `item`: the same word,
+/// perhaps in the trash, or a placeholder its reading completes.
+///
+/// # Errors
+///
+/// Returns an error if a query fails.
+pub fn find_saved(conn: &Connection, item: &NewItem) -> Result<Option<VocabItem>> {
+    match find_by_identity(conn, &item.simplified, &item.traditional, &item.pinyin)? {
+        Some(existing) => Ok(Some(existing)),
+        None => find_placeholder(conn, item),
     }
 }
 
@@ -310,45 +324,95 @@ pub fn find_by_identity(
     })
 }
 
-/// Words matching `filter`, newest first.
+/// Words matching `filter`, newest first. The HSK and frequency conditions
+/// are left to the caller, which has the dictionaries' ranks
+/// ([`LibraryFilter::admits_ranks`]).
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
 pub fn list_items(conn: &Connection, filter: &LibraryFilter) -> Result<Vec<VocabItem>> {
-    let mut conditions: Vec<&str> = vec![match filter.view {
-        LibraryView::Active => "deleted_at IS NULL AND archived_at IS NULL",
-        LibraryView::Archived => "deleted_at IS NULL AND archived_at IS NOT NULL",
-        LibraryView::Trash => "deleted_at IS NOT NULL",
-        LibraryView::All => "deleted_at IS NULL",
-    }];
-    let mut values: Vec<String> = Vec::new();
-    if let Some(verification) = filter.verification {
-        conditions.push("verification = ?");
-        values.push(verification.as_str().to_owned());
-    }
-    for tag in &filter.tags {
-        conditions.push(
-            "EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id \
-             WHERE it.item_id = items.id AND t.name = ? COLLATE NOCASE)",
-        );
-        values.push(tag.trim().to_owned());
-    }
-    if let Some(collection) = &filter.collection {
-        conditions.push(
-            "EXISTS (SELECT 1 FROM collection_items ci \
-             JOIN collections c ON c.id = ci.collection_id \
-             WHERE ci.item_id = items.id AND c.name = ? COLLATE NOCASE)",
-        );
-        values.push(collection.trim().to_owned());
-    }
-    let sql = format!(
-        "SELECT {COLUMNS} FROM items WHERE {} ORDER BY id DESC",
-        conditions.join(" AND ")
-    );
+    let (conditions, values) = conditions(filter);
+    let sql = format!("SELECT {COLUMNS} FROM items WHERE {conditions} ORDER BY id DESC");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), item_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The id and simplified form of each word matching `filter`, newest
+/// first: enough to check ranks without reading whole words. As
+/// [`list_items`], the HSK and frequency conditions are left to the caller.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn list_headwords(conn: &Connection, filter: &LibraryFilter) -> Result<Vec<(i64, String)>> {
+    let (conditions, values) = conditions(filter);
+    let sql = format!("SELECT id, simplified FROM items WHERE {conditions} ORDER BY id DESC");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// `filter`'s conditions on the database as a `WHERE` clause, and the
+/// values for its placeholders.
+fn conditions(filter: &LibraryFilter) -> (String, Vec<String>) {
+    let mut conditions: Vec<String> = vec![
+        match filter.view {
+            LibraryView::Active => "deleted_at IS NULL AND archived_at IS NULL",
+            LibraryView::Archived => "deleted_at IS NULL AND archived_at IS NOT NULL",
+            LibraryView::Trash => "deleted_at IS NOT NULL",
+            LibraryView::All => "deleted_at IS NULL",
+        }
+        .to_owned(),
+    ];
+    let mut values: Vec<String> = Vec::new();
+    if let Some(verification) = filter.verification {
+        conditions.push("verification = ?".to_owned());
+        values.push(verification.as_str().to_owned());
+    }
+    // Words with any of `names` (`EXISTS`), or with none (`NOT EXISTS`).
+    let mut linked = |exists: &str, group: Group, names: &[String]| {
+        if names.is_empty() {
+            return;
+        }
+        conditions.push(format!(
+            "{exists} (SELECT 1 FROM {links} l JOIN {table} g ON g.id = l.{key} \
+             WHERE l.item_id = items.id AND g.name COLLATE NOCASE IN ({marks}))",
+            links = group.join_table(),
+            table = group.table(),
+            key = group.foreign_key(),
+            marks = vec!["?"; names.len()].join(", "),
+        ));
+        values.extend(names.iter().map(|name| name.trim().to_owned()));
+    };
+    // Every one of these tags: a condition each.
+    for tag in &filter.tags {
+        linked("EXISTS", Group::Tag, std::slice::from_ref(tag));
+    }
+    if let Some(collection) = &filter.collection {
+        linked(
+            "EXISTS",
+            Group::Collection,
+            std::slice::from_ref(collection),
+        );
+    }
+    linked("EXISTS", Group::Tag, &filter.any_tags);
+    linked("NOT EXISTS", Group::Tag, &filter.without_tags);
+    linked("EXISTS", Group::Collection, &filter.any_collections);
+    linked("NOT EXISTS", Group::Collection, &filter.without_collections);
+    if filter.no_collection {
+        conditions.push(
+            "NOT EXISTS (SELECT 1 FROM collection_items ci WHERE ci.item_id = items.id)".to_owned(),
+        );
+    }
+    if let Some(days) = filter.added_within_days {
+        conditions.push("created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)".to_owned());
+        values.push(format!("-{days} days"));
+    }
+    (conditions.join(" AND "), values)
 }
 
 /// Applies `patch`. Changing the characters or reading into another saved
@@ -409,6 +473,102 @@ pub fn update_item(conn: &Connection, id: i64, patch: &ItemPatch) -> Result<Voca
     )
     .map_err(|err| identity_error(err, &simplified, &pinyin))?;
     require_item(conn, id)
+}
+
+/// Puts a saved word back as `item` has it: its forms, reading, text,
+/// review status, archive and trash dates, and source. Its revision rises,
+/// as with any change; `created_at` and `rev` in `item` are ignored. This is
+/// how an undo restores a word.
+///
+/// # Errors
+///
+/// [`vocab_core::ErrorKind::NotFound`], [`vocab_core::ErrorKind::Invalid`]
+/// (no characters), [`vocab_core::ErrorKind::Conflict`] when another word
+/// has taken its characters and reading, or a storage error.
+pub fn restore_item(conn: &Connection, item: &VocabItem) -> Result<()> {
+    require_item(conn, item.id)?;
+    let (simplified, traditional) = clean_forms(&item.simplified, &item.traditional)?;
+    let pinyin = stored_pinyin(&item.pinyin);
+    if let Some(other) = find_by_identity(conn, &simplified, &traditional, &pinyin)? {
+        if other.id != item.id {
+            return Err(VocabError::conflict(format!(
+                "{simplified} [{pinyin}] is saved as another word now"
+            )));
+        }
+    }
+    conn.execute(
+        &format!(
+            "UPDATE items SET simplified = ?1, traditional = ?2, pinyin = ?3, reading_key = ?4, \
+             definition = ?5, notes = ?6, verification = ?7, archived_at = ?8, deleted_at = ?9, \
+             source_kind = ?10, source_id = ?11, source_version = ?12, import_origin = ?13, \
+             {CHANGED} WHERE id = ?14"
+        ),
+        params![
+            simplified,
+            traditional,
+            pinyin,
+            reading_key(&pinyin),
+            item.definition.trim(),
+            item.notes.trim(),
+            item.verification.as_str(),
+            item.archived_at,
+            item.deleted_at,
+            item.source.kind.as_str(),
+            item.source.id,
+            item.source.version,
+            item.source.import_origin,
+            item.id,
+        ],
+    )
+    .map_err(|err| identity_error(err, &simplified, &pinyin))?;
+    Ok(())
+}
+
+/// Puts back a word that was deleted for good, under its old id and with
+/// its old creation date: how a redo brings back a word its undo deleted.
+/// Ids are never reused, so the old one is free unless the word is back.
+/// Its revision rises past the one in `item`, as with any change.
+///
+/// # Errors
+///
+/// [`vocab_core::ErrorKind::Conflict`] when the word exists or another word
+/// has taken its characters and reading,
+/// [`vocab_core::ErrorKind::Invalid`] (no characters), or a storage error.
+pub fn reinsert_item(conn: &Connection, item: &VocabItem) -> Result<()> {
+    if get_item(conn, item.id)?.is_some() {
+        return Err(VocabError::conflict(format!(
+            "{} is saved already",
+            item.simplified
+        )));
+    }
+    let (simplified, traditional) = clean_forms(&item.simplified, &item.traditional)?;
+    let pinyin = stored_pinyin(&item.pinyin);
+    conn.execute(
+        "INSERT INTO items (id, simplified, traditional, pinyin, reading_key, definition, notes, \
+         verification, archived_at, deleted_at, source_kind, source_id, source_version, \
+         import_origin, created_at, rev) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            item.id,
+            simplified,
+            traditional,
+            pinyin,
+            reading_key(&pinyin),
+            item.definition.trim(),
+            item.notes.trim(),
+            item.verification.as_str(),
+            item.archived_at,
+            item.deleted_at,
+            item.source.kind.as_str(),
+            item.source.id,
+            item.source.version,
+            item.source.import_origin,
+            item.created_at,
+            item.rev + 1,
+        ],
+    )
+    .map_err(|err| identity_error(err, &simplified, &pinyin))?;
+    Ok(())
 }
 
 fn touch(conn: &Connection, id: i64, assignment: &str, value: &dyn rusqlite::ToSql) -> Result<()> {
@@ -542,10 +702,10 @@ mod tests {
     };
 
     use super::{
-        NewItem, Saved, find_by_identity, list_items, purge_item, save_item, set_archived,
-        set_trashed, update_item,
+        NewItem, Saved, find_by_identity, list_headwords, list_items, purge_item, save_item,
+        set_archived, set_trashed, update_item,
     };
-    use crate::open_in_memory;
+    use crate::{add_tag, add_to_collection, open_in_memory};
 
     fn word(simplified: &str, traditional: &str, pinyin: &str) -> NewItem {
         NewItem {
@@ -770,5 +930,93 @@ mod tests {
         let conn = open_in_memory().unwrap();
         let err = save_item(&conn, &word("  ", "", "")).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Invalid);
+    }
+
+    #[test]
+    fn filters_take_any_of_their_names_and_leave_out_others() {
+        let conn = open_in_memory().unwrap();
+        let id = |simplified: &str| {
+            save_item(&conn, &word(simplified, "", ""))
+                .unwrap()
+                .item()
+                .id
+        };
+        let (cat, dog, fish, bird) = (id("猫"), id("狗"), id("鱼"), id("鸟"));
+        add_tag(&conn, cat, "pets").unwrap();
+        add_tag(&conn, dog, "Pets").unwrap();
+        add_tag(&conn, dog, "loud").unwrap();
+        add_tag(&conn, fish, "food").unwrap();
+        add_to_collection(&conn, cat, "Week 1").unwrap();
+        add_to_collection(&conn, fish, "Week 2").unwrap();
+        let ids = |filter: LibraryFilter| -> Vec<i64> {
+            let mut ids: Vec<i64> = list_items(&conn, &filter)
+                .unwrap()
+                .iter()
+                .map(|item| item.id)
+                .collect();
+            ids.sort_unstable();
+            let heads: Vec<i64> = {
+                let mut heads: Vec<i64> = list_headwords(&conn, &filter)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                heads.sort_unstable();
+                heads
+            };
+            assert_eq!(ids, heads, "both listings read the same conditions");
+            ids
+        };
+        let names = |names: &[&str]| names.iter().map(|&name| name.to_owned()).collect();
+        assert_eq!(
+            ids(LibraryFilter {
+                any_tags: names(&["PETS", "food"]),
+                ..LibraryFilter::default()
+            }),
+            vec![cat, dog, fish]
+        );
+        assert_eq!(
+            ids(LibraryFilter {
+                any_tags: names(&["pets"]),
+                without_tags: names(&["loud"]),
+                ..LibraryFilter::default()
+            }),
+            vec![cat]
+        );
+        assert_eq!(
+            ids(LibraryFilter {
+                any_collections: names(&["week 1", "Week 2"]),
+                ..LibraryFilter::default()
+            }),
+            vec![cat, fish]
+        );
+        assert_eq!(
+            ids(LibraryFilter {
+                without_collections: names(&["Week 1"]),
+                ..LibraryFilter::default()
+            }),
+            vec![dog, fish, bird]
+        );
+        assert_eq!(
+            ids(LibraryFilter {
+                added_within_days: Some(7),
+                without_tags: names(&["pets", "food"]),
+                ..LibraryFilter::default()
+            }),
+            vec![bird]
+        );
+        conn.execute(
+            "UPDATE items SET created_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1",
+            [bird],
+        )
+        .unwrap();
+        assert_eq!(
+            ids(LibraryFilter {
+                added_within_days: Some(7),
+                without_tags: names(&["pets", "food"]),
+                ..LibraryFilter::default()
+            }),
+            Vec::<i64>::new()
+        );
     }
 }

@@ -3,14 +3,17 @@
 //! compiler rejects one that drifts from the original, so the Swift types
 //! always match the core.
 
+use std::collections::HashMap;
+
 use shouci_core::{
     BulkAction, BulkResult, CandidateView, ConnectorView, DictionaryEntryView, DictionaryResults,
     DictionaryStatus, DictionaryView, ErrorKind, ExportRequest, ExportScope, FieldChange,
-    FieldConflict, GroupView, ImportAction, ImportCounts, ImportField, ImportPolicy, Incoming,
-    ItemPatch, ItemView, LegacyImport, LibraryFilter, LibraryResults, LibraryView, Lifecycle,
+    FieldConflict, FilterConditionView, FrequencyBand, FrequencyBandView, GroupView, HskLevelView,
+    ImportAction, ImportCounts, ImportField, ImportPolicy, Incoming, ItemPatch, ItemView,
+    LegacyImport, LibraryFilter, LibraryResults, LibrarySnapshot, LibraryView, Lifecycle,
     LoadingStage, ManualWord, MatchBasis, NameChange, PlannedLine, QueryKind, SaveOutcome,
-    SaveResult, SavedRef, Severity, SkipReason, SourceKind, SourceView, TransferSummary,
-    Verification,
+    SaveResult, SavedRef, Severity, SkipReason, SmartCollectionView, SourceKind, SourceView,
+    TransferSummary, Verification,
 };
 
 #[uniffi::remote(Enum)]
@@ -69,6 +72,15 @@ pub enum LibraryView {
     All,
 }
 
+#[uniffi::remote(Enum)]
+pub enum FrequencyBand {
+    Top1000,
+    To5000,
+    To10000,
+    Beyond10000,
+    Unlisted,
+}
+
 #[uniffi::remote(Record)]
 pub struct LibraryFilter {
     pub view: LibraryView,
@@ -78,6 +90,22 @@ pub struct LibraryFilter {
     pub tags: Vec<String>,
     #[uniffi(default)]
     pub collection: Option<String>,
+    #[uniffi(default)]
+    pub no_collection: bool,
+    #[uniffi(default)]
+    pub any_tags: Vec<String>,
+    #[uniffi(default)]
+    pub without_tags: Vec<String>,
+    #[uniffi(default)]
+    pub any_collections: Vec<String>,
+    #[uniffi(default)]
+    pub without_collections: Vec<String>,
+    #[uniffi(default)]
+    pub added_within_days: Option<u32>,
+    #[uniffi(default)]
+    pub hsk_levels: Vec<u64>,
+    #[uniffi(default)]
+    pub frequency_bands: Vec<FrequencyBand>,
 }
 
 #[uniffi::remote(Record)]
@@ -120,6 +148,9 @@ pub struct ItemView {
     pub tags: Vec<String>,
     pub collections: Vec<String>,
     pub destinations: Vec<String>,
+    pub frequency_rank: Option<u64>,
+    pub frequency_band: FrequencyBand,
+    pub hsk_rank: Option<u64>,
     pub created_at: String,
     pub modified_at: String,
     pub archived_at: Option<String>,
@@ -222,6 +253,42 @@ pub struct BulkResult {
 pub struct GroupView {
     pub name: String,
     pub count: u64,
+}
+
+#[uniffi::remote(Record)]
+pub struct SmartCollectionView {
+    pub name: String,
+    pub filter: LibraryFilter,
+    pub item_ids: Vec<i64>,
+}
+
+#[uniffi::remote(Record)]
+pub struct FilterConditionView {
+    pub id: String,
+    pub label: String,
+    pub without: LibraryFilter,
+}
+
+#[uniffi::remote(Record)]
+pub struct FrequencyBandView {
+    pub band: FrequencyBand,
+    pub label: String,
+    pub short_label: String,
+}
+
+#[uniffi::remote(Record)]
+pub struct HskLevelView {
+    pub level: u64,
+    pub label: String,
+}
+
+#[uniffi::remote(Record)]
+pub struct LibrarySnapshot {
+    pub words: Vec<ItemView>,
+    pub missing: Vec<i64>,
+    pub tags: Vec<String>,
+    pub collections: Vec<String>,
+    pub smart_filters: HashMap<String, LibraryFilter>,
 }
 
 #[uniffi::remote(Enum)]

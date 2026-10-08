@@ -5,21 +5,35 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 use vocab_core::{ItemPatch, LibraryFilter, LibraryView, Result, VocabItem};
 
+use crate::dictionaries::Loaded;
 use crate::dto::{BulkAction, BulkResult, GroupView, ItemView};
+use crate::ranks::RankTable;
 use crate::{Error, Shouci};
 
-/// One word with its tags, collections, and destinations.
-pub(crate) fn item_view(conn: &Connection, item: VocabItem) -> Result<ItemView> {
+/// One word with its tags, collections, and destinations, and its ranks
+/// when a dictionary is loaded.
+pub(crate) fn item_view(
+    conn: &Connection,
+    item: VocabItem,
+    ranks: Option<&RankTable>,
+) -> Result<ItemView> {
     let tags = vocab_db::item_tags(conn, item.id)?;
     let collections = vocab_db::item_collections(conn, item.id)?;
     let destinations = vocab_db::item_destinations(conn, item.id)?;
-    Ok(ItemView::new(item, tags, collections, destinations))
+    let ranks = ranks
+        .map(|table| table.of(&item.simplified))
+        .unwrap_or_default();
+    Ok(ItemView::new(item, tags, collections, destinations, ranks))
 }
 
 /// Many words, loading their groups in three queries instead of three each.
 /// The groups are loaded for the whole library, however few `items` there
 /// are: three indexed queries, cheaper than one round trip per word.
-pub(crate) fn item_views(conn: &Connection, items: Vec<VocabItem>) -> Result<Vec<ItemView>> {
+pub(crate) fn item_views(
+    conn: &Connection,
+    items: Vec<VocabItem>,
+    ranks: Option<&RankTable>,
+) -> Result<Vec<ItemView>> {
     let mut tags = vocab_db::tags_by_item(conn)?;
     let mut collections = vocab_db::collections_by_item(conn)?;
     let mut destinations: HashMap<i64, Vec<String>> = vocab_db::destinations_by_item(conn)?;
@@ -27,14 +41,40 @@ pub(crate) fn item_views(conn: &Connection, items: Vec<VocabItem>) -> Result<Vec
         .into_iter()
         .map(|item| {
             let id = item.id;
+            let word_ranks = ranks
+                .map(|table| table.of(&item.simplified))
+                .unwrap_or_default();
             ItemView::new(
                 item,
                 tags.remove(&id).unwrap_or_default(),
                 collections.remove(&id).unwrap_or_default(),
                 destinations.remove(&id).unwrap_or_default(),
+                word_ranks,
             )
         })
         .collect())
+}
+
+/// Whether a word meets `filter`'s HSK and frequency conditions, which the
+/// database can't check: the ranks come from the dictionaries. Before they
+/// load, every word is at no HSK level and not in the frequency list.
+pub(crate) fn admits(filter: &LibraryFilter, ranks: Option<&RankTable>, simplified: &str) -> bool {
+    if !filter.asks_ranks() {
+        return true;
+    }
+    let ranks = ranks.map(|table| table.of(simplified)).unwrap_or_default();
+    filter.admits_ranks(ranks.hsk, ranks.frequency)
+}
+
+/// The words matching `filter`, HSK and frequency included, newest first.
+pub(crate) fn list(
+    conn: &Connection,
+    filter: &LibraryFilter,
+    ranks: Option<&RankTable>,
+) -> Result<Vec<VocabItem>> {
+    let mut items = vocab_db::list_items(conn, filter)?;
+    items.retain(|item| admits(filter, ranks, &item.simplified));
+    Ok(items)
 }
 
 impl Shouci {
@@ -45,8 +85,10 @@ impl Shouci {
     /// Storage errors.
     pub fn list_items(&self, filter: &LibraryFilter) -> Result<Vec<ItemView>> {
         let conn = self.reader()?;
-        let items = vocab_db::list_items(&conn, filter)?;
-        item_views(&conn, items)
+        let loaded = self.loaded_opt();
+        let ranks = loaded.as_deref().map(Loaded::ranks);
+        let items = list(&conn, filter, ranks)?;
+        item_views(&conn, items, ranks)
     }
 
     /// # Errors
@@ -55,7 +97,8 @@ impl Shouci {
     pub fn item(&self, id: i64) -> Result<ItemView> {
         let conn = self.reader()?;
         let item = vocab_db::require_item(&conn, id)?;
-        item_view(&conn, item)
+        let loaded = self.loaded_opt();
+        item_view(&conn, item, loaded.as_deref().map(Loaded::ranks))
     }
 
     /// Edits a word's fields. Changing its characters or reading into
@@ -82,6 +125,7 @@ impl Shouci {
         patch: &ItemPatch,
         actions: &[BulkAction],
     ) -> Result<ItemView> {
+        let loaded = self.loaded_opt();
         let mut conn = self.writer()?;
         // One transaction, so another process's edit in between is never
         // overwritten with fields read before it.
@@ -91,7 +135,7 @@ impl Shouci {
                 apply(tx, id, action)?;
             }
             let item = vocab_db::require_item(tx, id)?;
-            item_view(tx, item)
+            item_view(tx, item, loaded.as_deref().map(Loaded::ranks))
         })
     }
 
@@ -157,7 +201,22 @@ impl Shouci {
     /// [`crate::ErrorKind::NotFound`], [`crate::ErrorKind::Conflict`] when
     /// the new name is taken, or a storage error.
     pub fn rename_tag(&self, from: &str, to: &str) -> Result<()> {
-        vocab_db::rename_tag(&*self.writer()?, from, to)
+        // With the smart collections that name it.
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| vocab_db::rename_tag(tx, from, to))
+    }
+
+    /// Gives every word tagged `from` the tag `into` instead, then deletes
+    /// `from`: the way to fold `HSK1` into `HSK 1`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::ErrorKind::NotFound`] if either tag is missing,
+    /// [`crate::ErrorKind::Invalid`] if they are the same tag, or a storage
+    /// error. Nothing changes then.
+    pub fn merge_tags(&self, from: &str, into: &str) -> Result<()> {
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| vocab_db::merge_tags(tx, from, into))
     }
 
     /// Deletes a tag; its words stay.
@@ -166,7 +225,8 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::NotFound`] or a storage error.
     pub fn delete_tag(&self, name: &str) -> Result<()> {
-        vocab_db::delete_tag(&*self.writer()?, name)
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| vocab_db::delete_tag(tx, name))
     }
 
     /// # Errors
@@ -192,7 +252,22 @@ impl Shouci {
     /// [`crate::ErrorKind::NotFound`], [`crate::ErrorKind::Conflict`] when
     /// the new name is taken, or a storage error.
     pub fn rename_collection(&self, from: &str, to: &str) -> Result<()> {
-        vocab_db::rename_collection(&*self.writer()?, from, to)
+        // With the smart collections that name it.
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| vocab_db::rename_collection(tx, from, to))
+    }
+
+    /// Puts every word of collection `from` into `into`, then deletes
+    /// `from`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::ErrorKind::NotFound`] if either collection is missing,
+    /// [`crate::ErrorKind::Invalid`] if they are the same collection, or a
+    /// storage error. Nothing changes then.
+    pub fn merge_collections(&self, from: &str, into: &str) -> Result<()> {
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| vocab_db::merge_collections(tx, from, into))
     }
 
     /// Deletes a collection; its words stay.
@@ -201,7 +276,8 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::NotFound`] or a storage error.
     pub fn delete_collection(&self, name: &str) -> Result<()> {
-        vocab_db::delete_collection(&*self.writer()?, name)
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| vocab_db::delete_collection(tx, name))
     }
 
     /// Turns a tag into a collection of the same name (the tag goes away).

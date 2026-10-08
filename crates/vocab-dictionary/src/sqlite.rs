@@ -372,6 +372,15 @@ pub struct SqliteDictionary {
     schema_version: String,
 }
 
+/// How common a headword is. Ranks belong to the simplified form: the build
+/// gives every entry written that way the same frequency and HSK level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadwordRanks {
+    pub simplified: String,
+    pub frequency_rank: Option<u64>,
+    pub hsk_rank: Option<u64>,
+}
+
 impl SqliteDictionary {
     /// Opens a built `dictionary.db` read-only.
     ///
@@ -425,6 +434,34 @@ impl SqliteDictionary {
             out.push((row.get(0)?, row.get(1)?));
         }
         Ok(out)
+    }
+
+    /// Every headword with a frequency rank or an HSK level: a few tens of
+    /// thousands of rows, read at once so a whole library can be looked up
+    /// without a query per word.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the connection is poisoned.
+    pub fn headword_ranks(&self) -> Result<Vec<HeadwordRanks>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| VocabError::new("dictionary connection poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT simplified, min(frequency_rank), min(hsk_rank) FROM dictionary_entries \
+             WHERE frequency_rank IS NOT NULL OR hsk_rank IS NOT NULL \
+             GROUP BY simplified ORDER BY simplified",
+        )?;
+        let rank = |value: Option<i64>| value.and_then(|v| u64::try_from(v).ok());
+        let rows = stmt.query_map([], |row| {
+            Ok(HeadwordRanks {
+                simplified: row.get(0)?,
+                frequency_rank: rank(row.get(1)?),
+                hsk_rank: rank(row.get(2)?),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// The [`MAX_RETRIEVAL`] glosses most likely to define `query`, when

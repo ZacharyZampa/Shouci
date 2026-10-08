@@ -123,6 +123,16 @@ CREATE INDEX idx_transfer_items_run ON transfer_items(run_id);
 CREATE INDEX idx_transfer_items_word ON transfer_items(simplified COLLATE NOCASE, reading_key);
 ";
 
+/// Smart collections (`smart.rs`): a name and a filter, kept as JSON.
+const V2: &str = r"
+CREATE TABLE smart_collections (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    filter TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+";
+
 /// One step forward.
 pub(crate) enum Migration {
     Sql(&'static str),
@@ -131,7 +141,7 @@ pub(crate) enum Migration {
     Rust(fn(&Transaction<'_>) -> Result<()>),
 }
 
-const MIGRATIONS: &[Migration] = &[Migration::Sql(V1)];
+const MIGRATIONS: &[Migration] = &[Migration::Sql(V1), Migration::Sql(V2)];
 
 /// The schema version this build writes.
 #[allow(clippy::cast_possible_wrap)] // a handful of migrations
@@ -258,7 +268,13 @@ ALTER TABLE items_new RENAME TO items;
              INSERT INTO item_tags (item_id, tag_id) VALUES (1, 1);",
         )
         .unwrap();
-        let steps = [Migration::Sql(super::V1), Migration::Sql(REBUILD_ITEMS)];
+        // Every migration, then the rebuild: one step past the latest.
+        assert_eq!(MIGRATIONS.len(), 2, "list every migration here");
+        let steps = [
+            Migration::Sql(super::V1),
+            Migration::Sql(super::V2),
+            Migration::Sql(REBUILD_ITEMS),
+        ];
         run(&mut conn, &steps).unwrap();
         let tagged: i64 = conn
             .query_row("SELECT count(*) FROM item_tags", [], |row| row.get(0))
@@ -268,7 +284,6 @@ ALTER TABLE items_new RENAME TO items;
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
         assert_eq!(foreign_keys, 1, "back on afterwards");
-        assert_eq!(MIGRATIONS.len(), 1);
     }
 
     #[test]

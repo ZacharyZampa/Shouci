@@ -19,7 +19,9 @@ mod export;
 mod import;
 mod resolve;
 
-pub use export::{ExportPlan, ExportRequest, ExportScope, apply_export, plan_export};
+pub use export::{
+    ExportPlan, ExportRequest, ExportScope, apply_export, plan_export, plan_export_where,
+};
 pub use import::{
     FieldChange, FieldConflict, ImportAction, ImportCounts, ImportField, ImportPlan, ImportPolicy,
     Incoming, NameChange, PlannedLine, SkipReason, apply_import, plan_import,

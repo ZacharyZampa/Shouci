@@ -40,5 +40,5 @@ jobs:
         run: |
           macos/scripts/build-core.sh
           swift test --package-path macos/ShouciCore
-          xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci -configuration Debug \
-            -derivedDataPath macos/build/DerivedData -quiet build
+          xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci -destination 'platform=macOS' \
+            -derivedDataPath macos/build/DerivedData -quiet test

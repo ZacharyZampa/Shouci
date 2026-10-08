@@ -158,3 +158,18 @@ extension View {
                 .strokeBorder(Palette.line))
     }
 }
+
+/// A warning in a sheet: what went wrong, where it is seen.
+struct Notice: View {
+    var icon = "exclamationmark.triangle"
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: icon)
+            .font(.system(size: 13))
+            .foregroundStyle(Palette.warn)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Palette.warnSoft))
+    }
+}

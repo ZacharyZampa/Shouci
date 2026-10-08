@@ -93,15 +93,37 @@ in front; Shouci gets out of the way when you're done.
 Open it with **⌘O** in quick search, right-click 文 › Open Shouci, or open
 Shouci from Spotlight. While it's open, Shouci has a Dock icon and menus.
 
-- Browse **All Vocabulary**, **Needs Review**, **Recently Added**,
-  **Archived**, and the **Trash**, or a collection or tag.
+- Browse **All Vocabulary**, **Needs Review**, **Not in a Collection**,
+  **Recently Added**, **Archived**, and the **Trash**, or a collection or
+  tag. Sort by date, pinyin, **HSK level**, or **frequency** (how common a
+  word is); words show their HSK level.
 - Search the toolbar field to find saved words and **add** new ones from the
   dictionary.
 - Select a word to see your entry next to the dictionary's; **Edit** (or
   Return, or double-click) changes it. **Add Word** (⌘N) adds one by hand.
 - Select several words (⌘-click, ⇧-click) to tag them, add them to a
-  collection, mark them for review, archive them, export them, or move them
-  to the Trash.
+  collection, take a tag or collection off them, mark them for review,
+  archive them, export them, or move them to the Trash.
+- Two tags or collections that should be one (`HSK1` and `HSK 1`):
+  right-click one › **Merge Into**, or rename it to the other's name.
+- **File Words…** in Not in a Collection (or ⇧⌘C anywhere) files words into
+  collections one after another: type a collection and Return files the
+  word and shows the next; Tab skips one. The collection you used last is
+  already picked, so a run of words for one collection is Return, Return,
+  Return.
+- **⌘Z** takes back a change made in the window: an edit, tags and
+  collections, archiving and the Trash, a rename, merge, or delete. It
+  refuses, changing nothing, when the word was changed elsewhere since (by
+  `shouci`, say). Emptying the Trash and imports can't be taken back.
+- **Filter** any view from the button above the list: HSK level, frequency,
+  review status, tags and collections a word has or hasn't, and when it was
+  added. Each condition shows as a chip above the list; click its × to take
+  it off.
+- **Save as Smart Collection…** keeps a filter in the sidebar. A smart
+  collection holds no words of its own: it shows whatever matches its filter
+  now, so words come and go as you tag, file, and add them. Select one to
+  change its filter in place, then **Save Changes**. ⌘Z takes back creating,
+  changing, renaming, or deleting one.
 
 ### Pleco and Anki
 
@@ -185,8 +207,13 @@ shouci export ~/Desktop/new.txt       # words new to Pleco; --to anki, --all
 ```
 
 Name a saved word by its id (from `shouci list`) or its characters. Add
-`--json` to any command for the result as JSON. `shouci --help` lists the
-rest: tags, collections, archiving, and dictionaries.
+`--json` to any command for the result as JSON; saved words carry their
+`hsk_rank` and `frequency_rank`. `shouci --help` lists the rest: tags and
+collections (`shouci tags merge hsk1 "HSK 1"`, `shouci list --no-collection`),
+filters (`shouci list --hsk 4 --frequency top-1000 --without-tag drilled`),
+smart collections (`shouci smart save "To Drill" --hsk 4`, `shouci list
+--smart "To Drill"`, `shouci export out.txt --smart "To Drill"`), archiving,
+and dictionaries.
 
 The first search downloads the dictionary if the app hasn't. Set `SHOUCI_HOME`
 to use a library somewhere else.
@@ -209,6 +236,7 @@ imports, **Ctrl+E** exports, **Ctrl+Q** quits.
 macos/scripts/build-core.sh              # the Rust core for the Mac app
 open macos/Shouci.xcodeproj              # the Mac app in Xcode
 swift test --package-path macos/ShouciCore
+xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci -destination 'platform=macOS' test
 ```
 
 More in [CONTRIBUTING.md](CONTRIBUTING.md) and

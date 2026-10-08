@@ -9,11 +9,13 @@ use vocab_db::{NewItem, Saved};
 use vocab_dictionary::{Candidate, DictionaryProvider};
 use vocab_search::{LibraryDoc, QueryKind, match_library};
 
+use crate::dictionaries::Loaded;
 use crate::dto::{
     CandidateView, DictionaryResults, LibraryResults, ManualWord, QuickAdd, SaveOutcome,
     SaveResult, SavedRef,
 };
 use crate::library::{item_view, item_views};
+use crate::ranks::RankTable;
 use crate::{Error, Shouci, check_query, count};
 
 /// Dictionary results returned when the caller gives no limit.
@@ -49,7 +51,7 @@ fn views(conn: &Connection, candidates: Vec<Candidate>) -> Result<Vec<CandidateV
         .collect()
 }
 
-fn save_result(conn: &Connection, saved: Saved) -> Result<SaveResult> {
+fn save_result(conn: &Connection, saved: Saved, ranks: Option<&RankTable>) -> Result<SaveResult> {
     let (outcome, item) = match saved {
         Saved::Inserted(item) => (SaveOutcome::Inserted, item),
         Saved::Existing(item) => (SaveOutcome::AlreadySaved, item),
@@ -58,7 +60,7 @@ fn save_result(conn: &Connection, saved: Saved) -> Result<SaveResult> {
     };
     Ok(SaveResult {
         outcome,
-        item: item_view(conn, item)?,
+        item: item_view(conn, item, ranks)?,
     })
 }
 
@@ -209,7 +211,8 @@ impl Shouci {
     ) -> Result<LibraryResults> {
         let query = check_query(query)?;
         let conn = self.reader()?;
-        let items = vocab_db::list_items(&conn, filter)?;
+        let loaded = self.loaded_opt();
+        let items = crate::library::list(&conn, filter, loaded.as_deref().map(Loaded::ranks))?;
         let limit = limit.map_or(usize::MAX, to_usize);
         if query.is_empty() {
             let total = count(items.len());
@@ -218,7 +221,7 @@ impl Shouci {
                 query: String::new(),
                 kind: None,
                 total,
-                items: item_views(&conn, items)?,
+                items: item_views(&conn, items, loaded.as_deref().map(Loaded::ranks))?,
             });
         }
         let docs: Vec<LibraryDoc<'_>> = items
@@ -248,7 +251,7 @@ impl Shouci {
             query: query.to_owned(),
             kind,
             total,
-            items: item_views(&conn, matched)?,
+            items: item_views(&conn, matched, loaded.as_deref().map(Loaded::ranks))?,
         })
     }
 
@@ -286,10 +289,11 @@ impl Shouci {
     /// process saving the same word in between is found, not reported as a
     /// conflict.
     fn save(&self, item: &NewItem) -> Result<SaveResult> {
+        let loaded = self.loaded_opt();
         let mut conn = self.writer()?;
         vocab_db::with_tx(&mut conn, |tx| {
             let saved = vocab_db::save_item(tx, item)?;
-            save_result(tx, saved)
+            save_result(tx, saved, loaded.as_deref().map(Loaded::ranks))
         })
     }
 
@@ -388,6 +392,43 @@ impl Shouci {
     ///
     /// [`crate::ErrorKind::Invalid`] without characters; storage errors.
     pub fn add_manual(&self, word: &ManualWord) -> Result<SaveResult> {
+        let item = self.manual_item(word)?;
+        let loaded = self.loaded_opt();
+        let mut conn = self.writer()?;
+        vocab_db::with_tx(&mut conn, |tx| {
+            let saved = vocab_db::save_item(tx, &item)?;
+            let id = saved.item().id;
+            for tag in &word.tags {
+                vocab_db::add_tag(tx, id, tag)?;
+            }
+            for collection in &word.collections {
+                vocab_db::add_to_collection(tx, id, collection)?;
+            }
+            // Tags change the word's revision; report it as stored.
+            let item = vocab_db::require_item(tx, id)?;
+            let ranks = loaded.as_deref().map(Loaded::ranks);
+            let outcome = save_result(tx, saved, ranks)?.outcome;
+            Ok(SaveResult {
+                outcome,
+                item: item_view(tx, item, ranks)?,
+            })
+        })
+    }
+
+    /// The saved word [`Shouci::add_manual`] would change for `word`: the
+    /// same word, perhaps in the trash, or one saved without a reading that
+    /// `word` completes. Read before saving, so an undo can put it back.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::ErrorKind::Invalid`] without characters; storage errors.
+    pub fn manual_match(&self, word: &ManualWord) -> Result<Option<i64>> {
+        let item = self.manual_item(word)?;
+        Ok(vocab_db::find_saved(&*self.reader()?, &item)?.map(|item| item.id))
+    }
+
+    /// The word [`Shouci::add_manual`] saves for `word`.
+    fn manual_item(&self, word: &ManualWord) -> Result<NewItem> {
         let simplified = word.simplified.trim();
         if simplified.is_empty() {
             return Err(Error::invalid("a word needs its characters"));
@@ -414,34 +455,14 @@ impl Shouci {
         } else {
             Verification::Confirmed
         };
-        let mut conn = self.writer()?;
-        vocab_db::with_tx(&mut conn, |tx| {
-            let saved = vocab_db::save_item(
-                tx,
-                &NewItem {
-                    simplified: simplified.to_owned(),
-                    traditional: traditional.clone().unwrap_or_default(),
-                    pinyin: pinyin.clone(),
-                    definition: definition.clone(),
-                    notes: text(&word.notes).unwrap_or_default(),
-                    verification,
-                    source: ItemSource::manual(),
-                },
-            )?;
-            let id = saved.item().id;
-            for tag in &word.tags {
-                vocab_db::add_tag(tx, id, tag)?;
-            }
-            for collection in &word.collections {
-                vocab_db::add_to_collection(tx, id, collection)?;
-            }
-            // Tags change the word's revision; report it as stored.
-            let item = vocab_db::require_item(tx, id)?;
-            let outcome = save_result(tx, saved)?.outcome;
-            Ok(SaveResult {
-                outcome,
-                item: item_view(tx, item)?,
-            })
+        Ok(NewItem {
+            simplified: simplified.to_owned(),
+            traditional: traditional.unwrap_or_default(),
+            pinyin,
+            definition,
+            notes: text(&word.notes).unwrap_or_default(),
+            verification,
+            source: ItemSource::manual(),
         })
     }
 

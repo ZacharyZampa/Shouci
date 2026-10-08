@@ -10,8 +10,9 @@ Spotlight opens the library window. Right-click 文 for Settings and Quit.
 
 | Path | Role |
 | --- | --- |
-| `Shouci.xcodeproj` | The app target (its files are the `Shouci/` folder) |
+| `Shouci.xcodeproj` | The app target (its files are the `Shouci/` folder) and `ShouciTests` |
 | `Shouci/` | The app: AppKit for 文, the panel, the windows, and the shortcut; SwiftUI for what's inside |
+| `ShouciTests/` | The app's logic, tested against a scratch library: the target compiles `Shouci/` itself, so nothing launches |
 | `ShouciCore/` | Swift package: the core as Swift (`ShouciCore.swift` is generated) and its tests |
 | `scripts/build-core.sh` | Builds the Rust core into `ShouciCore/ShouciFFI.xcframework` and regenerates the bindings |
 | `scripts/package.sh` | Release build, installed to `~/Applications/Shouci.app` |
@@ -27,6 +28,7 @@ macos/scripts/build-core.sh               # once, and after Rust changes
 open macos/Shouci.xcodeproj               # or:
 xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci build
 swift test --package-path macos/ShouciCore
+xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci -destination 'platform=macOS' test
 macos/scripts/package.sh                  # install a release build
 macos/scripts/make-dmg.sh                 # a release build as dist/Shouci-<version>.dmg
 ```
@@ -48,9 +50,35 @@ build while the installed app is running, give it another bundle id:
 - The library window is an AppKit window around a SwiftUI
   `NavigationSplitView`. While it is open Shouci has a Dock icon and menus;
   closed, it is back to the menu bar only.
-- The window holds the whole library in memory (scopes, counts, and sorting
-  are instant) and polls the core's data version, so words saved from quick
-  search, `shouci`, or `shouci-tui` show up within two seconds.
+- The window holds the whole library in memory and polls the core's data
+  version, so words saved from quick search, `shouci`, or `shouci-tui` show
+  up within two seconds. The current view's list and the sidebar's counts
+  are worked out when the library, the view, or the sort changes
+  (`LibraryModel.refreshList`), never while drawing: a click redraws
+  several times, and grouping 15,000 words takes milliseconds, not nothing.
+- The filter panel and smart collections (`SmartCollections.swift`,
+  `FilterPanel.swift`) ask the core which words match (`matching_ids`)
+  rather than deciding in Swift: only the core knows HSK levels and
+  frequency. Each change to the filter is one call off the main thread; the
+  list shows the view's words that are among the ids that come back. A
+  reload asks again, along with every smart collection's words. The chips'
+  wording, and whether two filters ask for the same words, come from the
+  core too (`filter_conditions`, `same_conditions`), so `shouci smart` says
+  the same thing, as do the HSK choices (`hsk_levels`) and each word's
+  frequency band (`ItemView.frequency_band`).
+- ⌘Z (`LibraryUndo.swift`) asks the core for the words a change touches
+  before and after it, with every name and smart collection (`snapshot`),
+  and undo and redo put one or the other back (`restore`), which the core
+  refuses when a word or smart collection changed since. Adding a word and
+  quick search's undo work the same way: a word saved new is missing from
+  the first snapshot, so undoing deletes it and redoing puts it back. A
+  typed word is first looked up (`manual_match`), so one brought back from
+  the Trash goes back there. The
+  actions go to the library window's own undo manager, so the Edit menu
+  names them.
+- A problem shows in the editor or filing sheet while one is open
+  (`Notice`), and in the window's alert otherwise: the alert waits until no
+  sheet is open.
 - Import reads the file with the core's `detect_import`, the same call as
   the CLI and TUI: every format the core has, keeping the one that reads it
   best, so detection is the core's own parsers, not a guess in Swift. It

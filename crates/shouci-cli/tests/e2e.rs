@@ -320,6 +320,103 @@ fn tags_and_collections() {
 }
 
 #[test]
+fn merging_groups_and_finding_words_in_none() {
+    let library = Library::new();
+    library.run(&["add", "学校"]);
+    library.run(&["add", "米饭"]);
+    library.run(&["add", "猫"]);
+    library.run(&["collections", "add", "Week_1", "学校"]);
+    library.run(&["collections", "add", "Week 1", "米饭"]);
+    let unsorted = library.run(&["list", "--no-collection"]);
+    assert!(
+        unsorted.contains("猫") && !unsorted.contains("学校"),
+        "{unsorted}"
+    );
+    library.run(&["collections", "merge", "Week_1", "Week 1"]);
+    assert_eq!(library.run(&["collections"]).trim(), "Week 1  (2)");
+    library.run(&["tags", "add", "hsk1", "学校"]);
+    library.run(&["tags", "add", "HSK 1", "米饭"]);
+    library.run(&["tags", "merge", "hsk1", "HSK 1"]);
+    assert_eq!(library.run(&["tags"]).trim(), "HSK 1  (2)");
+}
+
+#[test]
+fn smart_collections_keep_a_filter_to_list_and_export_later() {
+    let library = Library::new();
+    for word in ["学校", "猫", "米饭"] {
+        library.run(&["add", word]);
+    }
+    library.run(&["tags", "add", "drilled", "猫"]);
+    library.run(&["collections", "add", "Food", "米饭"]);
+    let filtered = library.run(&[
+        "list",
+        "--without-tag",
+        "drilled",
+        "--without-collection",
+        "Food",
+    ]);
+    assert!(
+        filtered.contains("学校") && !filtered.contains("猫") && !filtered.contains("米饭"),
+        "{filtered}"
+    );
+
+    let saved = library.run(&[
+        "smart",
+        "save",
+        "To Drill",
+        "--without-tag",
+        "drilled",
+        "--without-collection",
+        "Food",
+    ]);
+    assert_eq!(
+        saved.trim(),
+        "saved smart collection To Drill (1 word): Not tagged drilled · Not in Food"
+    );
+    let listed = library.run(&["list", "--smart", "to drill"]);
+    assert!(
+        listed.contains("学校") && !listed.contains("猫"),
+        "{listed}"
+    );
+    assert_eq!(
+        library.run(&["smart"]).trim(),
+        "To Drill  (1)  Not tagged drilled · Not in Food"
+    );
+
+    library.run(&["tags", "rename", "drilled", "done"]);
+    let changed = library.run(&[
+        "smart",
+        "save",
+        "To Drill",
+        "--any-tag",
+        "done",
+        "--hsk",
+        "none",
+    ]);
+    assert_eq!(
+        changed.trim(),
+        "changed smart collection To Drill (1 word): No HSK level · Tagged done"
+    );
+    let json = library.json(&["smart", "list"]);
+    assert_eq!(json[0]["filter"]["any_tags"][0], "done");
+    assert_eq!(json[0]["item_ids"].as_array().unwrap().len(), 1);
+
+    let out = library.file("drill.txt");
+    library.run(&["export", path(&out), "--all", "--smart", "To Drill"]);
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        written.contains("猫") && !written.contains("学校"),
+        "{written}"
+    );
+
+    library.run(&["smart", "rename", "To Drill", "Done"]);
+    let (_, err) = library.fail(&["list", "--smart", "To Drill"]);
+    assert!(err.contains("no smart collection named To Drill"), "{err}");
+    library.run(&["smart", "delete", "Done"]);
+    assert!(library.run(&["smart"]).starts_with("no smart collections"));
+}
+
+#[test]
 fn import_then_export_only_what_is_new() {
     let library = Library::new();
     let pleco = fixture("pleco/v1/valid/basic-flashcards.txt");

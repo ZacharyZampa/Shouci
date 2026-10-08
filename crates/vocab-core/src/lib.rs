@@ -13,6 +13,6 @@ mod item;
 pub use dictionary::{DictionaryEntry, MatchBasis, SourceId, SourceVersion};
 pub use error::{ErrorKind, Result, VocabError};
 pub use item::{
-    ItemPatch, ItemSource, LibraryFilter, LibraryView, Lifecycle, SourceKind, Verification,
-    VocabItem,
+    FrequencyBand, ItemPatch, ItemSource, LibraryFilter, LibraryView, Lifecycle, SourceKind,
+    Verification, VocabItem,
 };

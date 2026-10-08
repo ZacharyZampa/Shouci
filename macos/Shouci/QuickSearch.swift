@@ -25,11 +25,14 @@ final class QuickSearch {
         var id: String { title }
     }
 
-    struct Saved {
+    struct Saved: Sendable {
         let result: SaveResult
-        /// Inserting or restoring can be taken back; the rest changed nothing
-        /// or only filled in a reading.
-        var canUndo: Bool { result.outcome == .inserted || result.outcome == .restored }
+        /// The library before and after the save, which undo puts back
+        /// (the core's `restore`).
+        let before: LibrarySnapshot
+        let after: LibrarySnapshot
+
+        var canUndo: Bool { result.canUndo(before: before) }
     }
 
     let app: AppModel
@@ -177,24 +180,43 @@ final class QuickSearch {
         Task {
             defer { isBusy = false }
             do {
-                let result: SaveResult
+                let saved: Saved
                 switch row {
                 case .candidate(let candidate):
-                    result = try await app.call { try $0.saveCandidate(candidate: candidate) }
+                    let known = candidate.saved.map { [$0.id] } ?? []
+                    saved = try await app.call { core in
+                        try Self.saving(core, known: known) { try $0.saveCandidate(candidate: candidate) }
+                    }
                 case .saveForReview(let text):
-                    result = try await app.call { try $0.addManual(word: ManualWord(simplified: text)) }
+                    saved = try await app.call { core in
+                        let word = ManualWord(simplified: text)
+                        // Saved like this before, perhaps in the trash.
+                        let known = try core.manualMatch(word: word).map { [$0] } ?? []
+                        return try Self.saving(core, known: known) { try $0.addManual(word: word) }
+                    }
                 }
-                didSave(result)
+                didSave(saved)
             } catch {
                 problem = describe(error)
             }
         }
     }
 
-    private func didSave(_ result: SaveResult) {
+    /// Saves as `save` does, reading the library before and after: `known`
+    /// is the word's id when it is saved already.
+    nonisolated private static func saving(
+        _ core: Core, known: [Int64], _ save: (Core) throws -> SaveResult
+    ) throws -> Saved {
+        let before = try core.snapshot(ids: known)
+        let result = try save(core)
+        return Saved(result: result, before: before, after: try core.snapshot(ids: known + [result.item.id]))
+    }
+
+    private func didSave(_ saved: Saved) {
         searching?.cancel()
+        // Clearing the query forgets the last save, so this one is kept after.
         query = ""
-        saved = Saved(result: result)
+        self.saved = saved
         loadRecent()
         if preferences.afterSave == .close { close() }
     }
@@ -204,15 +226,12 @@ final class QuickSearch {
     func undo() -> Bool {
         guard let saved, saved.canUndo, !isBusy else { return false }
         let item = saved.result.item
-        let purge = saved.result.outcome == .inserted
         isBusy = true
         Task {
             defer { isBusy = false }
             do {
-                try await app.call { core in
-                    _ = try core.bulk(ids: [item.id], action: .trash)
-                    if purge { _ = try core.bulk(ids: [item.id], action: .purge) }
-                }
+                // Refused, changing nothing, when the word changed since.
+                try await app.call { try $0.restore(target: saved.before, current: saved.after) }
                 self.saved = nil
                 removed = item.simplified
                 loadRecent()

@@ -1,8 +1,8 @@
 import ShouciCore
 import SwiftUI
 
-/// Library views, collections, and tags, with the dictionary's state below
-/// (mockup 01).
+/// Library views, smart collections, collections, and tags, with the
+/// dictionary's state below (mockup 01).
 struct LibrarySidebar: View {
     @Bindable var model: LibraryModel
 
@@ -11,9 +11,28 @@ struct LibrarySidebar: View {
             Section("Library") {
                 row(.all, "All Vocabulary", icon: "list.bullet.rectangle")
                 row(.needsReview, "Needs Review", icon: "exclamationmark.triangle", tint: Palette.warn)
+                row(.noCollection, "Not in a Collection", icon: "tray")
                 row(.recent, "Recently Added", icon: "clock", counted: false)
                 row(.archived, "Archived", icon: "archivebox")
                 row(.trash, "Trash", icon: "trash")
+            }
+            Section {
+                ForEach(model.smartCollections) { smart in
+                    Label(smart.name, systemImage: "gearshape")
+                        .badge(smart.itemIds.count)
+                        .tag(LibraryModel.Scope.smart(smart.name))
+                        .contextMenu {
+                            Button("Rename…") {
+                                model.naming = .init(purpose: .renameSmartCollection(smart.name), text: smart.name)
+                            }
+                            Button("Delete Smart Collection") { model.deleteSmartCollection(smart.name) }
+                        }
+                }
+            } header: {
+                header(
+                    "Smart Collections", adding: "New Smart Collection",
+                    help: "New Smart Collection: filter All Vocabulary, then save the filter",
+                    action: model.newSmartCollection)
             }
             Section {
                 ForEach(model.collections) { collection in
@@ -24,21 +43,13 @@ struct LibrarySidebar: View {
                             Button("Rename…") {
                                 model.naming = .init(purpose: .renameCollection(collection.name), text: collection.name)
                             }
+                            mergeMenu(.collection, from: collection.name, into: model.collections)
                             Button("Delete Collection") { model.deleteCollection(collection.name) }
                         }
                 }
             } header: {
-                HStack {
-                    Text("Collections")
-                    Spacer()
-                    Button {
-                        model.naming = .init(purpose: .newCollection(then: []), text: "")
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .buttonStyle(.plain)
-                    .help("New Collection")
-                    .accessibilityLabel("New Collection")
+                header("Collections", adding: "New Collection") {
+                    model.naming = .init(purpose: .newCollection(then: []), text: "")
                 }
             }
             if !model.tags.isEmpty {
@@ -51,6 +62,7 @@ struct LibrarySidebar: View {
                                 Button("Rename…") {
                                     model.naming = .init(purpose: .renameTag(tag.name), text: tag.name)
                                 }
+                                mergeMenu(.tag, from: tag.name, into: model.tags)
                                 Button("Make a Collection") { model.makeCollection(fromTag: tag.name) }
                                 Button("Delete Tag") { model.deleteTag(tag.name) }
                             }
@@ -61,6 +73,22 @@ struct LibrarySidebar: View {
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             DictionaryFooter(app: model.app)
+        }
+    }
+
+    /// A section's title, with a + that adds to it.
+    private func header(
+        _ title: String, adding: String, help: String? = nil, action: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Button(action: action) {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.plain)
+            .help(help ?? adding)
+            .accessibilityLabel(adding)
         }
     }
 
@@ -76,8 +104,21 @@ struct LibrarySidebar: View {
         } icon: {
             Image(systemName: icon).foregroundStyle(tint ?? Palette.accent)
         }
-        .badge(counted ? model.items(in: scope).count : 0)
+        .badge(counted ? model.count(of: scope) : 0)
         .tag(scope)
+    }
+
+    /// Fold this tag or collection into another: `HSK1` into `HSK 1`.
+    @ViewBuilder
+    private func mergeMenu(_ kind: GroupKind, from name: String, into groups: [GroupView]) -> some View {
+        let others = groups.filter { $0.name != name }
+        if !others.isEmpty {
+            Menu("Merge Into") {
+                ForEach(others) { other in
+                    Button(other.name) { model.merging = .init(kind: kind, from: name, into: other.name) }
+                }
+            }
+        }
     }
 }
 
@@ -113,6 +154,9 @@ private struct DictionaryFooter: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Rows scroll under the footer; without a background they show
+        // through its text.
+        .background(.bar)
         .overlay(alignment: .top) { Rectangle().fill(Palette.line).frame(height: 1) }
     }
 }

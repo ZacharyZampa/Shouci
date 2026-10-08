@@ -183,6 +183,65 @@ fn edit_organize_and_trash() {
 }
 
 #[test]
+fn smart_collections_through_the_ffi() {
+    let lib = library();
+    let QuickAddResult::Saved { result } = lib.core.quick_add("学校".into(), None).unwrap()
+    else {
+        panic!("学校 has one match");
+    };
+    let unsorted = LibraryFilter {
+        no_collection: true,
+        without_tags: vec!["drilled".into()],
+        ..LibraryFilter::default()
+    };
+    assert_eq!(
+        lib.core.matching_ids(unsorted.clone()).unwrap(),
+        vec![result.item.id]
+    );
+    let smart = lib
+        .core
+        .create_smart_collection("Unsorted".into(), unsorted.clone())
+        .unwrap();
+    assert_eq!(smart.item_ids, vec![result.item.id]);
+    assert_eq!(smart.filter, unsorted);
+    lib.core
+        .rename_smart_collection("Unsorted".into(), "To File".into())
+        .unwrap();
+    lib.core
+        .bulk(
+            vec![result.item.id],
+            BulkAction::AddTags(vec!["drilled".into()]),
+        )
+        .unwrap();
+    let all = lib.core.smart_collections().unwrap();
+    assert_eq!(all[0].name, "To File");
+    assert_eq!(all[0].item_ids, Vec::<i64>::new());
+    let err = lib
+        .core
+        .delete_smart_collection("missing".into())
+        .unwrap_err();
+    assert_eq!(kind(&err), ErrorKind::NotFound);
+    assert_eq!(shouci_ffi::frequency_bands().len(), 5);
+
+    let conditions = shouci_ffi::filter_conditions(unsorted.clone());
+    assert_eq!(conditions.len(), 2);
+    assert_eq!(conditions[0].label, "Not tagged drilled");
+    assert!(shouci_ffi::filter_has_conditions(unsorted.clone()));
+    let one_left = conditions[1].without.clone();
+    assert!(!shouci_ffi::filter_has_conditions(LibraryFilter {
+        without_tags: Vec::new(),
+        ..one_left
+    }));
+    assert!(shouci_ffi::same_conditions(
+        unsorted.clone(),
+        LibraryFilter {
+            without_tags: vec!["Drilled".into()],
+            ..unsorted
+        }
+    ));
+}
+
+#[test]
 fn a_saved_word_in_another_dictionary() {
     let lib = library();
     let QuickAddResult::Saved { result } = lib.core.quick_add("学校".into(), None).unwrap()

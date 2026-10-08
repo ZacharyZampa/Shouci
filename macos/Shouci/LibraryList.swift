@@ -8,17 +8,22 @@ extension LibraryModel {
     enum Scope: Hashable {
         case all
         case needsReview
+        case noCollection
         case recent
         case archived
         case trash
         case collection(String)
         case tag(String)
+        /// A saved filter (`SmartCollections.swift`).
+        case smart(String)
     }
 
     enum Sort: String, CaseIterable, Identifiable {
         case added
         case edited
         case pinyin
+        case hsk
+        case frequency
 
         var id: Self { self }
 
@@ -27,6 +32,8 @@ extension LibraryModel {
             case .added: "Date Added"
             case .edited: "Date Edited"
             case .pinyin: "Pinyin"
+            case .hsk: "HSK Level"
+            case .frequency: "Frequency"
             }
         }
     }
@@ -83,6 +90,8 @@ enum LibraryList {
             return all.filter { $0.lifecycle == .active }
         case .needsReview:
             return all.filter { $0.lifecycle == .active && $0.verification == .needsReview }
+        case .noCollection:
+            return all.filter { $0.lifecycle == .active && $0.collections.isEmpty }
         case .recent:
             let since = now.addingTimeInterval(-7 * 86_400)
             return all.filter { $0.lifecycle == .active && (dates[$0.id]?.added ?? .distantPast) >= since }
@@ -94,20 +103,45 @@ enum LibraryList {
             return all.filter { $0.lifecycle != .trashed && $0.collections.contains(name) }
         case .tag(let name):
             return all.filter { $0.lifecycle != .trashed && $0.tags.contains(name) }
+        case .smart:
+            // Its filter decides: the model keeps the words the core matched.
+            return all.filter { $0.lifecycle != .trashed }
         }
     }
 
     /// A scope's words, sorted and grouped under headings: by first letter
-    /// of the reading, or by when they were added, edited, archived, or
-    /// trashed.
+    /// of the reading, HSK level, or how common they are, or by when they
+    /// were added, edited, archived, or trashed. The Archived and Trash
+    /// views always go by when words went there.
     static func groups(
         _ items: [ItemView], scope: Scope, sort: LibraryModel.Sort, dates: [Int64: ItemDates], now: Date
     ) -> [Group] {
-        if sort == .pinyin {
-            let sorted = items.sorted { ($0.pinyin.isEmpty ? "~" : $0.pinyin.lowercased()) < ($1.pinyin.isEmpty ? "~" : $1.pinyin.lowercased()) }
+        let sort = scope == .trash || scope == .archived ? .added : sort
+        // Sort keys are worked out once per word, not once per comparison.
+        switch sort {
+        case .pinyin:
+            let sorted = items.map { (readingOrder($0), $0) }.sorted { $0.0 < $1.0 }.map(\.1)
             return grouped(sorted) { item in
                 item.pinyin.first.map { String($0).uppercased() } ?? "No reading"
             }
+        case .hsk:
+            // Level, then the more common word first, then the reading.
+            let sorted = items
+                .map { ($0.hskRank ?? .max, $0.frequencyRank ?? .max, readingOrder($0), $0) }
+                .sorted { ($0.0, $0.1, $0.2) < ($1.0, $1.1, $1.2) }
+                .map(\.3)
+            let levels = Dictionary(
+                Set(sorted.compactMap(\.hskRank)).map { ($0, hskLevel(rank: $0)) },
+                uniquingKeysWith: { first, _ in first })
+            return grouped(sorted) { item in item.hskRank.flatMap { levels[$0] } ?? "Not in HSK" }
+        case .frequency:
+            let sorted = items
+                .map { ($0.frequencyRank ?? .max, readingOrder($0), $0) }
+                .sorted { ($0.0, $0.1) < ($1.0, $1.1) }
+                .map(\.2)
+            return grouped(sorted) { bandNames[$0.frequencyBand] ?? "" }
+        case .added, .edited:
+            break
         }
         let date: (ItemView) -> Date = { item in
             let dated = dates[item.id]
@@ -117,15 +151,41 @@ enum LibraryList {
             default: return (sort == .edited ? dated?.edited : dated?.added) ?? .distantPast
             }
         }
-        return grouped(items.sorted { date($0) > date($1) }) { period(date($0), now: now) }
+        let sorted = items.map { (date($0), $0) }.sorted { $0.0 > $1.0 }
+        // Newest first, so one day's words are neighbours: each day's
+        // heading is worked out once, not once per word.
+        let calendar = Calendar.current
+        var day: DateInterval?
+        var heading = ""
+        let titled = sorted.map { dated, item in
+            if day?.contains(dated) != true {
+                day = calendar.dateInterval(of: .day, for: dated)
+                heading = period(dated, now: now)
+            }
+            return (heading, item)
+        }
+        return grouped(titled)
     }
+
+    /// Readings in alphabetical order, words without one last.
+    private static func readingOrder(_ item: ItemView) -> String {
+        item.pinyin.isEmpty ? "~" : item.pinyin.lowercased()
+    }
+
+    /// The core's bands of the frequency list, most common first.
+    static let bands = frequencyBands()
+    /// Each band's name, to head the words the core put in it.
+    private static let bandNames = Dictionary(uniqueKeysWithValues: bands.map { ($0.band, $0.label) })
 
     /// Consecutive words with the same heading, as groups.
     private static func grouped(_ items: [ItemView], by title: (ItemView) -> String) -> [Group] {
+        grouped(items.map { (title($0), $0) })
+    }
+
+    private static func grouped(_ titled: [(String, ItemView)]) -> [Group] {
         var groups: [Group] = []
         var current: (title: String, rows: [LibraryModel.Row])?
-        for item in items {
-            let key = title(item)
+        for (key, item) in titled {
             if current?.title != key {
                 if let current { groups.append(Group(title: current.title, rows: current.rows)) }
                 current = (key, [])

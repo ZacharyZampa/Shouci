@@ -89,7 +89,7 @@ Two kinds of file, never mixed:
 
 | File | Role |
 | --- | --- |
-| `user.db` | Saved words, tags, collections, the transfer ledger, settings. Written. |
+| `user.db` | Saved words, tags, collections, smart collections, the transfer ledger, settings. Written. |
 | `dictionaries/<id>.db` | One per dictionary, read-only, describing itself in `dictionary_metadata`. `cc-cedict.db` is CC-CEDICT with OpenSubtitles frequency and HSK 3.0 levels. |
 
 Where they are (`Config::from_env`):
@@ -143,6 +143,53 @@ A saved word has two independent axes, **verification** (`confirmed`,
 change. Its identity is the simplified form, the traditional form, and the
 reading ignoring how tones are written; saving the same word twice changes
 nothing.
+
+A word's **HSK level and frequency rank** (`ItemView::hsk_rank`,
+`frequency_rank`) are looked up in the loaded dictionaries every time it is
+read, never stored with it (`shouci-core/src/ranks.rs`). The dictionaries
+rank a headword's simplified form, so the lookup is a table by simplified
+form, built once per load on the loading thread. Before the dictionaries
+load, words have none; the Mac window reloads when they are ready.
+
+A **filter** (`LibraryFilter`) narrows listings, search, and export. Every
+condition must hold; within one that names several values (HSK levels,
+tags any of which will do), any value does. The database answers the
+conditions it can (`vocab-db` `list_items`: tags, collections, status,
+when added); the core checks HSK levels and frequency bands against the
+rank table (`library::admits`), since only the dictionaries know them.
+`Shouci::matching_ids` gives just the ids, for a frontend that holds the
+library itself (the Mac window).
+
+A **smart collection** is a name and a filter, kept as JSON in
+`smart_collections` (`vocab-db/src/smart.rs`); its words are worked out each
+time it is read, never stored. JSON lets a later version add a condition
+without a migration, so `LibraryFilter`'s field names and `FrequencyBand`'s
+stored names (`top1000`, `unlisted`) are a storage format: pinned by
+`json_shapes_are_stable`. Renaming or merging a tag or collection renames it
+in every filter in the same transaction (`organize.rs` calls
+`smart::follow_rename`), and undoing it puts the old filter back, so a smart
+collection keeps finding the same words. Turning a tag into a collection
+asks for the collection instead, where the filter can say it that way
+(`smart::follow_tag_to_collection`); a filter that keeps words out of
+collections keeps asking for the tag.
+
+**Undo** is two calls (`shouci-core/src/undo.rs`). A frontend reads the words
+a change touches before and after it (`Shouci::snapshot`); undoing restores
+the first reading and redoing the second (`Shouci::restore`). A snapshot
+holds the words with their tags and collections, every tag and collection
+name, and every smart collection's filter, so one mechanism covers edits,
+archive and trash, tags and collections, renames, merges, and deletes, and
+smart collections. A word a change saved is missing from the first
+snapshot: undoing deletes it for good, and redoing puts it back with its id
+(`vocab_db::reinsert_item`; ids are never reused). A frontend saving a typed
+word reads the word it would change first (`Shouci::manual_match`), so a
+word brought back from the Trash goes back there. A restore refuses,
+changing nothing, when a word or smart collection is no longer as the
+change left it, so an undo never overwrites what another window, quick
+search, or `shouci` did since; a word deleted for good while the change ran
+is one the snapshot after it found missing, so an undo doesn't bring it
+back. Words are compared by what they hold, not by
+`rev`, so undoing several changes in turn works.
 
 ## Search path
 
@@ -310,9 +357,12 @@ cargo run -p vocab-dictionary --example ingest -- <cedict.u8> <out.db> [--freque
 | Import and export rules | `vocab-exchange/src/{import,export,resolve}.rs` |
 | A file format | its connector crate |
 | Schema | a new migration in `vocab-db/src/migrate.rs` |
+| A filter condition | `LibraryFilter` (`vocab-core/src/item.rs`); the SQL in `vocab-db` `items::conditions`, or `admits_ranks` if it needs the dictionaries; its wording in `shouci-core` `text::filter_conditions`; `shouci-cli` `Conditions` (and `--smart`'s conflicts); the Mac `FilterPanel.swift` |
 | CLI commands and output | `shouci-cli/src/main.rs`, `text.rs` |
 | TUI keys and screens | `shouci-tui/src/app/`, `ui.rs` |
 | The Swift API | `shouci-ffi/src/lib.rs` (methods), `remote.rs` (types) |
+| A change ⌘Z takes back | through `record` (`macos/Shouci/LibraryUndo.swift`); if it changes what `LibrarySnapshot` doesn't hold, `shouci-core/src/undo.rs` too |
+| The Mac app's logic | `macos/Shouci/`, tested in `macos/ShouciTests/` |
 
 Do not pull in tantivy or fuzzy matchers for dictionary lookup. FTS5 is
 retrieval; ranking is domain-specific.
@@ -348,7 +398,7 @@ Product I/O first: a query or file in, a headword or saved word out.
 | --- | --- |
 | `./scripts/check.sh` | crate boundaries, `fmt --check`, clippy `-D warnings`, `cargo test --workspace` (fetches the dictionary if missing) |
 | pre-commit | `./scripts/setup-hooks.sh` → `scripts/githooks/pre-commit` runs `check.sh` |
-| CI | `.github/workflows/ci.yml` on macOS: `check.sh`, then the Mac app (`build-core.sh`, `swift test`, `xcodebuild`) |
+| CI | `.github/workflows/ci.yml` on macOS: `check.sh`, then the Mac app (`build-core.sh`, `swift test`, `xcodebuild test`) |
 
 Coverage:
 
@@ -364,6 +414,12 @@ Coverage:
   ratatui's `TestBackend`.
 - `shouci-ffi/tests/core.rs` and `macos/ShouciCore/Tests`: the Swift-facing
   API, from Rust and from Swift.
+- `macos/ShouciTests`: the Mac app's own logic (`xcodebuild … test`): the
+  list's sorting and headings, name suggestions, and the library window's
+  model against a scratch library, with undo and redo, filing, smart
+  collections, and where problems show. The target compiles the app's
+  sources rather than launching the app, so tests never touch the real
+  library, settings, or shortcut.
 - `vocab-exchange/tests/engine.rs`: import and export rules.
 - `vocab-pleco` and `vocab-anki` `tests/golden.rs`: each format's grammar
   and round trips.

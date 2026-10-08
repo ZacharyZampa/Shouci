@@ -11,8 +11,8 @@
 //! One load runs at a time. Changing which dictionaries are enabled during a
 //! load is applied when the load finishes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use vocab_core::{
     DictionaryEntry, ItemPatch, ItemSource, Result, SourceKind, VocabError, VocabItem,
@@ -26,6 +26,7 @@ use vocab_search::{DeterministicRanker, SearchService};
 
 use crate::dto::{DictionaryEntryView, DictionaryStatus, DictionaryView, ItemView, LoadingStage};
 use crate::library::item_view;
+use crate::ranks::RankTable;
 use crate::{Error, Shouci, count};
 
 /// Setting: enabled dictionary ids, comma-separated, highest priority first.
@@ -51,11 +52,19 @@ pub(crate) enum DictState {
 pub(crate) struct Loaded {
     pub search: SearchService<DictionarySet>,
     pub enabled: Vec<String>,
+    /// Built on the loading thread once search works (see `set_ready`).
+    ranks: OnceLock<RankTable>,
 }
 
 impl Loaded {
     pub fn provider(&self) -> &dyn DictionaryProvider {
         self.search.provider()
+    }
+
+    /// How common each headword is and its HSK level, read once.
+    pub fn ranks(&self) -> &RankTable {
+        self.ranks
+            .get_or_init(|| RankTable::or_empty(self.search.provider().headword_ranks()))
     }
 }
 
@@ -340,7 +349,12 @@ impl Shouci {
                     import_origin: None,
                 },
             )?;
-            item_view(tx, vocab_db::require_item(tx, item_id)?)
+            let loaded = self.loaded_opt();
+            item_view(
+                tx,
+                vocab_db::require_item(tx, item_id)?,
+                loaded.as_deref().map(Loaded::ranks),
+            )
         })
     }
 
@@ -386,11 +400,14 @@ impl Shouci {
     }
 
     fn set_ready(&self, loaded: Loaded, notes: Vec<String>) {
+        let loaded = Arc::new(loaded);
         self.set_state(DictState::Ready {
-            loaded: Arc::new(loaded),
+            loaded: Arc::clone(&loaded),
             updating: None,
             notes,
         });
+        // Here, while loading, rather than in the first listing after it.
+        loaded.ranks();
     }
 
     /// Progress from a download: in the background when search already
@@ -495,6 +512,7 @@ impl Shouci {
             Loaded {
                 search: SearchService::new(set, ranker),
                 enabled,
+                ranks: OnceLock::new(),
             },
             notes,
         ))

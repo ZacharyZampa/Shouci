@@ -1624,6 +1624,7 @@ name = "vocab-db"
 version = "1.0.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "vocab-core",
  "vocab-pinyin",
 ]

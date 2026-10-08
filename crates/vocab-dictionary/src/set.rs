@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use vocab_core::{DictionaryEntry, Result, SourceId};
 use vocab_pinyin::NormalizedPinyin;
 
-use crate::{Candidate, DictionaryInfo, DictionaryProvider, SqliteDictionary};
+use crate::{Candidate, DictionaryInfo, DictionaryProvider, HeadwordRanks, SqliteDictionary};
 
 /// The enabled dictionaries, highest priority first.
 ///
@@ -72,6 +72,19 @@ impl DictionarySet {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
+    }
+
+    /// Every member's ranked headwords, highest priority first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a member cannot be read.
+    pub fn headword_ranks(&self) -> Result<Vec<HeadwordRanks>> {
+        let mut out = Vec::new();
+        for (_, dict) in &self.members {
+            out.extend(dict.headword_ranks()?);
+        }
+        Ok(out)
     }
 
     /// Every member's results, highest priority first. An entry is dropped

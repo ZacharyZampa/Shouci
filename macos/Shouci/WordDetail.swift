@@ -128,6 +128,11 @@ private struct ItemDetail: View {
             } else {
                 Chip(text: "Confirmed", icon: "checkmark", style: .ok)
             }
+            if let level = item.hskRank { Chip(text: hskLevel(rank: level), style: .plain) }
+            if let rank = item.frequencyRank {
+                Chip(text: "Frequency #\(rank.formatted())", style: .plain)
+                    .help("Its place in the dictionary’s list of the most common words")
+            }
             if item.lifecycle == .archived { Chip(text: "Archived", icon: "archivebox", style: .plain) }
             if item.lifecycle == .trashed { Chip(text: "In the Trash", icon: "trash", style: .plain) }
             if !item.destinations.isEmpty {
@@ -522,6 +527,11 @@ private struct BulkPanel: View {
         return first.tags.filter { tag in items.allSatisfy { $0.tags.contains(tag) } }
     }
 
+    /// Names any selected word has, to take off all of them.
+    private func held(_ names: KeyPath<ItemView, [String]>) -> [String] {
+        Set(items.flatMap { $0[keyPath: names] }).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -543,6 +553,11 @@ private struct BulkPanel: View {
                                     if let tag { model.perform(.addTags([tag]), on: ids) }
                                 }
                             }
+                        let tagged = held(\.tags)
+                        if !tagged.isEmpty {
+                            Divider()
+                            removeMenu("Remove Tag", icon: "tag.slash", names: tagged) { .removeTags([$0]) }
+                        }
                         Divider()
                         Menu {
                             ForEach(model.collections) { collection in
@@ -558,6 +573,13 @@ private struct BulkPanel: View {
                         .menuStyle(.button)
                         .buttonStyle(.plain)
                         .menuIndicator(.hidden)
+                        let collected = held(\.collections)
+                        if !collected.isEmpty {
+                            Divider()
+                            removeMenu("Remove from Collection", icon: "folder.badge.minus", names: collected) {
+                                .removeFromCollection($0)
+                            }
+                        }
                         Divider()
                         if items.allSatisfy({ $0.verification == .needsReview }) {
                             action("Mark as Confirmed", icon: "checkmark.circle") {
@@ -594,6 +616,23 @@ private struct BulkPanel: View {
         } message: {
             Text("This can’t be undone.")
         }
+    }
+
+    /// A menu of `names`; choosing one takes it off every selected word that
+    /// has it.
+    private func removeMenu(
+        _ title: String, icon: String, names: [String], action: @escaping (String) -> BulkAction
+    ) -> some View {
+        Menu {
+            ForEach(names, id: \.self) { name in
+                Button(name) { model.perform(action(name), on: ids) }
+            }
+        } label: {
+            actionLabel(title, icon: icon)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
     }
 
     private func action(

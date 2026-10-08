@@ -4,11 +4,11 @@
 use std::fmt::Write;
 
 pub use shouci_core::text::counted;
-use shouci_core::text::{import_outcome, with_review};
+use shouci_core::text::{filter_conditions, hsk_level, import_outcome, with_review};
 use shouci_core::{
     CandidateView, ConnectorView, DictionaryEntryView, DictionaryView, ExportPlan, GroupView,
-    ImportPlan, ItemView, Lifecycle, MatchBasis, Severity, SourceKind, TransferSummary,
-    Verification,
+    ImportPlan, ItemView, LibraryFilter, Lifecycle, MatchBasis, Severity, SmartCollectionView,
+    SourceKind, TransferSummary, Verification,
 };
 
 /// Definitions in lists are cut to this many characters.
@@ -141,6 +141,17 @@ pub fn item_detail(
     if !marks.is_empty() {
         lines.push(marks.join(" · "));
     }
+    let ranks: Vec<String> = [
+        item.hsk_rank.map(hsk_level),
+        item.frequency_rank
+            .map(|rank| format!("frequency rank {rank}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !ranks.is_empty() {
+        lines.push(ranks.join(" · "));
+    }
     if !item.notes.is_empty() {
         lines.push(format!("notes: {}", item.notes));
     }
@@ -206,6 +217,39 @@ pub fn group_lines(groups: &[GroupView], none: &str) -> String {
         .map(|group| format!("{}  ({})", group.name, group.count))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `To Drill  (12)  HSK 4 · Needs Review · Not tagged drilled`.
+pub fn smart_lines(smart: &[SmartCollectionView]) -> String {
+    if smart.is_empty() {
+        return "no smart collections; `shouci smart save NAME` saves a filter as one".to_owned();
+    }
+    smart
+        .iter()
+        .map(|smart| {
+            format!(
+                "{}  ({})  {}",
+                smart.name,
+                smart.item_ids.len(),
+                filter_description(&smart.filter)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What a filter asks for: `HSK 4 or 5 · Needs Review · Not tagged drilled`,
+/// worded as the Mac window's chips are.
+pub fn filter_description(filter: &LibraryFilter) -> String {
+    let labels: Vec<String> = filter_conditions(filter)
+        .into_iter()
+        .map(|condition| condition.label)
+        .collect();
+    if labels.is_empty() {
+        "every word".to_owned()
+    } else {
+        labels.join(" · ")
+    }
 }
 
 pub fn dictionary_lines(dictionaries: &[DictionaryView]) -> String {
@@ -347,7 +391,7 @@ pub fn export_summary(summary: &TransferSummary, format: &str) -> String {
     lines.join("\n")
 }
 
-fn count(n: usize) -> u64 {
+pub fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 

@@ -7,12 +7,18 @@
 //! "xué xiào"`), so no frontend reimplements pinyin or definition
 //! formatting.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
-use vocab_core::{Lifecycle, MatchBasis, SourceKind, Verification, VocabItem};
+use vocab_core::{
+    FrequencyBand, LibraryFilter, Lifecycle, MatchBasis, SourceKind, Verification, VocabItem,
+};
 use vocab_dictionary::{Candidate, display_definition};
 use vocab_exchange::ImportPlan;
 use vocab_pinyin::tone_marks;
 use vocab_search::QueryKind;
+
+use crate::ranks::Ranks;
 
 /// A saved word.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +41,17 @@ pub struct ItemView {
     pub collections: Vec<String>,
     /// Connectors that have this word: exported there or imported from it.
     pub destinations: Vec<String>,
+    /// The word's place in the dictionaries' frequency list, 1 the most
+    /// common. `None` when it is not in the list, or no dictionary is
+    /// loaded yet.
+    pub frequency_rank: Option<u64>,
+    /// The band of the frequency list the rank falls in: what a list
+    /// grouped by frequency heads the word with. Unlisted when there is no
+    /// rank.
+    pub frequency_band: FrequencyBand,
+    /// Its HSK 3.0 level: 1–6, or 7 for the advanced band (7–9). `None`
+    /// when it has none, or no dictionary is loaded yet.
+    pub hsk_rank: Option<u64>,
     pub created_at: String,
     pub modified_at: String,
     pub archived_at: Option<String>,
@@ -59,6 +76,7 @@ impl ItemView {
         tags: Vec<String>,
         collections: Vec<String>,
         destinations: Vec<String>,
+        ranks: Ranks,
     ) -> Self {
         Self {
             pinyin_display: tone_marks(&item.pinyin),
@@ -80,6 +98,9 @@ impl ItemView {
             tags,
             collections,
             destinations,
+            frequency_rank: ranks.frequency,
+            frequency_band: FrequencyBand::of(ranks.frequency),
+            hsk_rank: ranks.hsk,
             created_at: item.created_at,
             modified_at: item.modified_at,
             archived_at: item.archived_at,
@@ -242,6 +263,24 @@ pub struct BulkResult {
     pub changed: u32,
 }
 
+/// Some words as they were at one moment, with every tag and collection
+/// name: what an undo puts back ([`crate::Shouci::snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LibrarySnapshot {
+    /// The words asked for that exist. A word a change saved is missing
+    /// from the snapshot before it.
+    pub words: Vec<ItemView>,
+    /// The ids asked for that no longer exist. A word the snapshot after a
+    /// change finds gone was deleted for good while the change ran, so an
+    /// undo doesn't bring it back.
+    pub missing: Vec<i64>,
+    pub tags: Vec<String>,
+    pub collections: Vec<String>,
+    /// Every smart collection's filter, by name: changing smart collections
+    /// changes them, and so does renaming or merging a tag or collection.
+    pub smart_filters: HashMap<String, LibraryFilter>,
+}
+
 /// A tag or a collection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupView {
@@ -257,6 +296,47 @@ impl From<vocab_db::NameCount> for GroupView {
             count: value.count,
         }
     }
+}
+
+/// A smart collection: a saved filter, and the words it matches now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartCollectionView {
+    pub name: String,
+    pub filter: LibraryFilter,
+    /// The words the filter matches now, newest first.
+    pub item_ids: Vec<i64>,
+}
+
+/// One condition of a filter, worded for people
+/// ([`crate::text::filter_conditions`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterConditionView {
+    /// Tells the conditions of one filter apart: `hsk`, `tag pets`.
+    pub id: String,
+    /// What it asks for: `HSK 4 or 5`, `Not tagged drilled`.
+    pub label: String,
+    /// The same filter without it: what taking it off leaves.
+    pub without: LibraryFilter,
+}
+
+/// A band of the frequency list, for a frontend that lists or names them
+/// ([`crate::text::frequency_bands`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrequencyBandView {
+    pub band: FrequencyBand,
+    /// `Top 1,000`.
+    pub label: String,
+    /// `Top 1k`, where space is short.
+    pub short_label: String,
+}
+
+/// An HSK level a filter can ask for ([`crate::text::hsk_levels`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HskLevelView {
+    /// As a filter holds it: 1–6, 7 for 7–9, 0 for none.
+    pub level: u64,
+    /// `4`, `7–9`, or `None`: short, under an HSK heading.
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

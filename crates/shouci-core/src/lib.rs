@@ -1,7 +1,8 @@
 //! The vocabulary core every Shouci frontend projects.
 //!
 //! [`Shouci`] owns the user's library and the dictionaries and exposes every
-//! use case as a method: search, capture, edit, organize, import, export.
+//! use case as a method: search, capture, edit, organize (smart collections
+//! too), import, export.
 //! Inputs and outputs are plain serializable values ([`dto`]); frontends
 //! only render them. The CLI prints them as JSON, the Mac app receives them
 //! over FFI, and a new UI is a new renderer over the same calls.
@@ -15,9 +16,12 @@ mod connectors;
 mod dictionaries;
 pub mod dto;
 mod library;
+mod ranks;
 mod search;
+mod smart;
 pub mod text;
 mod transfer;
+mod undo;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
@@ -30,15 +34,15 @@ use rusqlite::Connection;
 pub use config::{Config, expand_tilde, expand_tilde_in};
 pub use dto::{
     BulkAction, BulkResult, CandidateView, ConnectorView, DetectedImport, DictionaryEntryView,
-    DictionaryResults, DictionaryStatus, DictionaryView, GroupView, ItemView, LegacyImport,
-    LibraryResults, LoadingStage, ManualWord, QuickAdd, SaveOutcome, SaveResult, SavedRef,
-    SourceView,
+    DictionaryResults, DictionaryStatus, DictionaryView, FilterConditionView, FrequencyBandView,
+    GroupView, HskLevelView, ItemView, LegacyImport, LibraryResults, LibrarySnapshot, LoadingStage,
+    ManualWord, QuickAdd, SaveOutcome, SaveResult, SavedRef, SmartCollectionView, SourceView,
 };
 pub use search::DEFAULT_LIMIT;
 pub use vocab_core::connector::{Issue, Severity};
 pub use vocab_core::{
-    ErrorKind, ItemPatch, LibraryFilter, LibraryView, Lifecycle, MatchBasis, Result, SourceKind,
-    Verification, VocabError as Error,
+    ErrorKind, FrequencyBand, ItemPatch, LibraryFilter, LibraryView, Lifecycle, MatchBasis, Result,
+    SourceKind, Verification, VocabError as Error,
 };
 pub use vocab_exchange::{
     ExportPlan, ExportRequest, ExportScope, FieldChange, FieldConflict, ImportAction, ImportCounts,

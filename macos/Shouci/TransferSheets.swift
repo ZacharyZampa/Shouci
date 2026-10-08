@@ -90,7 +90,7 @@ struct ImportSheet: View {
             if model.isWorking { ProgressView().controlSize(.small) }
         }
         if let problem = model.problem {
-            Notice(icon: "exclamationmark.triangle", text: problem)
+            Notice(text: problem)
         }
         if model.plan != nil {
             HStack(spacing: 10) {
@@ -366,7 +366,7 @@ struct ExportSheet: View {
                 include
                 saveAs
                 if let problem = model.problem {
-                    Notice(icon: "exclamationmark.triangle", text: problem)
+                    Notice(text: problem)
                 }
             }
             Spacer(minLength: 0)
@@ -635,19 +635,5 @@ private struct Tally: View {
             if !warn { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.line) }
         }
         .accessibilityElement(children: .combine)
-    }
-}
-
-private struct Notice: View {
-    let icon: String
-    let text: String
-
-    var body: some View {
-        Label(text, systemImage: icon)
-            .font(.system(size: 13))
-            .foregroundStyle(Palette.warn)
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Palette.warnSoft))
     }
 }

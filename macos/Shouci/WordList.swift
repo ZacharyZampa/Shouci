@@ -29,7 +29,12 @@ struct WordList: View {
         }
         .overlay { if model.isLoaded && model.groups.isEmpty { empty } }
         .safeAreaInset(edge: .top, spacing: 0) {
-            if !model.isSearching { header }
+            if !model.isSearching {
+                VStack(spacing: 0) {
+                    header
+                    if model.isFiltering || model.shownSmart != nil { FilterBar(model: model) }
+                }
+            }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if model.isSearching && !model.groups.isEmpty { hints }
@@ -48,7 +53,12 @@ struct WordList: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            if model.scope == .trash && !model.items(in: .trash).isEmpty {
+            if model.scope == .noCollection && model.shownCount > 0 {
+                Button("File Words…", action: model.startFiling)
+                    .controlSize(.small)
+                    .help("Add each word to a collection in turn (⇧⌘C)")
+            }
+            if model.scope == .trash && model.count(of: .trash) > 0 {
                 Button("Empty Trash…") { confirmingEmpty = true }
                     .controlSize(.small)
                     .confirmationDialog(
@@ -60,6 +70,7 @@ struct WordList: View {
                     }
             }
             Spacer()
+            FilterButton(model: model)
             Picker("Sort", selection: $model.sort) {
                 ForEach(LibraryModel.Sort.allCases) { Text($0.title).tag($0) }
             }
@@ -102,6 +113,22 @@ struct WordList: View {
             } actions: {
                 Button("Add “\(model.query)” by Hand") { model.newWord(simplified: model.query) }
             }
+        } else if model.shownSmart != nil {
+            ContentUnavailableView {
+                Label("No words match", systemImage: "line.3.horizontal.decrease.circle")
+            } description: {
+                Text("Words show up here as they come to match this smart collection’s filter.")
+            } actions: {
+                Button("Change Filter…") { model.showingFilter = true }
+            }
+        } else if model.isFiltering {
+            ContentUnavailableView {
+                Label("No words match", systemImage: "line.3.horizontal.decrease.circle")
+            } description: {
+                Text("No words in \(model.title) match the filter.")
+            } actions: {
+                Button("Clear Filter", action: model.clearFilter)
+            }
         } else {
             switch model.scope {
             case .all:
@@ -112,6 +139,10 @@ struct WordList: View {
                 ContentUnavailableView(
                     "Nothing needs review", systemImage: "checkmark.circle",
                     description: Text("Words with no dictionary match, or an uncertain one, show up here."))
+            case .noCollection:
+                ContentUnavailableView(
+                    "Every word is in a collection", systemImage: "tray",
+                    description: Text("Words you save show up here until you add them to a collection."))
             case .recent:
                 ContentUnavailableView(
                     "Nothing added this week", systemImage: "clock",
@@ -122,7 +153,7 @@ struct WordList: View {
                     description: Text("Archive words you know to keep them out of the way."))
             case .trash:
                 ContentUnavailableView("The Trash is empty", systemImage: "trash")
-            case .collection, .tag:
+            case .collection, .tag, .smart:
                 ContentUnavailableView("No words here yet", systemImage: "folder")
             }
         }
@@ -186,6 +217,10 @@ struct WordActions: View {
             } else {
                 Button("Archive") { model.perform(.archive, on: ids) }
             }
+            Button("File in Collection…") {
+                model.selection = Set(ids.map(LibraryModel.Pick.item))
+                model.startFiling()
+            }
             Divider()
             Button("Copy") {
                 NSPasteboard.general.clearContents()
@@ -217,6 +252,13 @@ struct ItemRow: View {
                     .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            if let level = item.hskRank {
+                Text(hskLevel(rank: level))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
             if item.verification == .needsReview {
                 Image(systemName: "exclamationmark.triangle")
                     .foregroundStyle(prominence == .increased ? AnyShapeStyle(.primary) : AnyShapeStyle(Palette.warn))
