@@ -32,19 +32,20 @@ private struct Headword: View {
     var body: some View {
         HStack(alignment: .top, spacing: 20) {
             Text(simplified)
-                .font(.system(size: 60, weight: .medium))
+                .font(Typography.hero)
+                .chinese()
                 .textSelection(.enabled)
                 .lineLimit(1)
                 .minimumScaleFactor(0.5)
             VStack(alignment: .leading, spacing: 6) {
                 Text(reading.isEmpty ? "No reading yet" : reading)
-                    .font(.system(size: 24))
+                    .font(Typography.heroReading)
                     .foregroundStyle(reading.isEmpty ? Palette.tertiary : Palette.text)
                     .textSelection(.enabled)
                 if !traditional.isEmpty && traditional != simplified {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("Traditional").font(.system(size: 12.5)).foregroundStyle(Palette.tertiary)
-                        Text(traditional).font(.system(size: 18)).foregroundStyle(Palette.secondary)
+                        Text("Traditional").font(Typography.supporting).foregroundStyle(Palette.tertiary)
+                        Text(traditional).font(Typography.alternate).chinese(.traditional).foregroundStyle(Palette.secondary)
                             .textSelection(.enabled)
                     }
                 }
@@ -65,7 +66,7 @@ private struct Senses: View {
                     Text("\(number + 1)").foregroundStyle(Palette.tertiary).frame(width: 16, alignment: .leading)
                     Text(displayDefinition(definition: gloss)).textSelection(.enabled)
                 }
-                .font(.system(size: 13.5))
+                .font(Typography.content)
                 .padding(.vertical, 7)
             }
         }
@@ -209,7 +210,7 @@ private struct ItemDetail: View {
                 .lineSpacing(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .font(.system(size: 13.5))
+        .font(Typography.content)
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
     }
@@ -265,7 +266,7 @@ private struct ItemDetail: View {
                     ForEach(entries) { entry in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(preferences.pinyin(raw: entry.pinyin, display: entry.pinyinDisplay))
-                                .font(.system(size: 13.5, weight: .semibold))
+                                .font(Typography.emphasis)
                             Text(entry.definitionDisplay).foregroundStyle(Palette.secondary)
                         }
                         .padding(.vertical, 5)
@@ -279,7 +280,7 @@ private struct ItemDetail: View {
                     .padding(.bottom, 5)
                 }
             }
-            .font(.system(size: 13.5))
+            .font(Typography.content)
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -306,7 +307,7 @@ private struct ItemDetail: View {
 
     private var provenance: some View {
         Text(provenanceText)
-            .font(.system(size: 12))
+            .font(Typography.control)
             .foregroundStyle(Palette.tertiary)
     }
 
@@ -386,6 +387,7 @@ private struct NotesField: View {
     var body: some View {
         TextField("Add a note", text: $text, axis: .vertical)
             .textFieldStyle(.plain)
+            .accessibilityLabel("Notes")
             .focused($focused)
             .onSubmit { focused = false }
             .onExitCommand {
@@ -519,7 +521,7 @@ private struct BulkPanel: View {
     @State private var confirmingDelete = false
 
     private var ids: [Int64] { items.map(\.id) }
-    private var trashed: Bool { items.allSatisfy { $0.lifecycle == .trashed } }
+    private var trashed: Bool { items.allTrashed }
 
     /// Tags every selected word already has.
     private var sharedTags: [String] {
@@ -535,14 +537,14 @@ private struct BulkPanel: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("\(items.count) words selected").font(.system(size: 22, weight: .semibold))
+                Text("\(items.count) words selected").font(Typography.title)
                 FlowLayout(spacing: 6) {
                     ForEach(items.prefix(40)) { Chip(text: $0.simplified, style: .plain) }
                     if items.count > 40 { Chip(text: "+\(items.count - 40) more", style: .plain) }
                 }
                 VStack(spacing: 0) {
                     if trashed {
-                        action("Put Back", icon: "arrow.uturn.backward") { model.perform(.restore, on: ids) }
+                        toggle(items.trashToggle)
                         Divider()
                         action("Delete Immediately…", icon: "trash.slash", role: .destructive) { confirmingDelete = true }
                     } else {
@@ -581,25 +583,13 @@ private struct BulkPanel: View {
                             }
                         }
                         Divider()
-                        if items.allSatisfy({ $0.verification == .needsReview }) {
-                            action("Mark as Confirmed", icon: "checkmark.circle") {
-                                model.perform(.setVerification(.confirmed), on: ids)
-                            }
-                        } else {
-                            action("Mark as Needs Review", icon: "exclamationmark.triangle") {
-                                model.perform(.setVerification(.needsReview), on: ids)
-                            }
-                        }
+                        toggle(items.reviewToggle)
                         Divider()
-                        if items.allSatisfy({ $0.lifecycle == .archived }) {
-                            action("Unarchive", icon: "tray.and.arrow.up") { model.perform(.unarchive, on: ids) }
-                        } else {
-                            action("Archive", icon: "archivebox") { model.perform(.archive, on: ids) }
-                        }
+                        toggle(items.archiveToggle)
                         Divider()
                         action("Export \(items.count) Words…", icon: "square.and.arrow.up") { model.transfer = .exporting }
                         Divider()
-                        action("Move to Trash", icon: "trash", role: .destructive) { model.perform(.trash, on: ids) }
+                        toggle(items.trashToggle)
                     }
                 }
                 .card()
@@ -615,6 +605,22 @@ private struct BulkPanel: View {
             Button("Delete Immediately", role: .destructive) { model.perform(.purge, on: ids) }
         } message: {
             Text("This can’t be undone.")
+        }
+    }
+
+    /// One of the changes offered in pairs (`reviewToggle` and the others),
+    /// with its icon.
+    private func toggle(_ change: BulkAction) -> some View {
+        let icon = switch change {
+        case .setVerification(.confirmed): "checkmark.circle"
+        case .setVerification: "exclamationmark.triangle"
+        case .unarchive: "tray.and.arrow.up"
+        case .archive: "archivebox"
+        case .restore: "arrow.uturn.backward"
+        default: "trash"
+        }
+        return action(change.title, icon: icon, role: change == .trash ? .destructive : nil) {
+            model.perform(change, on: ids)
         }
     }
 
@@ -652,7 +658,7 @@ private struct BulkPanel: View {
             Text(title).foregroundStyle(destructive ? Color.red : Palette.text)
             Spacer()
         }
-        .font(.system(size: 13.5))
+        .font(Typography.content)
         .padding(.horizontal, 16)
         .frame(height: 40)
         .contentShape(Rectangle())
@@ -669,7 +675,7 @@ private struct TagPicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Add tag to \(count) words").font(.headline)
+            Text("Add tag to \(count) words").font(Typography.emphasis)
             NameInput(
                 kind: .tag, known: tags, present: shared, placement: .list, focusOnAppear: true,
                 choose: apply, dismiss: { apply(nil) })
@@ -685,7 +691,7 @@ struct SoftButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 12, weight: .semibold))
+            .font(Typography.controlBold)
             .foregroundStyle(Palette.accent)
             .padding(.horizontal, 12)
             .frame(height: 26)

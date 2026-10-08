@@ -39,7 +39,7 @@ struct WordEditor: View {
             }
             footer
         }
-        .frame(width: 980, height: 680)
+        .sheetFrame(width: 980, height: 680)
         .onDisappear { model.problem = nil }
         .task(id: draft.simplified) {
             try? await Task.sleep(for: .milliseconds(250))
@@ -54,21 +54,28 @@ struct WordEditor: View {
             VStack(alignment: .leading, spacing: 16) {
                 CardLabel(isNew ? "New word" : "Your entry")
                 HStack(spacing: 12) {
-                    labeled("Simplified") {
+                    labeled("Simplified", namesField: true) {
                         LargeField(text: $draft.simplified, prompt: "")
+                            .chinese()
+                            .accessibilityLabel("Simplified")
                     }
-                    labeled("Traditional") {
+                    labeled("Traditional", namesField: true) {
                         LargeField(text: $draft.traditional, prompt: isNew ? "From the dictionary" : "")
+                            .chinese(.traditional)
+                            .accessibilityLabel("Traditional")
                     }
                 }
-                labeled("Pinyin") {
+                labeled("Pinyin", namesField: true) {
                     TextField(preferences.pinyinStyle == .numbers ? "xi2 guan4" : "xí guàn", text: $draft.pinyin)
+                        .accessibilityLabel("Pinyin")
                 }
-                labeled("Definition") {
+                labeled("Definition", namesField: true) {
                     TextField("", text: $draft.definition, axis: .vertical).lineLimit(3...6)
+                        .accessibilityLabel("Definition")
                 }
-                labeled("Notes") {
+                labeled("Notes", namesField: true) {
                     TextField("", text: $draft.notes, axis: .vertical).lineLimit(2...5)
+                        .accessibilityLabel("Notes")
                 }
                 // Each name list's menu opens over the fields below it.
                 labeled("Tags") {
@@ -92,7 +99,7 @@ struct WordEditor: View {
                 .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Palette.warnSoft))
                 if isNew {
                     Text("Without a reading and a definition, a new word is saved as needs review.")
-                        .font(.system(size: 12))
+                        .font(Typography.control)
                         .foregroundStyle(Palette.tertiary)
                 }
             }
@@ -108,9 +115,15 @@ struct WordEditor: View {
         }
     }
 
-    private func labeled(_ label: String, @ViewBuilder field: () -> some View) -> some View {
+    /// A field under its label. A text field carries the label as its own
+    /// VoiceOver name (`namesField`), so the label isn't read out a second
+    /// time; the tag and collection lists keep it to say what they hold.
+    private func labeled(
+        _ label: String, namesField: Bool = false, @ViewBuilder field: () -> some View
+    ) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(label).font(.system(size: 12)).foregroundStyle(Palette.tertiary)
+            Text(label).font(Typography.control).foregroundStyle(Palette.tertiary)
+                .accessibilityHidden(namesField)
             field()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -152,7 +165,7 @@ struct WordEditor: View {
                             ? "Type the characters to see the dictionary’s entries."
                             : "The dictionary has no entry for \(draft.simplified). Fill in what you know; the word stays marked needs review until it has a reading and a definition."
                     )
-                    .font(.system(size: 13))
+                    .font(Typography.content)
                     .foregroundStyle(Palette.tertiary)
                 }
                 ForEach(shown) { entry in
@@ -169,11 +182,12 @@ struct WordEditor: View {
         let isCurrent = draft.pinyin == pinyin && (draft.traditional.isEmpty || draft.traditional == entry.traditional)
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(entry.simplified).font(.system(size: 30, weight: .medium))
+                Text(entry.simplified).font(Typography.display).chinese()
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(pinyin).font(.system(size: 17))
+                    Text(pinyin).font(Typography.alternate)
                     if entry.traditional != entry.simplified {
-                        Text("Traditional \(entry.traditional)").font(.system(size: 12)).foregroundStyle(Palette.tertiary)
+                        Text("Traditional \(entry.traditional)").font(Typography.control).chinese(.traditional)
+                            .foregroundStyle(Palette.tertiary)
                     }
                 }
                 Spacer()
@@ -194,7 +208,7 @@ struct WordEditor: View {
                             .buttonStyle(SoftButtonStyle())
                             .disabled(draft.definition == gloss)
                     }
-                    .font(.system(size: 13.5))
+                    .font(Typography.content)
                     .padding(.vertical, 8)
                     if number < entry.glosses.count - 1 { Divider() }
                 }
@@ -257,18 +271,24 @@ struct WordEditor: View {
     }
 }
 
-/// A text field for characters, big enough to read them.
+/// A text field for characters, big enough to read them. Its edge turns
+/// accent while it has the keyboard, as the notes and name fields' do: a
+/// plain field draws no focus ring of its own.
 private struct LargeField: View {
     @Binding var text: String
     let prompt: String
+    @FocusState private var focused: Bool
 
     var body: some View {
         TextField(prompt, text: $text)
             .textFieldStyle(.plain)
-            .font(.system(size: 22))
+            .font(Typography.field)
+            .focused($focused)
             .padding(.horizontal, 10)
             .frame(height: 44)
             .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Palette.field))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Palette.line))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(focused ? Palette.accent : Palette.line, lineWidth: focused ? 2 : 1))
     }
 }

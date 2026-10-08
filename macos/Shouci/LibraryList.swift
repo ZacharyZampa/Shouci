@@ -65,17 +65,49 @@ extension LibraryModel {
 
 /// When a word was added, edited, archived, and trashed, parsed once per
 /// load so sorting doesn't parse timestamps.
-struct ItemDates {
+struct ItemDates: Sendable {
     let added: Date
     let edited: Date
     let archived: Date?
     let trashed: Date?
+    /// The timestamps they were read from.
+    private let stamps: Stamps
 
     init(_ item: ItemView) {
         added = When.parse(item.createdAt) ?? .distantPast
         edited = When.parse(item.modifiedAt) ?? .distantPast
         archived = item.archivedAt.flatMap(When.parse)
         trashed = item.deletedAt.flatMap(When.parse)
+        stamps = Stamps(item)
+    }
+
+    /// Each word's dates. A word whose timestamps are the ones `previous`
+    /// read keeps its dates, so a change to one word parses one word's:
+    /// parsing all of 15,000 takes longer than a frame.
+    static func of(_ items: [ItemView], reusing previous: [Int64: ItemDates]) -> [Int64: ItemDates] {
+        var dates = [Int64: ItemDates](minimumCapacity: items.count)
+        for item in items {
+            if let old = previous[item.id], old.stamps == Stamps(item) {
+                dates[item.id] = old
+            } else {
+                dates[item.id] = ItemDates(item)
+            }
+        }
+        return dates
+    }
+
+    private struct Stamps: Equatable, Sendable {
+        let created: String
+        let modified: String
+        let archived: String?
+        let deleted: String?
+
+        init(_ item: ItemView) {
+            created = item.createdAt
+            modified = item.modifiedAt
+            archived = item.archivedAt
+            deleted = item.deletedAt
+        }
     }
 }
 
@@ -109,6 +141,25 @@ enum LibraryList {
         }
     }
 
+    /// How many words each Library view holds, in one pass: the same rules
+    /// as `items(_:in:)`, without building each view's list to count it.
+    static func counts(_ all: [ItemView]) -> [Scope: Int] {
+        var (active, review, loose, archived, trash) = (0, 0, 0, 0, 0)
+        for item in all {
+            switch item.lifecycle {
+            case .active:
+                active += 1
+                if item.verification == .needsReview { review += 1 }
+                if item.collections.isEmpty { loose += 1 }
+            case .archived:
+                archived += 1
+            case .trashed:
+                trash += 1
+            }
+        }
+        return [.all: active, .needsReview: review, .noCollection: loose, .archived: archived, .trash: trash]
+    }
+
     /// A scope's words, sorted and grouped under headings: by first letter
     /// of the reading, HSK level, or how common they are, or by when they
     /// were added, edited, archived, or trashed. The Archived and Trash
@@ -117,28 +168,21 @@ enum LibraryList {
         _ items: [ItemView], scope: Scope, sort: LibraryModel.Sort, dates: [Int64: ItemDates], now: Date
     ) -> [Group] {
         let sort = scope == .trash || scope == .archived ? .added : sort
-        // Sort keys are worked out once per word, not once per comparison.
         switch sort {
         case .pinyin:
-            let sorted = items.map { (readingOrder($0), $0) }.sorted { $0.0 < $1.0 }.map(\.1)
+            let sorted = sorted(items, key: readingOrder, by: <)
             return grouped(sorted) { item in
                 item.pinyin.first.map { String($0).uppercased() } ?? "No reading"
             }
         case .hsk:
             // Level, then the more common word first, then the reading.
-            let sorted = items
-                .map { ($0.hskRank ?? .max, $0.frequencyRank ?? .max, readingOrder($0), $0) }
-                .sorted { ($0.0, $0.1, $0.2) < ($1.0, $1.1, $1.2) }
-                .map(\.3)
+            let sorted = sorted(items, key: { ($0.hskRank ?? .max, $0.frequencyRank ?? .max, readingOrder($0)) }, by: <)
             let levels = Dictionary(
                 Set(sorted.compactMap(\.hskRank)).map { ($0, hskLevel(rank: $0)) },
                 uniquingKeysWith: { first, _ in first })
             return grouped(sorted) { item in item.hskRank.flatMap { levels[$0] } ?? "Not in HSK" }
         case .frequency:
-            let sorted = items
-                .map { ($0.frequencyRank ?? .max, readingOrder($0), $0) }
-                .sorted { ($0.0, $0.1) < ($1.0, $1.1) }
-                .map(\.2)
+            let sorted = sorted(items, key: { ($0.frequencyRank ?? .max, readingOrder($0)) }, by: <)
             return grouped(sorted) { bandNames[$0.frequencyBand] ?? "" }
         case .added, .edited:
             break
@@ -151,20 +195,32 @@ enum LibraryList {
             default: return (sort == .edited ? dated?.edited : dated?.added) ?? .distantPast
             }
         }
-        let sorted = items.map { (date($0), $0) }.sorted { $0.0 > $1.0 }
+        let keys = items.map(date)
+        let newest = items.indices.sorted { keys[$0] > keys[$1] }
         // Newest first, so one day's words are neighbours: each day's
         // heading is worked out once, not once per word.
         let calendar = Calendar.current
         var day: DateInterval?
         var heading = ""
-        let titled = sorted.map { dated, item in
+        let titled = newest.map { index in
+            let dated = keys[index]
             if day?.contains(dated) != true {
                 day = calendar.dateInterval(of: .day, for: dated)
                 heading = period(dated, now: now)
             }
-            return (heading, item)
+            return (heading, items[index])
         }
         return grouped(titled)
+    }
+
+    /// `items` in the order of their keys. Each key is worked out once per
+    /// word, not once per comparison, and the words' positions are sorted
+    /// rather than the words: moving a word moves every one of its fields.
+    private static func sorted<Key>(
+        _ items: [ItemView], key: (ItemView) -> Key, by before: (Key, Key) -> Bool
+    ) -> [ItemView] {
+        let keys = items.map(key)
+        return items.indices.sorted { before(keys[$0], keys[$1]) }.map { items[$0] }
     }
 
     /// Readings in alphabetical order, words without one last.

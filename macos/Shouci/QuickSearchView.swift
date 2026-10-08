@@ -11,7 +11,7 @@ struct QuickSearchView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Rectangle().fill(Palette.line).frame(height: 1)
+            Rectangle().fill(Palette.line).frame(height: Metrics.hairline)
             content
             footer
         }
@@ -48,7 +48,7 @@ struct QuickSearchView: View {
             }
         }
         .padding(.horizontal, 16)
-        .frame(height: 56)
+        .frame(height: Metrics.header)
     }
 
     // MARK: Content
@@ -66,8 +66,8 @@ struct QuickSearchView: View {
                 ready
             }
         }
-        .padding(.top, 4)
-        .padding(.bottom, 8)
+        .padding(.top, Metrics.contentTop)
+        .padding(.bottom, Metrics.contentBottom)
     }
 
     @ViewBuilder
@@ -85,7 +85,8 @@ struct QuickSearchView: View {
                 SectionTitle(entry.group.title, first: position == 0)
                 if entry.group.rows.isEmpty {
                     Text("Nothing matches “\(model.query.trimmingCharacters(in: .whitespaces))”. Check the spelling, or type the word in Hanzi.")
-                        .font(.system(size: 12.5))
+                        .font(Typography.supporting)
+                        .lineLimit(3)
                         .foregroundStyle(Palette.tertiary)
                         .padding(.horizontal, 18)
                         .padding(.vertical, 8)
@@ -122,7 +123,7 @@ struct QuickSearchView: View {
         }
         if !model.recent.isEmpty {
             SectionTitle("Recently added", first: true)
-            ForEach(model.recent) { item in
+            ForEach(model.recentShown) { item in
                 Button {
                     model.openLibrary(item.id)
                 } label: {
@@ -134,7 +135,7 @@ struct QuickSearchView: View {
             }
         } else if model.saved == nil, app.isSearchable {
             Text("Words you save show up here.")
-                .font(.system(size: 12.5))
+                .font(Typography.supporting)
                 .foregroundStyle(Palette.tertiary)
                 .padding(.horizontal, 18)
                 .padding(.vertical, 12)
@@ -204,17 +205,44 @@ struct QuickSearchView: View {
             KeyHint(key: "⌘O", action: "Open Shouci")
             KeyHint(key: "esc", action: "Close")
         }
-        .font(.system(size: 12))
+        .font(Typography.control)
         .foregroundStyle(Palette.tertiary)
         .padding(.horizontal, 16)
-        .frame(height: 38)
+        .frame(height: Metrics.footer)
         .background(Palette.window)
-        .overlay(alignment: .top) { Rectangle().fill(Palette.line).frame(height: 1) }
+        .overlay(alignment: .top) { Rectangle().fill(Palette.line).frame(height: Metrics.hairline) }
     }
 
     private var footerNote: String {
         if case .ready(let updating?) = app.dictionary { return updating }
         return model.saved != nil ? "Ready for the next word" : "Type Hanzi, pinyin, or English"
+    }
+
+    /// The panel's fixed heights. The views are drawn with them, and
+    /// `QuickSearch.fit(height:)` adds them up to know how many results fit
+    /// on the screen.
+    enum Metrics {
+        static let header: CGFloat = 56
+        static let hairline: CGFloat = 1
+        /// Space above and below what the panel shows.
+        static let contentTop: CGFloat = 4
+        static let contentBottom: CGFloat = 8
+        static let footer: CGFloat = 38
+        /// A group's title; the first sits closer to the field.
+        static let firstTitle: CGFloat = 28
+        static let title: CGFloat = 32
+        static let row: CGFloat = 52
+        /// Save as needs review, when the dictionary has no match.
+        static let reviewRow: CGFloat = 60
+        /// A banner of one line and a line of detail: what went wrong, or
+        /// what was saved. Not fixed, so `AccessibilityTests` measures one.
+        static let banner: CGFloat = 64
+
+        /// Everything around the results at their tallest: the field, the
+        /// footer, two group titles, a banner, and the review row.
+        static var chrome: CGFloat {
+            header + hairline + contentTop + contentBottom + footer + firstTitle + title + banner + reviewRow
+        }
     }
 }
 
@@ -231,11 +259,13 @@ private struct SectionTitle: View {
 
     var body: some View {
         Text(title)
-            .font(.system(size: 11, weight: .semibold))
+            .font(Typography.label)
             .foregroundStyle(Palette.tertiary)
             .padding(.horizontal, 18)
             .padding(.bottom, 4)
-            .frame(maxWidth: .infinity, minHeight: first ? 28 : 32, alignment: .bottomLeading)
+            .frame(
+                maxWidth: .infinity, minHeight: first ? QuickSearchView.Metrics.firstTitle : QuickSearchView.Metrics.title,
+                alignment: .bottomLeading)
             .accessibilityAddTraits(.isHeader)
     }
 }
@@ -260,12 +290,13 @@ struct WordRow: View {
     var body: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 1) {
+                // One line in a row of fixed height: a long word truncates.
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(hanzi).font(.system(size: 18, weight: .semibold))
-                    Text(pinyin).font(.system(size: 13)).foregroundStyle(secondary)
+                    Text(hanzi).font(Typography.headword).chinese().lineLimit(1).layoutPriority(1)
+                    Text(pinyin).font(Typography.reading).foregroundStyle(secondary).lineLimit(1)
                 }
                 Text(gloss)
-                    .font(.system(size: 12.5))
+                    .font(Typography.supporting)
                     .foregroundStyle(secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -275,7 +306,7 @@ struct WordRow: View {
         }
         .foregroundStyle(selected ? Palette.onAccent : Palette.text)
         .padding(.horizontal, 10)
-        .frame(height: 52)
+        .frame(height: QuickSearchView.Metrics.row)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(selected ? Palette.accentFill : highlighted ? Palette.accentSoft : .clear))
@@ -296,18 +327,18 @@ struct WordRow: View {
             HStack(spacing: 6) {
                 Text("Save")
                 Text("↵")
-                    .font(.system(size: 11))
+                    .font(Typography.key)
                     .frame(minWidth: 20, minHeight: 20)
-                    .background(RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.22)))
+                    .background(RoundedRectangle(cornerRadius: 5).fill(Palette.onAccentInset))
             }
-            .font(.system(size: 12, weight: .semibold))
+            .font(Typography.controlBold)
         case .saved:
             Label("Saved", systemImage: "checkmark")
                 .labelStyle(TightLabelStyle())
-                .font(.system(size: 12, weight: .semibold))
+                .font(Typography.controlBold)
                 .foregroundStyle(selected ? Palette.onAccent : Palette.ok)
         case .note(let text):
-            Text(text).font(.system(size: 12)).foregroundStyle(secondary)
+            Text(text).font(Typography.control).foregroundStyle(secondary)
         case .time(let text, let needsReview):
             if needsReview {
                 Image(systemName: "exclamationmark.triangle")
@@ -315,7 +346,7 @@ struct WordRow: View {
                     .foregroundStyle(Palette.warn)
                     .accessibilityLabel("Needs review")
             }
-            Text(text).font(.system(size: 12)).foregroundStyle(secondary)
+            Text(text).font(Typography.control).foregroundStyle(secondary)
         }
     }
 }
@@ -349,22 +380,25 @@ private struct ReviewRow: View {
         HStack(spacing: 12) {
             Image(systemName: "exclamationmark.triangle").font(.system(size: 17))
             VStack(alignment: .leading, spacing: 2) {
-                Text("Save “\(text)” as needs review").font(.system(size: 14, weight: .semibold))
+                // Pasted text can be a paragraph: the panel stays its size.
+                Text("Save “\(text)” as needs review").font(Typography.emphasis)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
                 Text("Add the reading and meaning later in Shouci")
-                    .font(.system(size: 12.5))
+                    .font(Typography.supporting)
                     .foregroundStyle(selected ? Palette.onAccentSecondary : Palette.tertiary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if selected {
                 Text("↵")
-                    .font(.system(size: 11))
+                    .font(Typography.key)
                     .frame(minWidth: 20, minHeight: 20)
-                    .background(RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.22)))
+                    .background(RoundedRectangle(cornerRadius: 5).fill(Palette.onAccentInset))
             }
         }
         .foregroundStyle(selected ? Palette.onAccent : Palette.text)
         .padding(10)
-        .frame(minHeight: 60)
+        .frame(minHeight: QuickSearchView.Metrics.reviewRow)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(selected ? Palette.accentFill : .clear))
@@ -384,14 +418,14 @@ private struct SavedBanner: View {
         let pinyin = preferences.pinyin(raw: item.pinyin, display: item.pinyinDisplay)
         Banner(
             icon: "checkmark.circle", tint: Palette.ok, fill: Palette.okSoft,
-            title: "\(verb) \(item.simplified)\(pinyin.isEmpty ? "" : " · \(pinyin)")",
+            title: "\(saved.verb) \(item.simplified)\(pinyin.isEmpty ? "" : " · \(pinyin)")",
             detail: item.definitionDisplay.isEmpty ? nil : item.definitionDisplay
         ) {
             if saved.canUndo {
                 Button(action: undo) {
                     HStack(spacing: 6) {
                         Text("Undo")
-                        Text("⌘Z").font(.system(size: 11)).foregroundStyle(Palette.tertiary).fontWeight(.regular)
+                        Text("⌘Z").font(Typography.key).foregroundStyle(Palette.tertiary).fontWeight(.regular)
                     }
                 }
                 .buttonStyle(PillButtonStyle())
@@ -399,18 +433,9 @@ private struct SavedBanner: View {
             }
         }
     }
-
-    private var verb: String {
-        switch saved.result.outcome {
-        case .inserted: "Saved"
-        case .alreadySaved: "Already saved:"
-        case .restored: "Restored"
-        case .completed: "Completed"
-        }
-    }
 }
 
-private struct Banner<Accessory: View>: View {
+struct Banner<Accessory: View>: View {
     let icon: String
     let tint: Color
     let fill: Color
@@ -434,9 +459,9 @@ private struct Banner<Accessory: View>: View {
         HStack(spacing: 12) {
             Image(systemName: icon).font(.system(size: 19)).foregroundStyle(tint).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.system(size: 14, weight: .semibold)).foregroundStyle(tint)
+                Text(title).font(Typography.emphasis).foregroundStyle(tint).lineLimit(4)
                 if let detail {
-                    Text(detail).font(.system(size: 12.5)).foregroundStyle(Palette.secondary).lineLimit(1)
+                    Text(detail).font(Typography.supporting).foregroundStyle(Palette.secondary).lineLimit(1)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -456,7 +481,7 @@ private struct DictionaryProgress: View {
     var body: some View {
         HStack(spacing: 10) {
             ProgressView().controlSize(.small)
-            Text(text).font(.system(size: 13)).foregroundStyle(Palette.secondary)
+            Text(text).font(Typography.content).foregroundStyle(Palette.secondary)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
@@ -493,8 +518,8 @@ private struct Message: View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: icon).font(.system(size: 19)).foregroundStyle(tint)
             VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.system(size: 14, weight: .semibold))
-                Text(detail).font(.system(size: 12.5)).foregroundStyle(Palette.secondary)
+                Text(title).font(Typography.emphasis)
+                Text(detail).font(Typography.supporting).foregroundStyle(Palette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -507,7 +532,7 @@ struct PillButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .fixedSize()
-            .font(.system(size: 12, weight: .semibold))
+            .font(Typography.controlBold)
             .foregroundStyle(Palette.text)
             .padding(.horizontal, 10)
             .frame(height: 26)

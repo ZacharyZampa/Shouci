@@ -71,6 +71,49 @@ struct UndoTests {
         #expect(try library.word(id).deletedAt == trashed.deletedAt, "back in the trash, as it was")
     }
 
+    @Test func aWordAddedByHandThatIsSavedAlreadyLosesWhatTheSaveGaveIt() async throws {
+        let library = try TestLibrary()
+        let model = library.model
+        let other = try library.add("猫")
+        let school = try library.core.addManual(
+            word: ManualWord(simplified: "学校", pinyin: "xue2 xiao4", definition: "school")).item
+        await model.reload()
+        model.perform(.archive, on: [other.id])
+        await library.settle()
+
+        var draft = WordDraft(simplified: "学校")
+        draft.pinyin = "xue2 xiao4"
+        draft.tags = ["lunch"]
+        draft.needsReview = true
+        #expect(await model.save(draft))
+        await library.settle()
+        #expect(try library.word(school.id).tags == ["lunch"])
+        #expect(library.undo.undoActionName == "Add Word", "not the archive before it")
+
+        await library.undoLast()
+        let undone = try library.word(school.id)
+        #expect(undone.tags.isEmpty)
+        #expect(undone.verification == .confirmed)
+        #expect(try library.word(other.id).lifecycle == .archived, "the archive stays")
+
+        await library.redoLast()
+        #expect(try library.word(school.id).tags == ["lunch"])
+    }
+
+    @Test func savingAWordThatChangesNothingLeavesNothingToUndo() async throws {
+        let library = try TestLibrary()
+        let model = library.model
+        let other = try library.add("猫")
+        try library.add("学校")
+        await model.reload()
+        model.perform(.archive, on: [other.id])
+        await library.settle()
+
+        #expect(await model.save(WordDraft(simplified: "学校")))
+        await library.settle()
+        #expect(library.undo.undoActionName == "Archive")
+    }
+
     @Test func smartCollectionChangesAreUndoneAndRedone() async throws {
         let library = try TestLibrary()
         let model = library.model

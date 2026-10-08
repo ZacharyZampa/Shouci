@@ -32,7 +32,7 @@ final class QuickSearch {
         let before: LibrarySnapshot
         let after: LibrarySnapshot
 
-        var canUndo: Bool { result.canUndo(before: before) }
+        var canUndo: Bool { result.canUndo(before: before, after: after) }
     }
 
     let app: AppModel
@@ -56,14 +56,17 @@ final class QuickSearch {
     private(set) var saved: Saved?
     /// The word an undo just removed.
     private(set) var removed: String?
-    private(set) var problem: String?
+    private(set) var problem: String? {
+        didSet { if let problem, problem != oldValue { VoiceOver.say(problem) } }
+    }
     private(set) var focusRequests = 0
     private(set) var isBusy = false
 
     @ObservationIgnored private var searching: Task<Void, Never>?
 
-    /// Results asked for: enough to choose from, few enough to scan.
-    nonisolated static let limit: UInt32 = 8
+    /// Results asked for: enough to choose from, few enough to scan, and no
+    /// more than fit on the screen below the panel (`fit(height:)`).
+    private(set) var limit: UInt32 = 8
 
     init(app: AppModel, preferences: Preferences) {
         self.app = app
@@ -91,6 +94,19 @@ final class QuickSearch {
         searching?.cancel()
     }
 
+    /// Asks for fewer results when the panel has only `height` points to grow
+    /// into: a short screen, or one set to Larger Text, would otherwise put
+    /// the last rows and the footer below its edge. Recently added words are
+    /// kept to the same number.
+    func fit(height: CGFloat) {
+        let metrics = QuickSearchView.Metrics.self
+        let rows = Int((height - metrics.chrome) / metrics.row)
+        limit = UInt32(min(max(rows, 3), 8))
+    }
+
+    /// The words saved last, as many as fit (`fit(height:)`).
+    var recentShown: ArraySlice<ItemView> { recent.prefix(Int(limit)) }
+
     /// The library opened or the dictionary became searchable.
     func refresh() {
         loadRecent()
@@ -113,15 +129,17 @@ final class QuickSearch {
             results = nil
             groups = []
             selection = nil
+            if !text.isEmpty { VoiceOver.sayWhenSettled(spokenUnsearchable) }
             return
         }
         let kind = self.kind
+        let limit = self.limit
         searching = Task {
             try? await Task.sleep(for: .milliseconds(40))
             guard !Task.isCancelled else { return }
             do {
                 let found = try await app.call { core in
-                    try core.searchDictionary(query: text, kind: kind, limit: Self.limit)
+                    try core.searchDictionary(query: text, kind: kind, limit: limit)
                 }
                 guard !Task.isCancelled else { return }
                 show(found)
@@ -159,6 +177,7 @@ final class QuickSearch {
         selection = rows.firstIndex { row in
             if case .candidate(let candidate) = row { !candidate.isInVocabulary } else { true }
         } ?? (rows.isEmpty ? nil : 0)
+        VoiceOver.sayWhenSettled(spokenResults)
     }
 
     // MARK: Choosing and saving
@@ -166,7 +185,9 @@ final class QuickSearch {
     func move(by offset: Int) {
         let count = rows.count
         guard count > 0 else { return }
-        selection = min(max((selection ?? -1) + offset, 0), count - 1)
+        let selection = min(max((selection ?? -1) + offset, 0), count - 1)
+        self.selection = selection
+        VoiceOver.say(spoken(rows[selection]), interrupt: true)
     }
 
     func select(_ index: Int) {
@@ -217,6 +238,7 @@ final class QuickSearch {
         // Clearing the query forgets the last save, so this one is kept after.
         query = ""
         self.saved = saved
+        VoiceOver.say(saved.spoken(preferences))
         loadRecent()
         if preferences.afterSave == .close { close() }
     }
@@ -234,6 +256,7 @@ final class QuickSearch {
                 try await app.call { try $0.restore(target: saved.before, current: saved.after) }
                 self.saved = nil
                 removed = item.simplified
+                VoiceOver.say("Removed \(item.simplified)")
                 loadRecent()
             } catch {
                 problem = describe(error)

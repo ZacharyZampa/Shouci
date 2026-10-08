@@ -85,6 +85,8 @@ struct LibrarySidebar: View {
             Spacer()
             Button(action: action) {
                 Image(systemName: "plus")
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help(help ?? adding)
@@ -102,7 +104,7 @@ struct LibrarySidebar: View {
         Label {
             Text(title)
         } icon: {
-            Image(systemName: icon).foregroundStyle(tint ?? Palette.accent)
+            SidebarIcon(symbol: icon, tint: tint ?? Palette.accent)
         }
         .badge(counted ? model.count(of: scope) : 0)
         .tag(scope)
@@ -119,6 +121,19 @@ struct LibrarySidebar: View {
                 }
             }
         }
+    }
+}
+
+/// A Library view's icon in its color, and white on the selection, where
+/// indigo on indigo would vanish.
+private struct SidebarIcon: View {
+    let symbol: String
+    let tint: Color
+    @Environment(\.backgroundProminence) private var prominence
+
+    var body: some View {
+        Image(systemName: symbol)
+            .foregroundStyle(prominence == .increased ? AnyShapeStyle(.primary) : AnyShapeStyle(tint))
     }
 }
 
@@ -148,7 +163,7 @@ private struct DictionaryFooter: View {
                 Button("Retry", action: app.loadDictionaries).controlSize(.small)
             }
         }
-        .font(.system(size: 12))
+        .font(Typography.control)
         .foregroundStyle(Palette.secondary)
         .lineLimit(1)
         .padding(.horizontal, 16)

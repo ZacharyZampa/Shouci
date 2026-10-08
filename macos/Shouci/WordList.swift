@@ -81,7 +81,7 @@ struct WordList: View {
             .disabled(model.scope == .trash || model.scope == .archived)
             .help("Sort")
         }
-        .font(.system(size: 12))
+        .font(Typography.control)
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(.bar)
@@ -96,7 +96,7 @@ struct WordList: View {
             Spacer()
             KeyHint(key: "esc", action: "Clear")
         }
-        .font(.system(size: 12))
+        .font(Typography.control)
         .foregroundStyle(Palette.tertiary)
         .padding(.horizontal, 14)
         .frame(height: 34)
@@ -189,6 +189,50 @@ struct WordList: View {
     }
 }
 
+// The changes offered in pairs, worked out here for every place that offers
+// them: the context menu, the detail's panel for several words, and the
+// Word menu. Each turns back once every word has it.
+extension [ItemView] {
+    /// Every word is in the Trash.
+    var allTrashed: Bool { !isEmpty && allSatisfy { $0.lifecycle == .trashed } }
+
+    /// Mark as Needs Review, or Mark as Confirmed once every word needs
+    /// review.
+    var reviewToggle: BulkAction {
+        !isEmpty && allSatisfy { $0.verification == .needsReview }
+            ? .setVerification(.confirmed) : .setVerification(.needsReview)
+    }
+
+    /// Archive, or Unarchive once every word is archived.
+    var archiveToggle: BulkAction {
+        !isEmpty && allSatisfy { $0.lifecycle == .archived } ? .unarchive : .archive
+    }
+
+    /// Move to Trash, or Put Back once every word is in the Trash, as in
+    /// the Finder.
+    var trashToggle: BulkAction { allTrashed ? .restore : .trash }
+}
+
+extension BulkAction {
+    /// What menus call it, and the Edit menu after Undo: Archive, Undo
+    /// Archive.
+    var title: String {
+        switch self {
+        case .setVerification(.needsReview): "Mark as Needs Review"
+        case .setVerification: "Mark as Confirmed"
+        case .archive: "Archive"
+        case .unarchive: "Unarchive"
+        case .trash: "Move to Trash"
+        case .restore: "Put Back"
+        case .purge: "Delete Immediately"
+        case .addTags: "Add Tag"
+        case .removeTags: "Remove Tag"
+        case .addToCollection: "Add to Collection"
+        case .removeFromCollection: "Remove from Collection"
+        }
+    }
+}
+
 /// Actions on one or more saved words, for context menus and the detail's
 /// More menu.
 struct WordActions: View {
@@ -198,25 +242,17 @@ struct WordActions: View {
 
     var body: some View {
         let ids = items.map(\.id)
-        let trashed = items.allSatisfy { $0.lifecycle == .trashed }
+        let trashed = items.allTrashed
         if includeEdit, items.count == 1, let item = items.first, !trashed {
             Button("Edit…") { model.edit(item) }
             Divider()
         }
         if trashed {
-            Button("Put Back") { model.perform(.restore, on: ids) }
-            Button("Delete Immediately", role: .destructive) { model.perform(.purge, on: ids) }
+            toggle(items.trashToggle, on: ids)
+            Button(BulkAction.purge.title, role: .destructive) { model.perform(.purge, on: ids) }
         } else {
-            if items.allSatisfy({ $0.verification == .needsReview }) {
-                Button("Mark as Confirmed") { model.perform(.setVerification(.confirmed), on: ids) }
-            } else {
-                Button("Mark as Needs Review") { model.perform(.setVerification(.needsReview), on: ids) }
-            }
-            if items.allSatisfy({ $0.lifecycle == .archived }) {
-                Button("Unarchive") { model.perform(.unarchive, on: ids) }
-            } else {
-                Button("Archive") { model.perform(.archive, on: ids) }
-            }
+            toggle(items.reviewToggle, on: ids)
+            toggle(items.archiveToggle, on: ids)
             Button("File in Collection…") {
                 model.selection = Set(ids.map(LibraryModel.Pick.item))
                 model.startFiling()
@@ -227,8 +263,12 @@ struct WordActions: View {
                 NSPasteboard.general.setString(items.map(\.simplified).joined(separator: "\n"), forType: .string)
             }
             Divider()
-            Button("Move to Trash") { model.perform(.trash, on: ids) }
+            toggle(items.trashToggle, on: ids)
         }
+    }
+
+    private func toggle(_ action: BulkAction, on ids: [Int64]) -> some View {
+        Button(action.title) { model.perform(action, on: ids) }
     }
 }
 
@@ -243,18 +283,21 @@ struct ItemRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(preferences.headword(simplified: item.simplified, traditional: item.traditional))
-                        .font(.system(size: 18, weight: .semibold))
-                    Text(reading).font(.system(size: 13)).foregroundStyle(.secondary)
+                        .font(Typography.headword)
+                        .chinese()
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                    Text(reading).font(Typography.reading).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Text(gloss)
-                    .font(.system(size: 12.5))
+                    .font(Typography.supporting)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if let level = item.hskRank {
                 Text(hskLevel(rank: level))
-                    .font(.system(size: 11, weight: .medium))
+                    .font(Typography.key.weight(.medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .fixedSize()
@@ -292,12 +335,15 @@ struct CandidateRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(preferences.headword(simplified: candidate.simplified, traditional: candidate.traditional))
-                        .font(.system(size: 18, weight: .semibold))
+                        .font(Typography.headword)
+                        .chinese()
+                        .lineLimit(1)
+                        .layoutPriority(1)
                     Text(preferences.pinyin(raw: candidate.pinyin, display: candidate.pinyinDisplay))
-                        .font(.system(size: 13)).foregroundStyle(.secondary)
+                        .font(Typography.reading).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Text(candidate.definitionDisplay)
-                    .font(.system(size: 12.5))
+                    .font(Typography.supporting)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -305,11 +351,11 @@ struct CandidateRow: View {
             Button(action: add) {
                 Label("Add", systemImage: "plus")
                     .labelStyle(TitleAndIconTight())
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(Typography.controlBold)
                     .foregroundStyle(prominence == .increased ? Color.white : Palette.accent)
                     .padding(.horizontal, 10)
                     .frame(height: 24)
-                    .background(Capsule().fill(prominence == .increased ? Color.white.opacity(0.22) : Palette.accentSoft))
+                    .background(Capsule().fill(prominence == .increased ? Palette.onAccentInset : Palette.accentSoft))
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Add \(candidate.simplified)")

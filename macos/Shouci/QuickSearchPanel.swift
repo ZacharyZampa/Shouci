@@ -136,22 +136,27 @@ final class QuickSearchController: NSObject, NSWindowDelegate {
     }
 
     /// Under 文 when it is in the menu bar; otherwise centered near the top
-    /// of the screen with the pointer.
+    /// of the screen with the pointer. Results are kept to what fits between
+    /// there and the foot of the screen.
     private func place() {
         let size = panel.frame.size
+        let top: NSPoint
+        let visible: NSRect
         if let anchor = anchor(),
             let screen = NSScreen.screens.first(where: { $0.frame.intersects(anchor) })
         {
-            let visible = screen.visibleFrame
+            visible = screen.visibleFrame
             let x = min(max(anchor.midX - size.width / 2, visible.minX + 8), visible.maxX - size.width - 8)
-            panel.setFrameTopLeftPoint(NSPoint(x: x, y: anchor.minY - 8))
+            top = NSPoint(x: x, y: anchor.minY - 8)
         } else {
             let pointer = NSEvent.mouseLocation
             let screen = NSScreen.screens.first { $0.frame.contains(pointer) } ?? NSScreen.main
-            guard let visible = screen?.visibleFrame else { return }
-            panel.setFrameTopLeftPoint(
-                NSPoint(x: visible.midX - size.width / 2, y: visible.maxY - visible.height * 0.18))
+            guard let frame = screen?.visibleFrame else { return }
+            visible = frame
+            top = NSPoint(x: visible.midX - size.width / 2, y: visible.maxY - visible.height * 0.18)
         }
+        panel.setFrameTopLeftPoint(top)
+        model.fit(height: top.y - visible.minY - 8)
     }
 
     /// Follows the content's height, keeping the top edge where it is.

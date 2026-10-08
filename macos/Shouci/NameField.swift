@@ -120,9 +120,15 @@ struct NameList: View {
     var body: some View {
         FlowLayout(spacing: 6) {
             ForEach(names, id: \.self) { name in
-                Chip(text: name, style: kind.chipStyle) { remove(name) }
+                Chip(text: name, style: kind.chipStyle) {
+                    remove(name)
+                    VoiceOver.say("Removed \(kind.noun) \(name)")
+                }
             }
-            NameInput(kind: kind, known: known, present: names, choose: add)
+            NameInput(kind: kind, known: known, present: names) { name in
+                add(name)
+                VoiceOver.say("Added \(kind.noun) \(name)")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .coordinateSpace(.named(NameInput.row))
@@ -241,7 +247,14 @@ struct NameInput: View {
                     style: StrokeStyle(lineWidth: 1, dash: focused ? [] : [3, 2]))
                 .allowsHitTesting(false)
         }
-        .onChange(of: text) { moved = nil }
+        .onChange(of: text) {
+            moved = nil
+            // The menu's rows are drawn beside the field, out of VoiceOver's
+            // way: what typing found, and what ↵ picks, are said instead.
+            if !text.trimmingCharacters(in: .whitespaces).isEmpty {
+                VoiceOver.sayWhenSettled(self.suggestions.spoken(kind))
+            }
+        }
     }
 
     private func hover(_ index: Int, in suggestions: NameSuggestions) {
@@ -259,6 +272,7 @@ struct NameInput: View {
             next = offset > 0 ? choosable.first : choosable.last
         }
         moved = next.map { suggestions.rows[$0] }
+        if let moved { VoiceOver.say(moved.spoken(kind), interrupt: true) }
     }
 
     private func pick(_ row: NameSuggestions.Row) {
@@ -290,7 +304,9 @@ private struct SuggestionRows: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
+                // Lazy: before anything is typed every name is listed, and a
+                // library can have hundreds.
+                LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(rows.enumerated()), id: \.element) { index, row in
                         if case .create = row, index > 0 {
                             Divider().padding(.vertical, 4).padding(.horizontal, 8)
@@ -313,7 +329,7 @@ private struct SuggestionRows: View {
                 if let highlighted { proxy.scrollTo(rows[highlighted]) }
             }
         }
-        .font(.system(size: 13))
+        .font(Typography.content)
     }
 
     private func label(_ row: NameSuggestions.Row, highlighted: Bool) -> some View {

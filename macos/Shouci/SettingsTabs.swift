@@ -62,7 +62,7 @@ struct DictionarySettings: View {
                     if index == 0 && dictionary.enabled && dictionaries.count > 1 { Chip(text: "Shown first") }
                 }
                 Text("\(dictionary.entries.formatted()) entries · \(dictionary.license)")
-                    .font(.system(size: 12))
+                    .font(Typography.control)
                     .foregroundStyle(.secondary)
             }
             Spacer()

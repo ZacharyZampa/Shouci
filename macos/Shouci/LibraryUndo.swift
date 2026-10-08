@@ -15,8 +15,9 @@ import ShouciCore
 //
 // A word saved new is missing from the first reading, so undoing deletes it
 // for good and redoing puts the same word back; one brought back from the
-// trash goes back there. Emptying the Trash, deleting for good, and imports
-// can't be taken back.
+// trash goes back there, and one saved already loses what the save gave it
+// (tags, collections, Needs Review). Emptying the Trash, deleting for good,
+// and imports can't be taken back.
 
 extension LibraryModel {
     /// Runs a change ⌘Z can take back, after the changes asked for before
@@ -60,7 +61,7 @@ extension LibraryModel {
                 let saved = try save(core)
                 return (before, saved, try core.snapshot(ids: ids + [saved.item.id]))
             }
-            if saved.canUndo(before: before) { registerRestore(name, to: before, from: after) }
+            if saved.canUndo(before: before, after: after) { registerRestore(name, to: before, from: after) }
             return saved.item.id
         }
     }
@@ -81,35 +82,16 @@ extension LibraryModel {
 
 extension SaveResult {
     /// Whether ⌘Z (or quick search's Undo) takes this save back, given the
-    /// library before it, read with the word the save would change: a word
-    /// saved new, or one brought back from the trash. The rest changed
-    /// nothing or only filled in a reading, and a word saved by someone else
-    /// just before isn't this save's to take back.
-    func canUndo(before: LibrarySnapshot) -> Bool {
-        let wasSaved = before.words.contains { $0.id == item.id }
-        return switch outcome {
-        case .inserted: !wasSaved
-        case .restored: wasSaved
-        case .alreadySaved, .completed: false
-        }
-    }
-}
-
-extension BulkAction {
-    /// What the Edit menu calls it: Undo Archive.
-    var undoName: String {
-        switch self {
-        case .setVerification(.needsReview): "Mark as Needs Review"
-        case .setVerification: "Mark as Confirmed"
-        case .archive: "Archive"
-        case .unarchive: "Unarchive"
-        case .trash: "Move to Trash"
-        case .restore: "Put Back"
-        case .purge: "Delete Immediately"
-        case .addTags: "Add Tag"
-        case .removeTags: "Remove Tag"
-        case .addToCollection: "Add to Collection"
-        case .removeFromCollection: "Remove from Collection"
-        }
+    /// library before and after it, each read with the word the save would
+    /// change: a word saved new, or a saved word the save changed (brought
+    /// back from the trash, given a reading, tags, or collections). A save
+    /// that changed nothing has nothing to take back, and a word saved by
+    /// someone else just before isn't this save's.
+    func canUndo(before: LibrarySnapshot, after: LibrarySnapshot) -> Bool {
+        guard let was = before.words.first(where: { $0.id == item.id }) else { return outcome == .inserted }
+        // Every change to a word, its tags, or its collections raises its
+        // revision.
+        let now = after.words.first { $0.id == item.id }
+        return now?.rev != was.rev
     }
 }

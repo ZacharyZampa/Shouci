@@ -15,7 +15,8 @@ Spotlight opens the library window. Right-click 文 for Settings and Quit.
 | `ShouciTests/` | The app's logic, tested against a scratch library: the target compiles `Shouci/` itself, so nothing launches |
 | `ShouciCore/` | Swift package: the core as Swift (`ShouciCore.swift` is generated) and its tests |
 | `scripts/build-core.sh` | Builds the Rust core into `ShouciCore/ShouciFFI.xcframework` and regenerates the bindings |
-| `scripts/package.sh` | Release build, installed to `~/Applications/Shouci.app` |
+| `scripts/package.sh` | Release build at a path you give (`scripts/install.sh` installs one) |
+| `scripts/make-dmg.sh` | A release build as `dist/Shouci-<version>.dmg` (`scripts/release.sh` publishes one) |
 | `AppIcon.png` | The 文 icon master; `Shouci/Assets.xcassets` holds its sizes (`sips -z`) |
 
 Needs Xcode (the Command Line Tools alone lack SwiftUI's macros). No Apple
@@ -29,8 +30,9 @@ open macos/Shouci.xcodeproj               # or:
 xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci build
 swift test --package-path macos/ShouciCore
 xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci -destination 'platform=macOS' test
-macos/scripts/package.sh                  # install a release build
+scripts/install.sh                        # install a release build, with shouci and shouci-tui
 macos/scripts/make-dmg.sh                 # a release build as dist/Shouci-<version>.dmg
+scripts/release.sh 1.1.0                  # tested, tagged, and published on GitHub
 ```
 
 The app build stops with a message when the Rust core is missing or older
@@ -56,6 +58,10 @@ build while the installed app is running, give it another bundle id:
   are worked out when the library, the view, or the sort changes
   (`LibraryModel.refreshList`), never while drawing: a click redraws
   several times, and grouping 15,000 words takes milliseconds, not nothing.
+  A reload reads the words and their dates off the main thread, parsing
+  dates only for words whose timestamps changed, and the words by id
+  aren't observed (observation would compare all of them on each reload):
+  at 15,000 words a reload holds the main thread for about 9 ms.
 - The filter panel and smart collections (`SmartCollections.swift`,
   `FilterPanel.swift`) ask the core which words match (`matching_ids`)
   rather than deciding in Swift: only the core knows HSK levels and
@@ -73,12 +79,30 @@ build while the installed app is running, give it another bundle id:
   quick search's undo work the same way: a word saved new is missing from
   the first snapshot, so undoing deletes it and redoing puts it back. A
   typed word is first looked up (`manual_match`), so one brought back from
-  the Trash goes back there. The
-  actions go to the library window's own undo manager, so the Edit menu
-  names them.
+  the Trash goes back there, and one saved already loses the tags and
+  collections the save gave it. A save that changed nothing (its revision
+  didn't move) leaves nothing to undo. The actions go to the library
+  window's own undo manager, so the Edit menu names them.
 - A problem shows in the editor or filing sheet while one is open
   (`Notice`), and in the window's alert otherwise: the alert waits until no
   sheet is open.
+- Quick search, the library's search field, filing, and the tag and
+  collection fields keep the keyboard while ↑↓ move a highlight elsewhere,
+  so `VoiceOver.swift` says what the highlight lands on, what a search
+  found, and what was saved. Nothing is said while VoiceOver is off.
+- Colors are `Swatch`es (`Theme.swift`): light, dark, and a stronger pair
+  for Increase Contrast. The indigo is also the asset catalog's
+  `AccentColor`, so buttons, switches, and selection match it.
+  `AccessibilityTests` checks the contrast of each pair. Type is set in
+  `Typography`'s roles, one size and weight each, and Chinese is tagged
+  (`chinese()`) so its glyphs are Chinese forms, simplified or traditional,
+  whatever the Mac's language order.
+- Sheets and the filter popover fit between the library window's toolbar
+  and the foot of the screen, measured from the window (`ScreenRoom`,
+  `sheetFrame`, `scrollsBeyond`), and quick search asks for fewer results
+  when there is less room below it, adding up the heights its views are
+  drawn with (`QuickSearchView.Metrics`), so a 13-inch Mac set to Larger
+  Text keeps every button on screen.
 - Import reads the file with the core's `detect_import`, the same call as
   the CLI and TUI: every format the core has, keeping the one that reads it
   best, so detection is the core's own parsers, not a guess in Swift. It

@@ -35,10 +35,33 @@ struct FilterPanel: View {
 
     private var filter: LibraryFilter { model.filter }
 
+    /// From the foot of the window's toolbar to the top of the panel: the
+    /// list's header, where the Filter button sits, and the popover's arrow.
+    private static let belowToolbar: CGFloat = 56
+
+    @State private var footerHeight: CGFloat = 0
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            conditions
+                .padding([.horizontal, .top], 16)
+                .padding(.bottom, 14)
+                .scrollsBeyond(ScreenRoom.current.belowToolbar - Self.belowToolbar - footerHeight - ScreenRoom.margin)
+            Divider().padding(.horizontal, 16)
+            footer
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 16)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { footerHeight = $0 }
+        }
+        .font(Typography.control)
+        .frame(width: 360)
+    }
+
+    private var conditions: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Filter").font(.system(size: 13, weight: .semibold))
+                Text("Filter").font(Typography.emphasis)
                 Spacer()
                 Text(model.shownCount == 1 ? "1 word" : "\(model.shownCount) words")
                     .foregroundStyle(Palette.tertiary)
@@ -112,12 +135,7 @@ struct FilterPanel: View {
                     }
                 }
             }
-            Divider()
-            footer
         }
-        .font(.system(size: 12))
-        .padding(16)
-        .frame(width: 360)
     }
 
     private var footer: some View {
@@ -189,7 +207,7 @@ private struct ToggleChip: View {
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 12, weight: isOn ? .semibold : .regular))
+                .font(isOn ? Typography.controlBold : Typography.control)
                 .foregroundStyle(isOn ? Palette.onAccent : Palette.text)
                 .padding(.horizontal, 9)
                 .frame(height: 22)
@@ -287,7 +305,7 @@ struct FilterBar: View {
             }
         }
         .controlSize(.small)
-        .font(.system(size: 12))
+        .font(Typography.control)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -24,6 +24,7 @@ final class LibraryWindowController: NSWindowController, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.delegate = self
+        ScreenRoom.window = window
         model.undoManager = { [weak window] in
             let manager = window?.undoManager
             // A snapshot holds every word a change touched; fifty of them is

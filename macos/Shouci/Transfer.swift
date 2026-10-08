@@ -36,7 +36,11 @@ final class ImportModel {
     }
     private(set) var preview: ImportPreview?
     private(set) var plan: ImportPlanView?
-    private(set) var problem: String?
+    /// Shown in the sheet, and said to VoiceOver, which a notice
+    /// appearing doesn't reach.
+    private(set) var problem: String? {
+        didSet { if let problem, problem != oldValue { VoiceOver.say(problem) } }
+    }
     private(set) var isWorking = false
     private(set) var summary: TransferSummary?
 
@@ -216,7 +220,11 @@ final class ExportModel {
     private(set) var counts: [ExportChoice: Int] = [:]
     private(set) var preview: ExportPreview?
     private(set) var plan: ExportPlanView?
-    private(set) var problem: String?
+    /// Shown in the sheet, and said to VoiceOver, which a notice
+    /// appearing doesn't reach.
+    private(set) var problem: String? {
+        didSet { if let problem, problem != oldValue { VoiceOver.say(problem) } }
+    }
     private(set) var isWorking = false
     private(set) var summary: TransferSummary?
 

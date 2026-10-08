@@ -3,7 +3,8 @@
 //! Each entry of [`MIGRATIONS`] moves the schema one version forward. To
 //! change the schema, append a migration; never edit one that has shipped.
 //! A migration may be SQL or Rust (for data that must be recomputed, such as
-//! reading keys after a pinyin rule changes).
+//! reading keys after a pinyin rule changes). A new condition for smart
+//! collections' filters needs one too, even an empty one (`smart.rs`).
 //!
 //! How a migration runs, so table rebuilds are safe:
 //! 1. foreign keys are switched off (impossible inside a transaction, which

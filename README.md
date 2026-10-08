@@ -47,7 +47,8 @@ cd Shouci
 ```
 
 This downloads and builds the dictionary, builds Shouci for Apple silicon and
-Intel, installs it to `~/Applications/Shouci.app`, and starts it. Look for
+Intel, installs it to `~/Applications/Shouci.app` (or replaces the copy in
+`/Applications`, if that's where yours is), and starts it. Look for
 **文** in the menu bar. It also installs `shouci` and `shouci-tui` for the
 terminal ([In the terminal](#in-the-terminal)).
 
@@ -232,6 +233,7 @@ macos/scripts/build-core.sh              # the Rust core for the Mac app
 open macos/Shouci.xcodeproj              # the Mac app in Xcode
 swift test --package-path macos/ShouciCore
 xcodebuild -project macos/Shouci.xcodeproj -scheme Shouci -destination 'platform=macOS' test
+./scripts/release.sh 1.1.0               # a GitHub release with the disk image
 ```
 
 More in [CONTRIBUTING.md](CONTRIBUTING.md) and

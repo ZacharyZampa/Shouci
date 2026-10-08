@@ -15,6 +15,7 @@ extension LibraryModel {
         let picked = selectedItems.filter { $0.lifecycle != .trashed }
         if picked.count > 1 {
             filing = Filing(queue: picked.map(\.id), together: true)
+            VoiceOver.sayWhenSettled("\(picked.count) words, filed together")
             return
         }
         // The list as it is now: words filed from Not in a Collection leave
@@ -27,6 +28,7 @@ extension LibraryModel {
         guard start < listed.count else { return }
         filing = Filing(queue: Array(listed[start...]), together: false)
         selection = [.item(listed[start])]
+        VoiceOver.sayWhenSettled(spokenFilingTurn)
     }
 
     /// The words being filed now: the one whose turn it is, or every word
@@ -49,14 +51,17 @@ extension LibraryModel {
         Task { if await filed.value, filing?.id == session { filing?.filed += ids.count } }
         if filing?.together == true {
             filing = nil
+            VoiceOver.say("Filed \(ids.count) words in \(collection)")
         } else {
             nextFilingTurn()
+            VoiceOver.say("Filed in \(collection). \(spokenFilingTurn)")
         }
     }
 
     /// Leaves the word shown where it is and shows the next.
     func skipFiling() {
         nextFilingTurn()
+        VoiceOver.say("Skipped. \(spokenFilingTurn)")
     }
 
     private func nextFilingTurn() {
@@ -79,7 +84,7 @@ struct FilingSheet: View {
         if let filing = model.filing {
             VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("File in a Collection").font(.system(size: 17, weight: .semibold))
+                    Text("File in a Collection").font(Typography.title)
                     Text(progress(filing)).foregroundStyle(Palette.secondary)
                 }
                 let words = model.filingWords
@@ -100,7 +105,7 @@ struct FilingSheet: View {
                         Spacer()
                         KeyHint(key: "esc", action: "Done")
                     }
-                    .font(.system(size: 12))
+                    .font(Typography.control)
                     .foregroundStyle(Palette.tertiary)
                 }
             }
@@ -123,9 +128,10 @@ struct FilingSheet: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(model.preferences.headword(simplified: word.simplified, traditional: word.traditional))
-                        .font(.system(size: 28, weight: .medium))
+                        .font(Typography.display)
+                        .chinese()
                     Text(model.preferences.pinyin(raw: word.pinyin, display: word.pinyinDisplay))
-                        .font(.system(size: 15))
+                        .font(Typography.alternate)
                         .foregroundStyle(Palette.secondary)
                     Spacer()
                     if let level = word.hskRank {

@@ -1,3 +1,4 @@
+import AppKit
 import ShouciCore
 import SwiftUI
 
@@ -16,16 +17,21 @@ struct Chip: View {
             Text(text).lineLimit(1)
             if let remove {
                 Button(action: remove) {
+                    // A small mark with the chip's full height to click: the
+                    // Mac's 20-point minimum.
                     Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                        .frame(width: 20, height: 22)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .padding(.leading, -4)
                 .accessibilityLabel("Remove \(text)")
             }
         }
-        .font(.system(size: 12, weight: style == .ok || style == .warn ? .semibold : .regular))
+        .font(style == .ok || style == .warn ? Typography.controlBold : Typography.control)
         .foregroundStyle(foreground)
         .padding(.leading, icon == nil ? 9 : 8)
-        .padding(.trailing, remove == nil ? 9 : 7)
+        .padding(.trailing, remove == nil ? 9 : 1)
         .frame(height: 22)
         .background(Capsule().fill(background))
         .overlay { if style == .plain { Capsule().strokeBorder(Palette.line) } }
@@ -50,7 +56,9 @@ struct Chip: View {
     }
 }
 
-/// Lays children out in rows, wrapping when a row is full.
+/// Lays children out in rows, wrapping when a row is full. A child wider than
+/// a whole row is offered the row's width, so a long name truncates rather
+/// than running past the edge.
 struct FlowLayout: Layout {
     var spacing: CGFloat = 6
 
@@ -66,7 +74,7 @@ struct FlowLayout: Layout {
         for row in arrange(subviews, width: bounds.width) {
             var x = bounds.minX
             for index in row.indices {
-                let size = subviews[index].sizeThatFits(.unspecified)
+                let size = Self.size(of: subviews[index], within: bounds.width)
                 subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
                 x += size.width + spacing
             }
@@ -83,7 +91,7 @@ struct FlowLayout: Layout {
     private func arrange(_ subviews: Subviews, width: CGFloat) -> [Row] {
         var rows: [Row] = [Row()]
         for index in subviews.indices {
-            let size = subviews[index].sizeThatFits(.unspecified)
+            let size = Self.size(of: subviews[index], within: width)
             let needed = rows[rows.count - 1].indices.isEmpty ? size.width : rows[rows.count - 1].width + spacing + size.width
             if needed > width && !rows[rows.count - 1].indices.isEmpty {
                 rows.append(Row())
@@ -95,6 +103,12 @@ struct FlowLayout: Layout {
             rows[rows.count - 1] = row
         }
         return rows.filter { !$0.indices.isEmpty }
+    }
+
+    private static func size(of subview: LayoutSubview, within width: CGFloat) -> CGSize {
+        let ideal = subview.sizeThatFits(.unspecified)
+        guard ideal.width > width else { return ideal }
+        return subview.sizeThatFits(ProposedViewSize(width: width, height: nil))
     }
 }
 
@@ -117,7 +131,7 @@ struct KindMenu: View {
                 Text(shown.title)
                 Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
             }
-            .font(.system(size: 12, weight: .semibold))
+            .font(Typography.controlBold)
             .foregroundStyle(Palette.accent)
             .padding(.horizontal, 9)
             .frame(height: 22)
@@ -141,7 +155,7 @@ struct CardLabel: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 11, weight: .semibold))
+            .font(Typography.label)
             .foregroundStyle(Palette.tertiary)
             .accessibilityAddTraits(.isHeader)
     }
@@ -159,6 +173,69 @@ extension View {
     }
 }
 
+/// What the library window leaves its sheets and the filter popover: the
+/// width of its screen, and the height from the foot of its toolbar, where a
+/// sheet hangs, to the foot of the screen. Measured from the window as it
+/// is; a small display, or one set to Larger Text (1024 × 640 points on a
+/// 13-inch Mac), has less than the mockups.
+@MainActor
+struct ScreenRoom {
+    /// Kept clear between a sheet or popover and the screen's edges.
+    static let margin: CGFloat = 20
+    /// Never less than this, even below a window parked at the foot of the
+    /// screen: there, what's inside scrolls.
+    static let least: CGFloat = 320
+    /// The library window, set by its controller.
+    static weak var window: NSWindow?
+
+    let width: CGFloat
+    let belowToolbar: CGFloat
+
+    static var current: ScreenRoom {
+        guard let window, let screen = window.screen ?? NSScreen.main else {
+            let visible = NSScreen.main?.visibleFrame.size ?? CGSize(width: 1440, height: 900)
+            return ScreenRoom(width: visible.width, belowToolbar: visible.height)
+        }
+        let visible = screen.visibleFrame
+        // The content below the title bar and toolbar, in screen coordinates.
+        let toolbarFoot = window.frame.minY + window.contentLayoutRect.maxY
+        return ScreenRoom(width: visible.width, belowToolbar: max(toolbarFoot - visible.minY, least))
+    }
+}
+
+extension View {
+    /// A sheet `width` by `height` where the screen has room for it, and only
+    /// as big as the screen allows where it doesn't, so the buttons along its
+    /// foot stay on screen. What's inside must scroll.
+    func sheetFrame(width: CGFloat, height: CGFloat) -> some View {
+        let room = ScreenRoom.current
+        return frame(
+            width: min(width, room.width - 2 * ScreenRoom.margin),
+            height: min(height, room.belowToolbar - ScreenRoom.margin))
+    }
+
+    /// The content as it is while it fits in `room` points of height, and
+    /// scrolling in that much once it is taller: a popover with many tags,
+    /// or on a short screen.
+    func scrollsBeyond(_ room: CGFloat) -> some View {
+        modifier(ScrollsBeyond(room: room))
+    }
+}
+
+private struct ScrollsBeyond: ViewModifier {
+    let room: CGFloat
+    @State private var height: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        let measured = content.onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
+        if height > room {
+            ScrollView { measured }.frame(height: room)
+        } else {
+            measured
+        }
+    }
+}
+
 /// A warning in a sheet: what went wrong, where it is seen.
 struct Notice: View {
     var icon = "exclamationmark.triangle"
@@ -166,7 +243,7 @@ struct Notice: View {
 
     var body: some View {
         Label(text, systemImage: icon)
-            .font(.system(size: 13))
+            .font(Typography.content)
             .foregroundStyle(Palette.warn)
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)

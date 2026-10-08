@@ -43,7 +43,7 @@ struct ImportSheet: View {
                 .padding(.vertical, 16)
                 .overlay(alignment: .top) { Divider() }
         }
-        .frame(width: 600, height: model.file == nil || model.summary != nil ? 340 : 760)
+        .sheetFrame(width: 600, height: model.file == nil || model.summary != nil ? 340 : 760)
     }
 
     private var fileCard: some View {
@@ -51,12 +51,12 @@ struct ImportSheet: View {
             Image(systemName: "doc.text").font(.system(size: 24)).foregroundStyle(Palette.accent)
             VStack(alignment: .leading, spacing: 1) {
                 if let file = model.file {
-                    Text(file.lastPathComponent).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-                    Text(fileDetail).font(.system(size: 12.5)).foregroundStyle(Palette.tertiary)
+                    Text(file.lastPathComponent).font(Typography.emphasis).lineLimit(1)
+                    Text(fileDetail).font(Typography.supporting).foregroundStyle(Palette.tertiary)
                 } else {
-                    Text("No file chosen").font(.system(size: 14, weight: .semibold))
+                    Text("No file chosen").font(Typography.emphasis)
                     Text("Export from Pleco (Import/Export › Export Cards) or Anki (File › Export › Notes in Plain Text), then choose the file here.")
-                        .font(.system(size: 12.5)).foregroundStyle(Palette.tertiary)
+                        .font(Typography.supporting).foregroundStyle(Palette.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -79,7 +79,7 @@ struct ImportSheet: View {
     @ViewBuilder
     private var details: some View {
         HStack(spacing: 12) {
-            Text("Format").font(.system(size: 13)).foregroundStyle(Palette.tertiary).frame(width: 60, alignment: .leading)
+            Text("Format").font(Typography.content).foregroundStyle(Palette.tertiary).frame(width: 60, alignment: .leading)
             Picker("Format", selection: $model.connector) {
                 ForEach(model.formats) { Text("\($0.name) text").tag(Optional($0.id)) }
             }
@@ -111,40 +111,47 @@ struct ImportSheet: View {
                 model.errorLines.count == 1 ? "1 line can’t be imported" : "\(model.errorLines.count) lines can’t be imported",
                 systemImage: "exclamationmark.triangle"
             )
-            .font(.system(size: 13, weight: .semibold))
+            .font(Typography.emphasis)
             .foregroundStyle(Palette.warn)
             ForEach(model.errorLines.prefix(3), id: \.line) { issue in
-                Text("Line \(issue.line): \(issue.message)").font(.system(size: 12.5)).foregroundStyle(Palette.secondary)
+                Text("Line \(issue.line): \(issue.message)").font(Typography.supporting).foregroundStyle(Palette.secondary)
             }
             if model.errorLines.count > 3 {
-                Text("and \(model.errorLines.count - 3) more").font(.system(size: 12.5)).foregroundStyle(Palette.tertiary)
+                Text("and \(model.errorLines.count - 3) more").font(Typography.supporting).foregroundStyle(Palette.tertiary)
             }
             Toggle("Skip these lines and import the rest", isOn: $model.skipErrors)
-                .font(.system(size: 13))
+                .font(Typography.content)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Palette.warnSoft))
     }
 
+    private static let policies: [(policy: ImportPolicy, title: String, detail: String)] = [
+        (.skip, "Skip", "Keep my version, and add the file’s tags and collections."),
+        (.merge, "Merge", "Fill in missing fields and add tags and collections. Keeps what you have edited."),
+        (.overwrite, "Overwrite", "Replace my entry’s fields with the ones the file has."),
+    ]
+
     private var policy: some View {
         VStack(alignment: .leading, spacing: 8) {
             CardLabel("If a word already exists")
             VStack(spacing: 0) {
-                PolicyRow(
-                    policy: .skip, selection: $model.policy, title: "Skip",
-                    detail: "Keep my version, and add the file’s tags and collections.")
-                Divider()
-                PolicyRow(
-                    policy: .merge, selection: $model.policy, title: "Merge",
-                    detail: "Fill in missing fields and add tags and collections. Keeps what you have edited.")
-                Divider()
-                PolicyRow(
-                    policy: .overwrite, selection: $model.policy, title: "Overwrite",
-                    detail: "Replace my entry’s fields with the ones the file has.")
+                ForEach(Array(Self.policies.enumerated()), id: \.element.policy) { index, choice in
+                    if index > 0 { Divider() }
+                    PolicyRow(policy: choice.policy, selection: $model.policy, title: choice.title, detail: choice.detail)
+                }
             }
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.line))
+            // The rows are drawn to hold a sentence each; VoiceOver gets the
+            // radio group they stand for.
+            .accessibilityRepresentation {
+                Picker("If a word already exists", selection: $model.policy) {
+                    ForEach(Self.policies, id: \.policy) { Text("\($0.title). \($0.detail)").tag($0.policy) }
+                }
+                .pickerStyle(.radioGroup)
+            }
         }
     }
 
@@ -158,7 +165,7 @@ struct ImportSheet: View {
                     Text("Result")
                     Spacer()
                 }
-                .font(.system(size: 11.5))
+                .font(Typography.label)
                 .foregroundStyle(Palette.tertiary)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 7)
@@ -183,7 +190,7 @@ struct ImportSheet: View {
         HStack(spacing: 10) {
             if model.summary == nil, model.plan != nil {
                 Text(outcome)
-                    .font(.system(size: 12.5))
+                    .font(Typography.supporting)
                     .foregroundStyle(Palette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -244,8 +251,8 @@ private struct PolicyRow: View {
                 Image(systemName: selection == policy ? "largecircle.fill.circle" : "circle")
                     .foregroundStyle(selection == policy ? Palette.accentFill : Palette.tertiary)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.system(size: 13.5, weight: .semibold))
-                    Text(detail).font(.system(size: 12.5)).foregroundStyle(Palette.secondary)
+                    Text(title).font(Typography.emphasis)
+                    Text(detail).font(Typography.supporting).foregroundStyle(Palette.secondary)
                 }
                 Spacer()
             }
@@ -255,7 +262,6 @@ private struct PolicyRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityAddTraits(selection == policy ? .isSelected : [])
     }
 }
 
@@ -267,7 +273,7 @@ private struct PlannedRow: View {
     var body: some View {
         let (word, pinyin, result, tone) = describe()
         HStack {
-            Text(word).font(.system(size: 15, weight: .semibold)).lineLimit(1).frame(width: 120, alignment: .leading)
+            Text(word).font(Typography.emphasis).chinese().lineLimit(1).frame(width: 120, alignment: .leading)
             Text(pinyin).foregroundStyle(Palette.secondary).lineLimit(1).frame(width: 120, alignment: .leading)
             Text(result)
                 .foregroundStyle(tone)
@@ -275,7 +281,7 @@ private struct PlannedRow: View {
                 .lineLimit(1)
             Spacer()
         }
-        .font(.system(size: 13))
+        .font(Typography.content)
         .padding(.horizontal, 14)
         .frame(height: 32)
     }
@@ -320,11 +326,11 @@ private struct ImportDone: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(title, systemImage: "checkmark.circle")
-                .font(.system(size: 16, weight: .semibold))
+                .font(Typography.emphasis)
                 .foregroundStyle(Palette.ok)
-            Text(detail).font(.system(size: 13)).foregroundStyle(Palette.secondary)
+            Text(detail).font(Typography.content).foregroundStyle(Palette.secondary)
             ForEach(summary.notes, id: \.self) { note in
-                Text(note).font(.system(size: 12.5)).foregroundStyle(Palette.tertiary)
+                Text(note).font(Typography.supporting).foregroundStyle(Palette.tertiary)
             }
         }
         .padding(16)
@@ -356,27 +362,35 @@ struct ExportSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 0) {
             SheetTitle("Export Vocabulary", "Send words to Pleco or Anki.")
-            if let summary = model.summary {
-                done(summary)
-            } else {
-                destinationCards
-                choices
-                include
-                saveAs
-                if let problem = model.problem {
-                    Notice(text: problem)
+                .padding(.horizontal, 28)
+                .padding(.top, 26)
+                .padding(.bottom, 18)
+            // Scrolls only when the screen is shorter than the sheet.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if let summary = model.summary {
+                        done(summary)
+                    } else {
+                        destinationCards
+                        choices
+                        include
+                        saveAs
+                        if let problem = model.problem {
+                            Notice(text: problem)
+                        }
+                    }
                 }
+                .padding(.horizontal, 28)
+                .padding(.bottom, 18)
             }
-            Spacer(minLength: 0)
+            .scrollBounceBehavior(.basedOnSize)
             footer
+                .padding(.horizontal, 28)
+                .padding(.bottom, 22)
         }
-        .padding(.horizontal, 28)
-        .padding(.top, 26)
-        .padding(.bottom, 22)
-        .frame(width: 600)
-        .frame(minHeight: model.summary == nil ? 640 : 300)
+        .sheetFrame(width: 600, height: model.summary == nil ? 640 : 300)
         .task { model.start() }
     }
 
@@ -392,8 +406,8 @@ struct ExportSheet: View {
                             Image(systemName: model.connector == format.id ? "largecircle.fill.circle" : "circle")
                                 .foregroundStyle(model.connector == format.id ? Palette.accentFill : Palette.tertiary)
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(format.name).font(.system(size: 14, weight: .semibold))
-                                Text(Self.blurb(format.id)).font(.system(size: 12.5)).foregroundStyle(Palette.secondary)
+                                Text(format.name).font(Typography.emphasis)
+                                Text(Self.blurb(format.id)).font(Typography.supporting).foregroundStyle(Palette.secondary)
                             }
                             Spacer()
                         }
@@ -409,8 +423,13 @@ struct ExportSheet: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityAddTraits(model.connector == format.id ? .isSelected : [])
                 }
+            }
+            .accessibilityRepresentation {
+                Picker("Destination", selection: $model.connector) {
+                    ForEach(model.formats) { Text("\($0.name). \(Self.blurb($0.id))").tag($0.id) }
+                }
+                .pickerStyle(.radioGroup)
             }
         }
     }
@@ -434,7 +453,24 @@ struct ExportSheet: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Palette.line))
+            .accessibilityRepresentation {
+                Picker("What to export", selection: $model.choice) {
+                    ForEach(model.choices, id: \.self) { Text(spoken($0)).tag($0) }
+                }
+                .pickerStyle(.radioGroup)
+            }
         }
+    }
+
+    /// A choice as VoiceOver reads it: `Current view, HSK 1. 12 words`.
+    private func spoken(_ choice: ExportChoice) -> String {
+        var title = title(choice)
+        if choice == .filter, let label = model.filter?.label { title += ", \(label)" }
+        return [title, detail(choice), wordCount(choice)].compactMap { $0 }.joined(separator: ". ")
+    }
+
+    private func wordCount(_ choice: ExportChoice) -> String? {
+        model.counts[choice].map { $0 == 1 ? "1 word" : "\($0) words" }
     }
 
     private func choiceRow(_ choice: ExportChoice) -> some View {
@@ -447,16 +483,16 @@ struct ExportSheet: View {
                     .foregroundStyle(selected ? Palette.accentFill : Palette.tertiary)
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 8) {
-                        Text(title(choice)).font(.system(size: 13.5, weight: .semibold))
+                        Text(title(choice)).font(Typography.emphasis)
                         if choice == .filter, let label = model.filter?.label { Chip(text: label) }
                     }
                     if let detail = detail(choice) {
-                        Text(detail).font(.system(size: 12.5)).foregroundStyle(Palette.secondary)
+                        Text(detail).font(Typography.supporting).foregroundStyle(Palette.secondary)
                     }
                 }
                 Spacer()
-                Text(model.counts[choice].map { $0 == 1 ? "1 word" : "\($0) words" } ?? "–")
-                    .font(.system(size: 13))
+                Text(wordCount(choice) ?? "–")
+                    .font(Typography.content)
                     .foregroundStyle(Palette.secondary)
             }
             .padding(.horizontal, 14)
@@ -465,7 +501,6 @@ struct ExportSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func title(_ choice: ExportChoice) -> String {
@@ -487,12 +522,13 @@ struct ExportSheet: View {
     private var include: some View {
         VStack(alignment: .leading, spacing: 8) {
             CardLabel("Include")
-            Toggle("Words marked needs review", isOn: $model.includeNeedsReview).font(.system(size: 13.5))
+            Toggle("Words marked needs review", isOn: $model.includeNeedsReview).font(Typography.content)
             if model.connector == "anki" {
                 HStack(spacing: 12) {
-                    Text("Deck").font(.system(size: 13)).foregroundStyle(Palette.tertiary)
+                    Text("Deck").font(Typography.content).foregroundStyle(Palette.tertiary)
                     TextField("Anki asks when you import", text: $model.deck)
                         .textFieldStyle(.roundedBorder)
+                        .accessibilityLabel("Deck")
                 }
             }
         }
@@ -501,7 +537,7 @@ struct ExportSheet: View {
     private var saveAs: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 12) {
-                Text("Save as").font(.system(size: 13)).foregroundStyle(Palette.tertiary)
+                Text("Save as").font(Typography.content).foregroundStyle(Palette.tertiary)
                 HStack(spacing: 8) {
                     Image(systemName: "doc").foregroundStyle(Palette.tertiary)
                     Text(model.destination.lastPathComponent).lineLimit(1)
@@ -510,7 +546,7 @@ struct ExportSheet: View {
                         .foregroundStyle(Palette.tertiary)
                         .lineLimit(1)
                 }
-                .font(.system(size: 13))
+                .font(Typography.content)
                 .padding(.horizontal, 12)
                 .frame(height: 30)
                 .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Palette.field))
@@ -519,7 +555,7 @@ struct ExportSheet: View {
             }
             if model.plan?.replacesExisting == true {
                 Text("A file with this name is already there and will be replaced.")
-                    .font(.system(size: 12))
+                    .font(Typography.control)
                     .foregroundStyle(Palette.warn)
             }
         }
@@ -529,7 +565,7 @@ struct ExportSheet: View {
         HStack(spacing: 10) {
             if model.summary == nil {
                 Text(outcome)
-                    .font(.system(size: 12.5))
+                    .font(Typography.supporting)
                     .foregroundStyle(Palette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -581,15 +617,15 @@ struct ExportSheet: View {
                 summary.written == 1 ? "Exported 1 word" : "Exported \(summary.written) words",
                 systemImage: "checkmark.circle"
             )
-            .font(.system(size: 16, weight: .semibold))
+            .font(Typography.emphasis)
             .foregroundStyle(Palette.ok)
             Text("Saved to \(model.destination.lastPathComponent) in \(model.destination.deletingLastPathComponent().lastPathComponent).")
-                .font(.system(size: 13))
+                .font(Typography.content)
                 .foregroundStyle(Palette.secondary)
             Text(model.connector == "anki"
                  ? "In Anki, choose File › Import… and pick this file."
                  : "In Pleco, open Import/Export › Import Cards and pick this file.")
-                .font(.system(size: 13))
+                .font(Typography.content)
                 .foregroundStyle(Palette.secondary)
         }
         .padding(16)
@@ -611,8 +647,8 @@ private struct SheetTitle: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.system(size: 20, weight: .semibold))
-            Text(subtitle).font(.system(size: 13)).foregroundStyle(Palette.secondary)
+            Text(title).font(Typography.title)
+            Text(subtitle).font(Typography.content).foregroundStyle(Palette.secondary)
         }
     }
 }
@@ -624,8 +660,8 @@ private struct Tally: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("\(number)").font(.system(size: 26, weight: .semibold)).foregroundStyle(warn ? Palette.warn : Palette.text)
-            Text(label).font(.system(size: 12.5)).foregroundStyle(warn ? Palette.text : Palette.secondary)
+            Text("\(number)").font(Typography.figure).foregroundStyle(warn ? Palette.warn : Palette.text)
+            Text(label).font(Typography.supporting).foregroundStyle(warn ? Palette.text : Palette.secondary)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)

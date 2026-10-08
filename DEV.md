@@ -442,6 +442,7 @@ crates/shouci-cli       shouci
 crates/shouci-tui       shouci-tui
 macos/                  the Mac app (Xcode project, Swift package, scripts)
 scripts/install.sh      install the app, shouci, and shouci-tui
+scripts/release.sh      a GitHub release with the disk image
 scripts/check.sh        boundaries + fmt + clippy + all tests
 scripts/setup-hooks.sh  git pre-commit → check.sh
 data/dictionaries/      the dictionary build tests use (not committed)

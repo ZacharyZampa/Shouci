@@ -8,7 +8,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MACAPP="${HOME}/Applications/Shouci.app"
+APP_ID="com.zacharyzampa.shouci"
+# An update replaces the copy already installed, in either Applications
+# folder (one dragged in from the disk image is in /Applications); a new
+# install goes to ~/Applications, which needs no administrator.
+if [ -d "/Applications/Shouci.app" ] && [ ! -d "${HOME}/Applications/Shouci.app" ]; then
+  MACAPP="/Applications/Shouci.app"
+else
+  MACAPP="${HOME}/Applications/Shouci.app"
+fi
 # Where the app keeps its data; overridable the same way the app's is.
 DATA_DIR="${SHOUCI_HOME:-${HOME}/Library/Application Support/Shouci}"
 DICTIONARIES="${SHOUCI_DICTIONARIES:-${DATA_DIR}/dictionaries}"
@@ -41,14 +49,27 @@ prerequisites() {
   fi
 }
 
+is_running() {
+  # By bundle id: a development build, also named Shouci, has another.
+  [ "$(osascript -e "application id \"${APP_ID}\" is running" 2>/dev/null)" = "true" ]
+}
+
+# Asks Shouci to quit, as its Quit command does, so a note still being typed
+# is saved; stops it only when it hasn't quit within 15 seconds.
 quit_shouci() {
-  if pgrep -x Shouci >/dev/null 2>&1; then
-    echo "==> quitting the running Shouci"
-    pkill -x Shouci || true
-    for _ in $(seq 1 20); do
-      pgrep -x Shouci >/dev/null 2>&1 || break
-      sleep 0.25
-    done
+  is_running || return 0
+  echo "==> quitting the running Shouci"
+  osascript -e "tell application id \"${APP_ID}\" to quit" >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    is_running || return 0
+    sleep 0.25
+  done
+  echo "    it didn't quit in time; stopping it"
+  pkill -f "^${MACAPP}/Contents/MacOS/Shouci$" || true
+  sleep 1
+  if is_running; then
+    echo "error: Shouci is still running; quit it, then run this again" >&2
+    exit 1
   fi
 }
 
@@ -87,8 +108,8 @@ status() {
   else
     echo "app:          not installed"
   fi
-  if pgrep -x Shouci >/dev/null 2>&1; then
-    echo "running:      yes (pid $(pgrep -x Shouci | tr '\n' ' '))"
+  if is_running; then
+    echo "running:      yes"
   else
     echo "running:      no"
   fi

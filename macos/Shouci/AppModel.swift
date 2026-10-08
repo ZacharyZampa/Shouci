@@ -20,8 +20,8 @@ final class AppModel {
     /// Why the library could not be opened. Nothing works without it.
     private(set) var openFailure: String?
     private(set) var dictionary: DictionaryState = .starting
-    /// Things to tell the user once: words brought over from the proof of
-    /// concept, a monthly refresh that failed.
+    /// Things to tell the user once: a shortcut that couldn't be set, a
+    /// monthly refresh that failed.
     private(set) var notices: [String] = []
 
     @ObservationIgnored private var seenNotes: Set<String> = []

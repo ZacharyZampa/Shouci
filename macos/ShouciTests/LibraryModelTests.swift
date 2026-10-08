@@ -1,10 +1,29 @@
 import Foundation
+import Observation
 import ShouciCore
 import Testing
 
 /// Filing, smart collections, the filter panel, and how problems are shown.
 @MainActor
 struct LibraryModelTests {
+    /// The words by id aren't observed themselves (comparing 15,000 of them
+    /// on each reload is slow): reading one must still see a reload that
+    /// changed it, or the detail would show it as it was.
+    @Test func aWordShownIsSeenAgainWhenAReloadChangesIt() async throws {
+        let library = try TestLibrary()
+        let word = try library.add("书")
+        await library.model.reload()
+        let changed = Flag()
+        withObservationTracking {
+            _ = library.model.item(word.id)
+        } onChange: {
+            changed.set()
+        }
+        _ = try library.core.bulk(ids: [word.id], action: .setVerification(.needsReview))
+        await library.model.reload()
+        #expect(changed.isSet)
+    }
+
     @Test func aWordIsCountedOnceFiledAndAFailedFilingIsNot() async throws {
         let library = try TestLibrary()
         let model = library.model
@@ -84,5 +103,17 @@ struct LibraryModelTests {
         #expect(model.problem == "A word needs its characters.")
         #expect(await model.save(WordDraft(simplified: "米饭")))
         #expect(model.problem == nil, "a new try clears it")
+    }
+}
+
+/// Set once, from whichever thread observation calls back on.
+private final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool { lock.withLock { value } }
+
+    func set() {
+        lock.withLock { value = true }
     }
 }

@@ -2,10 +2,15 @@
 //! collection holds no words of its own; its words are the ones its filter
 //! matches whenever it is looked at.
 //!
-//! The filter is kept as JSON, so a newer Shouci can add conditions without
-//! a migration (an older one ignores what it doesn't know). Renaming or
-//! merging a tag or collection renames it in every filter too, so a smart
-//! collection keeps finding the same words.
+//! The filter is kept as JSON. An older Shouci would read it without the
+//! conditions it doesn't know, so it would show more words than the filter
+//! asks for, and drop those conditions for good when a rename rewrites the
+//! filter. So a new condition comes with a schema migration (`migrate.rs`),
+//! even an empty one: an older Shouci then refuses the library and asks to
+//! be updated. `a_new_filter_condition_comes_with_a_migration` holds this.
+//!
+//! Renaming or merging a tag or collection renames it in every filter too,
+//! so a smart collection keeps finding the same words.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use vocab_core::{LibraryFilter, Result, VocabError};
@@ -259,6 +264,41 @@ mod tests {
 
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    /// See the module's comment: a filter field added or removed without a
+    /// migration would let an older Shouci misread smart collections.
+    #[test]
+    fn a_new_filter_condition_comes_with_a_migration() {
+        let serde_json::Value::Object(fields) =
+            serde_json::to_value(LibraryFilter::default()).unwrap()
+        else {
+            panic!("a filter is saved as a JSON object");
+        };
+        let mut fields: Vec<&str> = fields.keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(
+            (crate::SCHEMA_VERSION, fields),
+            (
+                2,
+                vec![
+                    "added_within_days",
+                    "any_collections",
+                    "any_tags",
+                    "collection",
+                    "frequency_bands",
+                    "hsk_levels",
+                    "no_collection",
+                    "tags",
+                    "verification",
+                    "view",
+                    "without_collections",
+                    "without_tags",
+                ]
+            ),
+            "the filter's fields changed: add a migration (an empty one will do) so an older \
+             Shouci refuses the library, then record the new version and fields here"
+        );
     }
 
     #[test]

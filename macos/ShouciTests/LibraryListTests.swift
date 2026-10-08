@@ -65,4 +65,54 @@ struct LibraryListTests {
         #expect(held(.archived) == [3])
         #expect(held(.trash) == [4])
     }
+
+    @Test func theSidebarCountsWhatEachViewHolds() {
+        var words = [
+            word(1, "学校", collections: ["Week 1"]), word(2, "米饭"),
+            word(3, "旅行", lifecycle: .archived, collections: ["Week 1"]),
+            word(4, "猫", lifecycle: .trashed), word(5, "狗", lifecycle: .archived),
+        ]
+        words.append(ItemView(
+            id: 6, simplified: "饕餮", traditional: "饕餮", pinyin: "", pinyinDisplay: "", definition: "",
+            definitionDisplay: "", notes: "", verification: .needsReview, lifecycle: .active,
+            source: SourceView(kind: .manual, id: nil, version: nil, importOrigin: nil), tags: [], collections: [],
+            destinations: [], frequencyRank: nil, frequencyBand: .unlisted, hskRank: nil,
+            createdAt: "2026-01-01T09:00:00.000Z", modifiedAt: "2026-01-01T09:00:00.000Z", archivedAt: nil,
+            deletedAt: nil, rev: 1))
+        let counts = LibraryList.counts(words)
+        for scope in [LibraryModel.Scope.all, .needsReview, .noCollection, .archived, .trash] {
+            #expect(counts[scope] == LibraryList.items(words, in: scope, dates: [:], now: now).count, "\(scope)")
+        }
+    }
+
+    @Test func eachPairedChangeTurnsBackOnceEveryWordHasIt() {
+        var review = word(1, "书")
+        review.verification = .needsReview
+        let active = word(2, "笔")
+        let archived = word(3, "猫", lifecycle: .archived)
+        let trashed = word(4, "狗", lifecycle: .trashed)
+
+        #expect([review, active].reviewToggle == .setVerification(.needsReview))
+        #expect([review].reviewToggle == .setVerification(.confirmed))
+        #expect([active, archived].archiveToggle == .archive)
+        #expect([archived].archiveToggle == .unarchive)
+        #expect([active, trashed].trashToggle == .trash)
+        #expect([trashed].trashToggle == .restore)
+        // Nothing selected: the menus' titles stay as they start.
+        let none: [ItemView] = []
+        #expect(none.reviewToggle.title == "Mark as Needs Review")
+        #expect(none.archiveToggle.title == "Archive")
+        #expect(none.trashToggle.title == "Move to Trash")
+        #expect(!none.allTrashed)
+    }
+
+    @Test func datesAreReadAgainOnlyForWordsThatChanged() {
+        let before = [word(1, "书"), word(2, "笔")]
+        let first = ItemDates.of(before, reusing: [:])
+        let edited = [word(1, "书"), word(2, "笔", trashed: "2026-03-01T09:00:00.000Z")]
+        let second = ItemDates.of(edited, reusing: first)
+        #expect(second[1]?.edited == first[1]?.edited)
+        #expect(second[2]?.trashed == When.parse("2026-03-01T09:00:00.000Z"))
+        #expect(second[2]?.edited == When.parse("2026-03-01T09:00:00.000Z"))
+    }
 }

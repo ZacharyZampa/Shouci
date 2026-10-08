@@ -112,7 +112,11 @@ final class LibraryModel {
     var selection: Set<Pick> = []
     /// What went wrong, shown in the editor or filing sheet when one is
     /// open, otherwise in an alert.
-    var problem: String?
+    var problem: String? {
+        // The window's alert is read out by itself; a notice in the editor
+        // or filing sheet isn't.
+        didSet { if let problem, problem != oldValue, editor != nil || filing != nil { VoiceOver.say(problem) } }
+    }
     var editor: WordDraft?
     var naming: Naming?
     var merging: Merging?
@@ -126,11 +130,22 @@ final class LibraryModel {
     /// A sheet is open over the window.
     var showsSheet: Bool { editor != nil || filing != nil || transfer != nil }
 
-    /// Observed: the detail reads the selected word here, and must show it
-    /// again when a change to it reloads the library.
-    private var byID: [Int64: ItemView] = [:]
+    /// Every word by id. Not observed itself: SwiftUI's observation compares
+    /// a new value with the old before saying it changed, which for 15,000
+    /// words takes milliseconds on every reload. Read it through `words`.
+    @ObservationIgnored private var byID: [Int64: ItemView] = [:]
+
+    /// `byID`, observing `items` instead, which a reload replaces with it:
+    /// the detail shows a word again when a change to it reloads the
+    /// library.
+    private var words: [Int64: ItemView] {
+        _ = items
+        return byID
+    }
     /// `listGroups`' rows in order, for selection.
     @ObservationIgnored private var listOrder: [Pick] = []
+    /// The same rows as a set, to find one without walking the list.
+    @ObservationIgnored private var listed: Set<Pick> = []
     /// When the list was last worked out: headings such as Today go stale
     /// at midnight.
     @ObservationIgnored private var listedAt = Date.distantPast
@@ -165,11 +180,18 @@ final class LibraryModel {
             // The version first: a change landing while the rest loads then
             // shows up as a newer version, and the watcher loads again.
             let query = filterQuery
-            let (version, all, trash, groups, smart, matched, dictionaries, connectors) = try await app.call { core in
-                (
-                    try core.dataVersion(),
-                    try core.listItems(filter: LibraryFilter(view: .all)),
-                    try core.listItems(filter: LibraryFilter(view: .trash)),
+            let previousDates = dates
+            let (version, loaded, groups, smart, matched, dictionaries, connectors) = try await app.call { core in
+                let version = try core.dataVersion()
+                let items = try core.listItems(filter: LibraryFilter(view: .all))
+                    + core.listItems(filter: LibraryFilter(view: .trash))
+                // Worked out here, off the main thread, and only for the
+                // words that changed: for 15,000 words, all the dates take
+                // longer than a frame.
+                let byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                return (
+                    version,
+                    (items, byID, ItemDates.of(items, reusing: previousDates)),
                     (try core.tags(), try core.collections()),
                     try core.smartCollections(),
                     try query.map { try core.matchingIds(filter: $0) },
@@ -178,9 +200,7 @@ final class LibraryModel {
                 )
             }
             let (tags, collections) = groups
-            items = all + trash
-            byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-            dates = byID.mapValues(ItemDates.init)
+            (items, byID, dates) = loaded
             self.tags = tags
             self.collections = collections
             let previous = smartCollections
@@ -228,7 +248,7 @@ final class LibraryModel {
 
     // MARK: What the window shows
 
-    func item(_ id: Int64) -> ItemView? { byID[id] }
+    func item(_ id: Int64) -> ItemView? { words[id] }
 
     /// Words in a view of the Library section, or in the current view.
     func count(of scope: Scope) -> Int { counts[scope] ?? 0 }
@@ -242,11 +262,10 @@ final class LibraryModel {
     private func keepSelectionInView(shown: [Pick]) {
         guard !isSearching else {
             selection = selection.filter { pick in
-                if case .item(let id) = pick { byID[id] != nil } else { true }
+                if case .item(let id) = pick { words[id] != nil } else { true }
             }
             return
         }
-        let listed = Set(listOrder)
         let kept = selection.filter(listed.contains)
         guard kept.isEmpty, let first = shown.firstIndex(where: selection.contains) else {
             selection = kept
@@ -260,16 +279,14 @@ final class LibraryModel {
     /// sort.
     func refreshList() {
         let now = Date.now
-        var counts: [Scope: Int] = [:]
-        for counted in [Scope.all, .needsReview, .noCollection, .archived, .trash] {
-            counts[counted] = LibraryList.items(items, in: counted, dates: dates, now: now).count
-        }
+        var counts = LibraryList.counts(items)
         var words = LibraryList.items(items, in: scope, dates: dates, now: now)
         counts[scope] = words.count
         if let filtered { words = words.filter { filtered.contains($0.id) } }
         shownCount = words.count
         listGroups = LibraryList.groups(words, scope: scope, sort: sort, dates: dates, now: now)
         listOrder = listGroups.flatMap { $0.rows.map(\.id) }
+        listed = Set(listOrder)
         self.counts = counts
         listedAt = now
     }
@@ -333,15 +350,22 @@ final class LibraryModel {
     var order: [Pick] { isSearching ? groups.flatMap { $0.rows.map(\.id) } : listOrder }
 
     var selectedItems: [ItemView] {
-        order.compactMap { pick in
+        // None or one: read on every redraw, so not by walking the list.
+        if selection.count < 2 {
+            guard case .item(let id)? = selection.first, let item = words[id],
+                isSearching ? order.contains(.item(id)) : listed.contains(.item(id))
+            else { return [] }
+            return [item]
+        }
+        return order.compactMap { pick in
             guard selection.contains(pick), case .item(let id) = pick else { return nil }
-            return byID[id]
+            return words[id]
         }
     }
 
     var selectedItem: ItemView? {
         guard selection.count == 1, case .item(let id)? = selection.first else { return nil }
-        return byID[id] ?? hits.first { $0.id == id }
+        return words[id] ?? hits.first { $0.id == id }
     }
 
     var selectedCandidate: CandidateView? {
@@ -380,6 +404,7 @@ final class LibraryModel {
                 if selection.isEmpty || !selection.allSatisfy({ order.contains($0) }) {
                     selection = order.first.map { [$0] } ?? []
                 }
+                VoiceOver.sayWhenSettled(spokenResults)
             } catch {
                 guard !Task.isCancelled else { return }
                 problem = describe(error)
@@ -398,6 +423,7 @@ final class LibraryModel {
         let current = selection.count == 1 ? selection.first.flatMap(order.firstIndex) : nil
         let next = min(max((current ?? -1) + offset, 0), order.count - 1)
         selection = [order[next]]
+        VoiceOver.say(spoken(order[next]), interrupt: true)
     }
 
     /// ↵ from the search field: add the chosen dictionary word, or edit the
@@ -414,7 +440,7 @@ final class LibraryModel {
 
     func reveal(_ id: Int64) {
         query = ""
-        if let item = byID[id] {
+        if let item = words[id] {
             scope = item.lifecycle == .trashed ? .trash : item.lifecycle == .archived ? .archived : .all
         }
         selection = [.item(id)]
@@ -459,7 +485,7 @@ final class LibraryModel {
             enqueue { _ = try $0.bulk(ids: ids, action: action) }
             return
         }
-        record(action.undoName, ids: ids) { _ = try $0.bulk(ids: ids, action: action) }
+        record(action.title, ids: ids) { _ = try $0.bulk(ids: ids, action: action) }
     }
 
     /// Changes one word where the detail shows it: its notes, a tag, a
@@ -468,7 +494,7 @@ final class LibraryModel {
         let fieldsKept = patch.simplified == nil && patch.traditional == nil && patch.pinyin == nil
             && patch.definition == nil && patch.verification == nil
         let name =
-            if fieldsKept && patch.notes == nil && actions.count == 1 { actions[0].undoName }
+            if fieldsKept && patch.notes == nil && actions.count == 1 { actions[0].title }
             else if fieldsKept && actions.isEmpty { "Edit Notes" }
             else { "Edit" }
         record(name, ids: [id]) { _ = try $0.editItem(id: id, patch: patch, actions: actions) }
@@ -477,7 +503,7 @@ final class LibraryModel {
     /// Saves notes still being typed, then waits for the changes asked for:
     /// quitting loses none of them.
     func finishChanges() async {
-        if let typed = typedNotes, let item = byID[typed.id] {
+        if let typed = typedNotes, let item = words[typed.id] {
             let notes = typed.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if notes != item.notes { update(typed.id, patch: ItemPatch(notes: notes)) }
         }

@@ -106,6 +106,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         libraryModel.startFiling()
     }
 
+    // MARK: Word menu
+
+    /// The words a Word menu command acts on: the library window's
+    /// selection, while that window has the keyboard, no sheet is open, and
+    /// no field is being typed in (there ⌘⌫ and ⌘E edit the text instead).
+    private var menuWords: [ItemView] {
+        guard let window = library?.window, window.isKeyWindow, !libraryModel.showsSheet,
+            !(window.firstResponder is NSTextView)
+        else { return [] }
+        return libraryModel.selectedItems
+    }
+
+    @objc func editWord(_ sender: Any?) {
+        let words = menuWords
+        if words.count == 1, let word = words.first { libraryModel.edit(word) }
+    }
+
+    // Each turns back once every word has it (`reviewToggle` and the others).
+
+    @objc func markWords(_ sender: Any?) {
+        let words = menuWords
+        libraryModel.perform(words.reviewToggle, on: words.map(\.id))
+    }
+
+    @objc func archiveWords(_ sender: Any?) {
+        let words = menuWords
+        libraryModel.perform(words.archiveToggle, on: words.map(\.id))
+    }
+
+    @objc func trashWords(_ sender: Any?) {
+        let words = menuWords
+        libraryModel.perform(words.trashToggle, on: words.map(\.id))
+    }
+
     @objc func findInLibrary(_ sender: Any?) {
         openLibrary()
         libraryModel.focusSearch()
@@ -206,6 +240,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(.separator())
         appMenu.addItem(item("Settings…", #selector(showSettings(_:)), key: ",", target: self))
         appMenu.addItem(.separator())
+        appMenu.addItem(item("Hide Shouci", #selector(NSApplication.hide(_:)), key: "h"))
+        appMenu.addItem(
+            item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), key: "h", modifiers: [.command, .option]))
+        appMenu.addItem(item("Show All", #selector(NSApplication.unhideAllApplications(_:))))
+        appMenu.addItem(.separator())
         appMenu.addItem(item("Quit Shouci", #selector(NSApplication.terminate(_:)), key: "q"))
         let file = NSMenu(title: "File")
         file.addItem(item("New Word", #selector(newWord(_:)), key: "n", target: self))
@@ -224,15 +263,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         edit.addItem(item("Paste", #selector(NSText.paste(_:)), key: "v"))
         edit.addItem(item("Select All", #selector(NSText.selectAll(_:)), key: "a"))
         edit.addItem(.separator())
-        edit.addItem(item("File in Collection…", #selector(fileInCollection(_:)), key: "C", target: self))
         edit.addItem(item("Find", #selector(findInLibrary(_:)), key: "f", target: self))
+        // AppKit names these Show or Hide Sidebar, and Enter or Exit Full
+        // Screen, as they apply.
+        let view = NSMenu(title: "View")
+        view.addItem(
+            item("Show Sidebar", #selector(NSSplitViewController.toggleSidebar(_:)), key: "s", modifiers: [.command, .control]))
+        view.addItem(.separator())
+        view.addItem(
+            item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), key: "f", modifiers: [.command, .control]))
+        // The selected words. Titles follow the selection (`validateMenuItem`).
+        let word = NSMenu(title: "Word")
+        word.addItem(item("Edit Word…", #selector(editWord(_:)), key: "e", target: self))
+        word.addItem(item("File in Collection…", #selector(fileInCollection(_:)), key: "C", target: self))
+        word.addItem(.separator())
+        word.addItem(item(BulkAction.setVerification(.needsReview).title, #selector(markWords(_:)), key: "R", target: self))
+        word.addItem(item(BulkAction.archive.title, #selector(archiveWords(_:)), key: "a", modifiers: [.command, .control], target: self))
+        word.addItem(.separator())
+        word.addItem(item(BulkAction.trash.title, #selector(trashWords(_:)), key: "\u{8}", target: self))
         let window = NSMenu(title: "Window")
         window.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), key: "m"))
         window.addItem(item("Zoom", #selector(NSWindow.performZoom(_:))))
         window.addItem(.separator())
         window.addItem(item("Bring All to Front", #selector(NSApplication.arrangeInFront(_:))))
         NSApp.windowsMenu = window
-        for submenu in [appMenu, file, edit, window] {
+        // Empty but for the search field macOS puts in a Help menu, which
+        // finds any command by name.
+        let help = NSMenu(title: "Help")
+        NSApp.helpMenu = help
+        for submenu in [appMenu, file, edit, view, word, window, help] {
             let holder = NSMenuItem()
             holder.submenu = submenu
             main.addItem(holder)
@@ -240,9 +299,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return main
     }
 
-    private func item(_ title: String, _ action: Selector, key: String = "", target: AnyObject? = nil) -> NSMenuItem {
+    private func item(
+        _ title: String, _ action: Selector, key: String = "", modifiers: NSEvent.ModifierFlags = .command,
+        target: AnyObject? = nil
+    ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
         item.target = target
         return item
+    }
+}
+
+extension AppDelegate: NSMenuItemValidation {
+    /// The Word menu acts on the selection, and says what it will do to it.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        let words = menuWords
+        let trashed = words.allTrashed
+        switch item.action {
+        case #selector(editWord(_:)):
+            return words.count == 1 && !trashed
+        case #selector(markWords(_:)):
+            item.title = words.reviewToggle.title
+            return !words.isEmpty && !trashed
+        case #selector(archiveWords(_:)):
+            item.title = words.archiveToggle.title
+            return !words.isEmpty && !trashed
+        case #selector(trashWords(_:)):
+            item.title = words.trashToggle.title
+            return !words.isEmpty
+        default:
+            return true
+        }
     }
 }
