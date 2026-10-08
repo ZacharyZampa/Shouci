@@ -143,7 +143,6 @@ struct DataSettings: View {
     let app: AppModel
     let openImport: () -> Void
     let openExport: () -> Void
-    @State private var bringOver: String?
 
     var body: some View {
         Form {
@@ -164,12 +163,6 @@ struct DataSettings: View {
                 } label: {
                     Text("Pleco and Anki")
                     Text("Plain-text files that Pleco and Anki read and write.")
-                }
-                LabeledContent {
-                    Button("Choose File…", action: chooseOldLibrary)
-                } label: {
-                    Text("An older Shouci library")
-                    Text(bringOver ?? "Brings words over from a proof-of-concept user.db. Only new words are added.")
                 }
             }
             Section {
@@ -193,26 +186,6 @@ struct DataSettings: View {
                 .textSelection(.enabled)
                 .lineLimit(1)
                 .truncationMode(.middle)
-        }
-    }
-
-    private func chooseOldLibrary() {
-        let panel = NSOpenPanel()
-        panel.message = "Choose the user.db of an older Shouci (pleco-companion) library."
-        panel.prompt = "Bring Words Over"
-        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/Application Support/pleco-companion")
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let path = url.path
-        Task {
-            do {
-                let result = try await app.call { try $0.importPoc(legacyDb: path) }
-                var parts = ["\(result.itemsAdded) words added", "\(result.itemsAlreadySaved) already here"]
-                if !result.skipped.isEmpty { parts.append("\(result.skipped.count) could not come over") }
-                bringOver = parts.joined(separator: ", ") + "."
-            } catch {
-                bringOver = describe(error)
-            }
         }
     }
 }

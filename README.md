@@ -60,10 +60,6 @@ about it.
 | See what's installed | `./scripts/install.sh --status` |
 | Uninstall | `./scripts/install.sh --uninstall` (your words stay; see below) |
 
-**Coming from the proof of concept?** On first launch Shouci copies your
-words from `~/Library/Application Support/pleco-companion/` into its new
-library. The old folder is left as it was.
-
 ## Using Shouci
 
 <p align="center">
@@ -151,8 +147,7 @@ Right-click 文 › Settings, or ⌘, in Shouci.
   lists, and opening at login.
 - **Dictionaries:** which dictionaries search uses, and checking for a new
   one.
-- **Data:** where your words are kept, import and export, and bringing words
-  over from an older library.
+- **Data:** where your words are kept, and import and export.
 
 ## Where your data is
 

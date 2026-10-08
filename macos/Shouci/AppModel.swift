@@ -46,7 +46,6 @@ final class AppModel {
                     try Core.open(config: defaultConfig())
                 }.value
                 self.core = core
-                core.startupNotes().forEach(post)
                 loadDictionaries()
             } catch {
                 openFailure = describe(error)

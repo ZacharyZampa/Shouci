@@ -17,6 +17,14 @@
 //!
 //! Enum-like columns have no CHECK constraints: widening one would need a
 //! table rebuild. Values are validated in Rust instead.
+//!
+//! Before anything writes to a database, [`check`] makes sure it is one
+//! Shouci can open safely: empty, or holding every table and column its
+//! version should have (what the migrations build up to that version).
+//! Anything else (another program's database, a newer Shouci's) is refused
+//! and left as it is.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use vocab_core::{Result, VocabError};
@@ -151,6 +159,102 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
     run(conn, MIGRATIONS)
 }
 
+/// Tables and their columns.
+type Schema = BTreeMap<String, BTreeSet<String>>;
+
+/// Refuses a database this build can't open safely, before anything
+/// writes to it: one from a newer Shouci, one holding tables at version 0
+/// (another program's), or one missing a table or column its version
+/// should have. Extra tables and columns are allowed.
+pub(crate) fn check(conn: &mut Connection) -> Result<()> {
+    check_against(conn, MIGRATIONS)
+}
+
+fn check_against(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
+    #[allow(clippy::cast_possible_wrap)]
+    let latest = migrations.len() as i64;
+    // One read, so a migration committing in between can't mix versions.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > latest {
+        return Err(newer(version, latest));
+    }
+    let found = schema_of(&tx)?;
+    if version == 0 {
+        return if found.is_empty() {
+            Ok(())
+        } else {
+            Err(VocabError::storage(
+                "this user.db isn't a Shouci library (it holds tables Shouci didn't make), \
+                 so it was left as it is",
+            ))
+        };
+    }
+    let expected = schema_at(migrations, version)?;
+    let missing = expected
+        .iter()
+        .find_map(|(table, columns)| match found.get(table) {
+            None => Some(table.clone()),
+            Some(have) => columns
+                .iter()
+                .find(|column| !have.contains(*column))
+                .map(|column| format!("{table}.{column}")),
+        });
+    match missing {
+        Some(missing) => Err(VocabError::storage(format!(
+            "this user.db isn't a Shouci library this build can open: it says schema \
+             {version} but has no {missing}, so it was left as it is"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// What the first `version` migrations build, made in memory.
+fn schema_at(migrations: &[Migration], version: i64) -> Result<Schema> {
+    let mut conn = Connection::open_in_memory()?;
+    let tx = conn.transaction()?;
+    let steps = usize::try_from(version).unwrap_or(0);
+    for (index, migration) in migrations.iter().enumerate().take(steps) {
+        apply(&tx, index + 1, migration)?;
+    }
+    schema_of(&tx)
+}
+
+fn schema_of(conn: &Connection) -> Result<Schema> {
+    let mut tables = conn.prepare(
+        r"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\'",
+    )?;
+    let names = tables
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut columns = conn.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    names
+        .into_iter()
+        .map(|table| {
+            let names = columns
+                .query_map([&table], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            Ok((table, names))
+        })
+        .collect()
+}
+
+fn newer(version: i64, latest: i64) -> VocabError {
+    VocabError::storage(format!(
+        "this user.db was written by a newer Shouci (schema {version}; this build \
+         understands up to {latest}). Update Shouci to open it."
+    ))
+}
+
+fn apply(tx: &Transaction<'_>, step: usize, migration: &Migration) -> Result<()> {
+    match migration {
+        Migration::Sql(sql) => tx
+            .execute_batch(sql)
+            .map_err(|err| VocabError::storage(format!("schema migration {step} failed: {err}"))),
+        Migration::Rust(apply) => apply(tx),
+    }
+}
+
 pub(crate) fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<()> {
     #[allow(clippy::cast_possible_wrap)]
     let latest = migrations.len() as i64;
@@ -170,26 +274,12 @@ fn run_locked(conn: &mut Connection, migrations: &[Migration], latest: i64) -> R
     // Read inside the write lock: another process may have just migrated.
     let current: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if current > latest {
-        return Err(VocabError::storage(format!(
-            "this user.db was written by a newer Shouci (schema {current}; this build \
-             understands up to {latest}). Update Shouci to open it."
-        )));
-    }
-    if current == 0 && is_poc_database(&tx)? {
-        return Err(VocabError::invalid(
-            "this is a Shouci proof-of-concept database. Open a new user.db and bring \
-             these words in with `shouci migrate-poc`.",
-        ));
+        return Err(newer(current, latest));
     }
     let start = usize::try_from(current).unwrap_or(0);
     for (index, migration) in migrations.iter().enumerate().skip(start) {
         let step = index + 1;
-        match migration {
-            Migration::Sql(sql) => tx.execute_batch(sql).map_err(|err| {
-                VocabError::storage(format!("schema migration {step} failed: {err}"))
-            })?,
-            Migration::Rust(apply) => apply(&tx)?,
-        }
+        apply(&tx, step, migration)?;
         tx.pragma_update(None, "user_version", crate::to_i64(step)?)?;
     }
     let broken: Option<String> = tx
@@ -204,20 +294,11 @@ fn run_locked(conn: &mut Connection, migrations: &[Migration], latest: i64) -> R
     Ok(())
 }
 
-fn is_poc_database(conn: &Connection) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'vocabulary_items'",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(count > 0)
-}
-
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
 
-    use super::{MIGRATIONS, Migration, SCHEMA_VERSION, migrate, run};
+    use super::{MIGRATIONS, Migration, SCHEMA_VERSION, check, migrate, run};
 
     #[test]
     fn fresh_database_reaches_the_latest_version_once() {
@@ -239,13 +320,83 @@ mod tests {
         assert!(err.to_string().contains("newer Shouci"), "{err}");
     }
 
+    /// A `user.db` on disk made by `sql`, as `crate::open` would find it.
+    fn file_with(name: &str, sql: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("shouci-check-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user.db");
+        Connection::open(&path).unwrap().execute_batch(sql).unwrap();
+        path
+    }
+
+    fn query(path: &std::path::Path, sql: &str) -> String {
+        Connection::open(path)
+            .unwrap()
+            .query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
+            .map(|value| format!("{value:?}"))
+            .unwrap()
+    }
+
     #[test]
-    fn poc_database_is_refused_with_a_way_forward() {
+    fn another_programs_database_is_left_as_it_is() {
+        let path = file_with(
+            "foreign",
+            "CREATE TABLE vocabulary_items (id INTEGER PRIMARY KEY);",
+        );
+        let err = crate::open(&path).unwrap_err();
+        assert!(err.to_string().contains("isn't a Shouci library"), "{err}");
+        assert_eq!(
+            query(&path, "PRAGMA journal_mode"),
+            r#"Text("delete")"#,
+            "not WAL"
+        );
+        assert_eq!(
+            query(&path, "SELECT count(*) FROM sqlite_master"),
+            "Integer(1)",
+            "nothing added"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_database_missing_what_its_version_has_is_refused() {
+        // Another program's database that happens to say schema 1
+        let path = file_with(
+            "claims",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT); PRAGMA user_version = 1;",
+        );
+        let err = crate::open(&path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("schema 1 but has no collection_items"),
+            "{err}"
+        );
+        assert_eq!(
+            query(&path, "PRAGMA user_version"),
+            "Integer(1)",
+            "not migrated"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // A library missing a column
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE vocabulary_items (item_id INTEGER PRIMARY KEY);")
+        migrate(&mut conn).unwrap();
+        conn.execute_batch("ALTER TABLE items DROP COLUMN notes;")
             .unwrap();
-        let err = migrate(&mut conn).unwrap_err();
-        assert!(err.to_string().contains("migrate-poc"), "{err}");
+        let err = check(&mut conn).unwrap_err();
+        assert!(err.to_string().contains("has no items.notes"), "{err}");
+    }
+
+    #[test]
+    fn a_library_holding_more_than_its_version_needs_opens() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE added_by_hand (id INTEGER); ALTER TABLE items ADD COLUMN extra TEXT;",
+        )
+        .unwrap();
+        check(&mut conn).unwrap();
     }
 
     /// The shape of a future migration that rebuilds `items` (to change a

@@ -12,8 +12,8 @@ use shouci_core::{
     BulkAction, BulkResult, CandidateView, Config, ConnectorView, DictionaryEntryView,
     DictionaryResults, DictionaryStatus, DictionaryView, ErrorKind, ExportRequest,
     FilterConditionView, FrequencyBandView, GroupView, HskLevelView, ImportPolicy, ItemPatch,
-    ItemView, LegacyImport, LibraryFilter, LibraryResults, LibrarySnapshot, ManualWord, QueryKind,
-    QuickAdd, SaveResult, Shouci, SmartCollectionView, TransferSummary,
+    ItemView, LibraryFilter, LibraryResults, LibrarySnapshot, ManualWord, QueryKind, QuickAdd,
+    SaveResult, Shouci, SmartCollectionView, TransferSummary,
 };
 
 mod remote;
@@ -61,7 +61,6 @@ pub struct CoreConfig {
     pub data_dir: String,
     pub dictionaries_dir: String,
     pub fetch_dictionaries: bool,
-    pub legacy_dir: Option<String>,
 }
 
 impl From<&Config> for CoreConfig {
@@ -70,7 +69,6 @@ impl From<&Config> for CoreConfig {
             data_dir: text(&config.data_dir),
             dictionaries_dir: text(&config.dictionaries_dir),
             fetch_dictionaries: config.fetch_dictionaries,
-            legacy_dir: config.legacy_dir.as_deref().map(text),
         }
     }
 }
@@ -81,7 +79,6 @@ impl From<CoreConfig> for Config {
             data_dir: PathBuf::from(config.data_dir),
             dictionaries_dir: PathBuf::from(config.dictionaries_dir),
             fetch_dictionaries: config.fetch_dictionaries,
-            legacy_dir: config.legacy_dir.map(PathBuf::from),
         }
     }
 }
@@ -220,17 +217,8 @@ impl Core {
         CoreConfig::from(self.shouci.config())
     }
 
-    #[must_use]
-    pub fn startup_notes(&self) -> Vec<String> {
-        self.shouci.startup_notes().to_vec()
-    }
-
     pub fn data_version(&self) -> Result<i64> {
         Ok(self.shouci.data_version()?)
-    }
-
-    pub fn import_poc(&self, legacy_db: String) -> Result<LegacyImport> {
-        Ok(self.shouci.import_poc(Path::new(&legacy_db))?)
     }
 
     pub fn load_dictionaries(&self) -> Result<()> {

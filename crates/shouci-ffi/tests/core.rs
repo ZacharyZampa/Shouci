@@ -28,7 +28,6 @@ fn config(dir: &std::path::Path) -> CoreConfig {
         data_dir: dir.to_string_lossy().into_owned(),
         dictionaries_dir: dir.join("dictionaries").to_string_lossy().into_owned(),
         fetch_dictionaries: false,
-        legacy_dir: None,
     }
 }
 

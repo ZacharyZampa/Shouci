@@ -419,23 +419,3 @@ pub struct DetectedImport {
     /// No other format reads the file as well.
     pub unambiguous: bool,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct LegacyImport {
-    pub items_added: u32,
-    pub items_already_saved: u32,
-    pub runs_added: u32,
-    /// Rows that could not come over, with why.
-    pub skipped: Vec<String>,
-}
-
-impl From<vocab_db::LegacyReport> for LegacyImport {
-    fn from(value: vocab_db::LegacyReport) -> Self {
-        Self {
-            items_added: crate::count(value.items_added),
-            items_already_saved: crate::count(value.items_already_saved),
-            runs_added: crate::count(value.runs_added),
-            skipped: value.skipped,
-        }
-    }
-}

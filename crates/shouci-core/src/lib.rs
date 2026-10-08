@@ -26,7 +26,6 @@ mod undo;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
-use std::path::Path;
 use std::sync::{Mutex, MutexGuard, RwLock};
 
 use rusqlite::Connection;
@@ -35,8 +34,8 @@ pub use config::{Config, expand_tilde, expand_tilde_in};
 pub use dto::{
     BulkAction, BulkResult, CandidateView, ConnectorView, DetectedImport, DictionaryEntryView,
     DictionaryResults, DictionaryStatus, DictionaryView, FilterConditionView, FrequencyBandView,
-    GroupView, HskLevelView, ItemView, LegacyImport, LibraryResults, LibrarySnapshot, LoadingStage,
-    ManualWord, QuickAdd, SaveOutcome, SaveResult, SavedRef, SmartCollectionView, SourceView,
+    GroupView, HskLevelView, ItemView, LibraryResults, LibrarySnapshot, LoadingStage, ManualWord,
+    QuickAdd, SaveOutcome, SaveResult, SavedRef, SmartCollectionView, SourceView,
 };
 pub use search::DEFAULT_LIMIT;
 pub use vocab_core::connector::{Issue, Severity};
@@ -69,16 +68,11 @@ pub struct Shouci {
     dictionaries: RwLock<DictState>,
     load: LoadControl,
     connectors: Registry,
-    startup_notes: Vec<String>,
 }
 
 impl Shouci {
     /// Opens (or creates) the library. Fast: dictionaries are loaded
     /// separately by [`Shouci::load_dictionaries`].
-    ///
-    /// When `user.db` is created and the config names a proof-of-concept
-    /// directory, its words are brought over (see
-    /// [`Shouci::startup_notes`]).
     ///
     /// # Errors
     ///
@@ -92,12 +86,8 @@ impl Shouci {
             ))
         })?;
         let path = config.user_db_path();
-        let mut conn = vocab_db::open(&path)?;
+        let conn = vocab_db::open(&path)?;
         let reader = vocab_db::open(&path)?;
-        let mut startup_notes = Vec::new();
-        if let Some(legacy) = &config.legacy_dir {
-            bring_over(&config, legacy, &mut conn, &mut startup_notes);
-        }
         Ok(Self {
             config,
             writer: Mutex::new(conn),
@@ -105,20 +95,12 @@ impl Shouci {
             dictionaries: RwLock::new(DictState::NotLoaded),
             load: LoadControl::default(),
             connectors: Registry::builtin(),
-            startup_notes,
         })
     }
 
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
-    }
-
-    /// What happened while opening, for the frontend to show once: words
-    /// brought over from the proof of concept, or why they weren't.
-    #[must_use]
-    pub fn startup_notes(&self) -> &[String] {
-        &self.startup_notes
     }
 
     /// Changes whenever the library changes: from this `Shouci` (the popover
@@ -130,18 +112,6 @@ impl Shouci {
     /// Storage errors.
     pub fn data_version(&self) -> Result<i64> {
         vocab_db::data_version(&*self.reader()?)
-    }
-
-    /// Brings words, tags, and transfer history over from a
-    /// proof-of-concept `user.db`. Safe to run again: only new words are
-    /// added.
-    ///
-    /// # Errors
-    ///
-    /// When the file is missing or not a POC database, or writing fails.
-    pub fn import_poc(&self, legacy_db: &Path) -> Result<LegacyImport> {
-        let mut conn = self.writer()?;
-        Ok(vocab_db::import_poc_database(&mut conn, &expand_tilde(legacy_db)?)?.into())
     }
 
     /// The connection for writes.
@@ -173,62 +143,6 @@ pub(crate) fn check_query(query: &str) -> Result<&str> {
         )));
     }
     Ok(query)
-}
-
-/// After the proof of concept: copy its words once, and its built
-/// dictionary so the first launch needs no download. Runs on every open
-/// until the words have come over (an interrupted first launch tries
-/// again). Failures are reported, never fatal.
-fn bring_over(config: &Config, legacy: &Path, conn: &mut Connection, notes: &mut Vec<String>) {
-    let legacy_db = legacy.join("user.db");
-    let done = vocab_db::get_setting(conn, vocab_db::LEGACY_IMPORTED_SETTING)
-        .ok()
-        .flatten()
-        .is_some();
-    if legacy_db.is_file() && !done {
-        match vocab_db::import_poc_database(conn, &legacy_db) {
-            Ok(report) => {
-                if report.items_added > 0 {
-                    notes.push(format!(
-                        "Brought {} words over from {}.",
-                        report.items_added,
-                        legacy_db.display()
-                    ));
-                }
-                if !report.skipped.is_empty() {
-                    notes.push(format!(
-                        "{} could not come over: {}",
-                        report.skipped.len(),
-                        report.skipped.join("; ")
-                    ));
-                }
-            }
-            Err(err) => notes.push(format!(
-                "Could not bring words over from {}: {err}. Try `shouci migrate-poc`.",
-                legacy_db.display()
-            )),
-        }
-    }
-    let legacy_dictionary = legacy.join("dictionary.db");
-    let target = vocab_dictionary::catalog::dictionary_path(
-        &config.dictionaries_dir,
-        vocab_dictionary::catalog::CC_CEDICT.id,
-    );
-    if legacy_dictionary.is_file() && !target.exists() {
-        // Copy beside, then rename: a copy cut short never looks finished.
-        let partial = target.with_extension("building.db");
-        let copied = std::fs::create_dir_all(&config.dictionaries_dir)
-            .and_then(|()| std::fs::copy(&legacy_dictionary, &partial))
-            .and_then(|_| std::fs::rename(&partial, &target));
-        if copied.is_ok() {
-            let stamp = legacy_dictionary.with_extension("fetched");
-            if stamp.is_file() {
-                let _ = std::fs::copy(stamp, target.with_extension("fetched"));
-            }
-        } else {
-            let _ = std::fs::remove_file(&partial);
-        }
-    }
 }
 
 #[cfg(test)]

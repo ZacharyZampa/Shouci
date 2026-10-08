@@ -95,8 +95,6 @@ enum Command {
     Import(ImportArgs),
     /// Export words to a Pleco or Anki text file.
     Export(ExportArgs),
-    /// Bring words over from the proof of concept's library.
-    MigratePoc(MigrateArgs),
 }
 
 /// How to read a query.
@@ -586,13 +584,6 @@ struct ExportArgs {
     dry_run: bool,
 }
 
-#[derive(Args)]
-struct MigrateArgs {
-    /// The old library (default:
-    /// ~/Library/Application Support/pleco-companion/user.db).
-    file: Option<PathBuf>,
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let out = Out { json: cli.json };
@@ -651,7 +642,6 @@ fn run(command: Command, out: Out) -> Result<ExitCode> {
         }
         Command::Import(args) => import(&args, out),
         Command::Export(args) => export(args, out),
-        Command::MigratePoc(args) => migrate(args, out),
     }
 }
 
@@ -716,11 +706,7 @@ fn note(text: &str) {
 fn open(fetch: bool) -> Result<Shouci> {
     let mut config = Config::from_env();
     config.fetch_dictionaries = fetch;
-    let shouci = Shouci::open(config)?;
-    for line in shouci.startup_notes() {
-        note(line);
-    }
-    Ok(shouci)
+    Shouci::open(config)
 }
 
 /// The library, ready to search. With no dictionary installed yet, it is
@@ -1376,37 +1362,6 @@ fn export(args: ExportArgs, out: Out) -> Result<ExitCode> {
     out.show(&summary, || {
         let mut lines = vec![text::export_summary(&summary, &format)];
         lines.extend(text::left_out(&plan, &format));
-        lines.join("\n")
-    })
-}
-
-fn migrate(args: MigrateArgs, out: Out) -> Result<ExitCode> {
-    let shouci = open(false)?;
-    let path = match args.file {
-        Some(path) => path,
-        None => shouci
-            .config()
-            .legacy_dir
-            .as_ref()
-            .map(|dir| dir.join("user.db"))
-            .ok_or_else(|| {
-                Error::invalid("name the old user.db (SHOUCI_HOME is set, so there is no default)")
-            })?,
-    };
-    let report = shouci.import_poc(&path)?;
-    out.show(&report, || {
-        let mut lines = vec![format!(
-            "brought {} over from {} ({} already here)",
-            counted(report.items_added, "word", "words"),
-            path.display(),
-            report.items_already_saved
-        )];
-        lines.extend(
-            report
-                .skipped
-                .iter()
-                .map(|why| format!("not brought over: {why}")),
-        );
         lines.join("\n")
     })
 }

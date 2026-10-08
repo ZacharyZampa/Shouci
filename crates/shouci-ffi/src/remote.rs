@@ -10,10 +10,10 @@ use shouci_core::{
     DictionaryStatus, DictionaryView, ErrorKind, ExportRequest, ExportScope, FieldChange,
     FieldConflict, FilterConditionView, FrequencyBand, FrequencyBandView, GroupView, HskLevelView,
     ImportAction, ImportCounts, ImportField, ImportPolicy, Incoming, ItemPatch, ItemView,
-    LegacyImport, LibraryFilter, LibraryResults, LibrarySnapshot, LibraryView, Lifecycle,
-    LoadingStage, ManualWord, MatchBasis, NameChange, PlannedLine, QueryKind, SaveOutcome,
-    SaveResult, SavedRef, Severity, SkipReason, SmartCollectionView, SourceKind, SourceView,
-    TransferSummary, Verification,
+    LibraryFilter, LibraryResults, LibrarySnapshot, LibraryView, Lifecycle, LoadingStage,
+    ManualWord, MatchBasis, NameChange, PlannedLine, QueryKind, SaveOutcome, SaveResult, SavedRef,
+    Severity, SkipReason, SmartCollectionView, SourceKind, SourceView, TransferSummary,
+    Verification,
 };
 
 #[uniffi::remote(Enum)]
@@ -348,14 +348,6 @@ pub struct ConnectorView {
     pub extensions: Vec<String>,
     pub can_import: bool,
     pub can_export: bool,
-}
-
-#[uniffi::remote(Record)]
-pub struct LegacyImport {
-    pub items_added: u32,
-    pub items_already_saved: u32,
-    pub runs_added: u32,
-    pub skipped: Vec<String>,
 }
 
 #[uniffi::remote(Enum)]

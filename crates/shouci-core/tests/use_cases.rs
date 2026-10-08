@@ -5,7 +5,7 @@ use std::path::Path;
 
 use shouci_core::testing::{empty_sandbox, install_dictionary, sandbox, scratch_dir};
 use shouci_core::{
-    BulkAction, Config, DictionaryStatus, ErrorKind, ExportRequest, ExportScope, FrequencyBand,
+    BulkAction, DictionaryStatus, ErrorKind, ExportRequest, ExportScope, FrequencyBand,
     ImportAction, ImportPolicy, ItemPatch, LibraryFilter, LibraryView, Lifecycle, ManualWord,
     MatchBasis, QueryKind, QuickAdd, SaveOutcome, Shouci, SmartCollectionView, SourceKind,
     Verification,
@@ -1387,48 +1387,9 @@ fn every_connector_round_trips_a_word_and_rejects_binary() {
 // --- Data safety ----------------------------------------------------------
 
 #[test]
-fn proof_of_concept_words_come_over_on_first_open() {
-    let legacy = scratch_dir("legacy");
-    write_poc(&legacy.join("user.db"));
-    let dir = scratch_dir("fresh");
-    let mut config = Config::in_dir(&dir);
-    config.fetch_dictionaries = false;
-    config.legacy_dir = Some(legacy.clone());
-    let shouci = Shouci::open(config.clone()).unwrap();
-    assert!(
-        shouci.startup_notes()[0].contains("Brought 1 words"),
-        "{:?}",
-        shouci.startup_notes()
-    );
-    assert_eq!(heads(&shouci, &active()), vec!["学校"]);
-    drop(shouci);
-    // Opening again does not import again.
-    let reopened = Shouci::open(config).unwrap();
-    assert_eq!(reopened.startup_notes(), [] as [String; 0]);
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(legacy);
-}
-
-/// A minimal proof-of-concept database with one exported word.
-fn write_poc(path: &Path) {
-    rusqlite::Connection::open(path)
-        .unwrap()
-        .execute_batch(
-            "CREATE TABLE vocabulary_items (item_id INTEGER PRIMARY KEY, simplified TEXT, \
-             traditional TEXT, pinyin TEXT, definition TEXT, status TEXT, notes TEXT, \
-             source_id TEXT, source_version TEXT, import_origin TEXT, created_at TEXT, \
-             modified_at TEXT); INSERT INTO vocabulary_items VALUES (1, '学校', '學校', \
-             'xue2 xiao4', 'school', 'exported', NULL, 'cc-cedict', '1.0.0', NULL, \
-             '2026-09-20 10:00:00', '2026-09-20 10:00:00');",
-        )
-        .unwrap();
-}
-
-#[test]
 fn another_process_writing_is_noticed() {
     let shouci = sandbox();
-    let mut config = shouci.config().clone();
-    config.legacy_dir = None;
+    let config = shouci.config().clone();
     let other = Shouci::open(config).unwrap();
     let before = shouci.data_version().unwrap();
     other
@@ -1447,8 +1408,7 @@ fn another_process_writing_is_noticed() {
 #[test]
 fn writers_in_other_processes_wait_their_turn() {
     let shouci = empty_sandbox();
-    let mut config = shouci.config().clone();
-    config.legacy_dir = None;
+    let config = shouci.config().clone();
     let writers: Vec<_> = (0..6u32)
         .map(|writer| {
             let config = config.clone();

@@ -15,9 +15,6 @@ pub struct Config {
     /// Download and build built-in dictionaries that are missing, and
     /// refresh them monthly. Needs the network on first run.
     pub fetch_dictionaries: bool,
-    /// A proof-of-concept data directory to bring words over from when
-    /// `user.db` is created.
-    pub legacy_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -29,7 +26,6 @@ impl Config {
             dictionaries_dir: data_dir.join("dictionaries"),
             data_dir,
             fetch_dictionaries: true,
-            legacy_dir: None,
         }
     }
 
@@ -41,17 +37,13 @@ impl Config {
     /// - `SHOUCI_DICTIONARIES`: the dictionaries directory, otherwise
     ///   `dictionaries/` inside the data directory.
     ///
-    /// With no `SHOUCI_HOME`, the proof of concept's directory is checked
-    /// for words to bring over.
-    ///
     /// `~` and relative paths in the variables are resolved (against the
     /// home and current directories).
     #[must_use]
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
         let home = var("HOME");
-        let explicit = var("SHOUCI_HOME");
-        let data_dir = explicit.clone().map_or_else(
+        let data_dir = var("SHOUCI_HOME").map_or_else(
             || {
                 platform_dir(
                     home.as_deref(),
@@ -65,14 +57,6 @@ impl Config {
         let mut config = Self::in_dir(data_dir);
         if let Some(dir) = var("SHOUCI_DICTIONARIES") {
             config.dictionaries_dir = resolve(&dir, home.as_deref());
-        }
-        if explicit.is_none() {
-            config.legacy_dir = Some(platform_dir(
-                home.as_deref(),
-                var("XDG_DATA_HOME").as_deref(),
-                "pleco-companion",
-                "pleco-companion",
-            ));
         }
         config
     }

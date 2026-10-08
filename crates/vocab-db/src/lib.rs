@@ -7,7 +7,6 @@
 //! `shouci-core` calls this crate.
 
 mod items;
-mod legacy;
 mod migrate;
 mod organize;
 mod settings;
@@ -19,7 +18,6 @@ pub use items::{
     list_items, purge_item, reading_key, reinsert_item, require_item, restore_item, save_item,
     set_archived, set_source, set_trashed, set_verification, update_item,
 };
-pub use legacy::{IMPORTED_SETTING as LEGACY_IMPORTED_SETTING, LegacyReport, import_poc_database};
 pub use migrate::SCHEMA_VERSION;
 pub use organize::{
     NameCount, add_tag, add_to_collection, collection_from_tag, collection_in_use, collections,
@@ -87,6 +85,8 @@ pub fn open_in_memory() -> Result<Connection> {
 
 fn configure(mut conn: Connection) -> Result<Connection> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    // Before switching to WAL, which writes to the file.
+    migrate::check(&mut conn)?;
     // Returns the resulting mode as a row, so it is queried, not updated.
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;

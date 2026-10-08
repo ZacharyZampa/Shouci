@@ -20,7 +20,6 @@ CARGO_BIN="${HOME}/.cargo/bin"
 TOOLS=(shouci shouci-tui)
 OLD_AGENT_LABEL="com.plecocompanion.agent"
 OLD_AGENT_PLIST="${HOME}/Library/LaunchAgents/${OLD_AGENT_LABEL}.plist"
-OLD_DATA="${HOME}/Library/Application Support/pleco-companion"
 
 platform_check() {
   if [ "$(uname -s)" != "Darwin" ]; then
@@ -113,9 +112,6 @@ status() {
   fi
   if [ -f "${LOGIN_AGENT}" ]; then
     echo "at login:     opens Shouci"
-  fi
-  if [ -f "${OLD_DATA}/user.db" ]; then
-    echo "older words:  ${OLD_DATA}/user.db (copied into the new library on first launch; left in place)"
   fi
 }
 

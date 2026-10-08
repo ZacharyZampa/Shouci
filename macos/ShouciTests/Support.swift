@@ -21,8 +21,7 @@ final class TestLibrary {
             config: CoreConfig(
                 dataDir: dir.path,
                 dictionariesDir: dir.appendingPathComponent("dictionaries").path,
-                fetchDictionaries: false,
-                legacyDir: nil))
+                fetchDictionaries: false))
         let defaults = UserDefaults(suiteName: "shouci-tests-\(UUID().uuidString)")!
         model = LibraryModel(app: AppModel(core: core), preferences: Preferences(defaults: defaults))
         let undo = undo

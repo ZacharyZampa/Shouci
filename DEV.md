@@ -98,15 +98,15 @@ Where they are (`Config::from_env`):
    `$XDG_DATA_HOME/shouci`, else `~/.local/share/shouci`. Holds `user.db`.
 2. `SHOUCI_DICTIONARIES`, else `dictionaries/` inside that.
 
-The app, the CLI, and the TUI all read the same library. Without
-`SHOUCI_HOME`, opening a library also looks in the proof of concept's folder
-(`…/pleco-companion`): its words come over once (`vocab-db/src/legacy.rs`),
-and its `dictionary.db` is copied so the first launch needs no download.
-`shouci migrate-poc` runs the word import again; it only adds what is new.
+The app, the CLI, and the TUI all read the same library.
 
 `user.db` runs in WAL mode with a busy timeout, so the app and the CLI can
 write at once. Its schema version is `PRAGMA user_version`;
 `vocab-db/src/migrate.rs` appends migrations and never edits a shipped one.
+Before anything writes to a database, it must be empty or hold every table
+and column its version should have (what the migrations build up to it);
+anything else, such as another program's database or a newer Shouci's, is
+refused and left as it is.
 In a checkout, `data/dictionaries/` is where the build that tests and CI use
 goes (`check.sh` points `SHOUCI_DICTIONARIES` there). It is not committed:
 the first run of `check.sh` downloads and builds it.

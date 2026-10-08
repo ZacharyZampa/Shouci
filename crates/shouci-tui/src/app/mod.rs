@@ -249,7 +249,6 @@ fn open() -> Result<Opened> {
     let mut config = Config::from_env();
     config.fetch_dictionaries = false;
     let shouci = Shouci::open(config)?;
-    let mut notes = shouci.startup_notes().to_vec();
     let shouci = if shouci.dictionaries()?.is_empty() {
         eprintln!(
             "shouci-tui: downloading the dictionary (first run only; needs an internet \
@@ -258,16 +257,15 @@ fn open() -> Result<Opened> {
         let mut config = shouci.config().clone();
         config.fetch_dictionaries = true;
         drop(shouci);
-        let fetched = Shouci::open(config)?;
-        notes.extend(fetched.startup_notes().iter().cloned());
-        fetched
+        Shouci::open(config)?
     } else {
         shouci
     };
     let problem = shouci.load_dictionaries().err().map(|err| err.to_string());
-    if let DictionaryStatus::Ready { notes: more, .. } = shouci.dictionary_status() {
-        notes.extend(more);
-    }
+    let notes = match shouci.dictionary_status() {
+        DictionaryStatus::Ready { notes, .. } => notes,
+        _ => Vec::new(),
+    };
     Ok(Opened {
         shouci,
         notes,

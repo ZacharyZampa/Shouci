@@ -14,8 +14,7 @@ private func library() throws -> (Core, URL) {
         config: CoreConfig(
             dataDir: dir.path,
             dictionariesDir: dir.appendingPathComponent("dictionaries").path,
-            fetchDictionaries: false,
-            legacyDir: nil))
+            fetchDictionaries: false))
     return (core, dir)
 }
 
