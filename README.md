@@ -64,10 +64,10 @@ about it.
 ## Using Shouci
 
 <p align="center">
-  <img src="docs/screenshots/library.png" alt="The Shouci library window: a list of saved words, with the selected word's definition, notes, tags and collections beside it" width="860">
+  <img src="docs/screenshots/library.png" alt="The Shouci library window: collections, tags and smart collections in the sidebar, saved words with HSK levels in the list, and the selected word's entry, tags and dictionary definition beside it" width="860">
 </p>
 <p align="center">
-  <img src="docs/screenshots/quick-search.png" alt="Quick search over another app: results for “to travel”, with a word you already have marked Saved" width="400">
+  <img src="docs/screenshots/quick-search.png" alt="Quick search before you type: your most recently added words, each with its pinyin, meaning and when you saved it" width="400">
 </p>
 
 ### Quick search
@@ -80,7 +80,8 @@ in front; Shouci gets out of the way when you're done.
   field shows how it read your search, and its menu changes it.
 - **↑ ↓** choose, **Return** saves, **⌘Z** takes the save back, **Esc**
   closes. **⌘O** opens your library.
-- Words you already have are marked **Saved**.
+- With nothing typed, quick search lists your **recently added** words.
+  Words you already have are marked **Saved** in results.
 - No dictionary entry? Save the characters as **needs review** and fill in
   the reading and meaning later. Shouci also shows the dictionary words found
   inside what you typed (`蚌埠住了` → 蚌埠, 住, 了).
